@@ -59,6 +59,11 @@ type Service struct {
 	Tenant       string
 	AuthIdentity string
 	Logger       *slog.Logger
+	// PerServerTimeout overrides the default per-server discovery timeout
+	// when greater than zero. Useful for tests and for callers that need a
+	// tighter or looser bound. When zero, defaultPerServerDiscoveryTimeout
+	// applies.
+	PerServerTimeout time.Duration
 }
 
 type RuntimeServer struct {
@@ -170,12 +175,21 @@ func (s *Service) DiscoverServerRuntime(ctx context.Context, server market.Serve
 	}, nil
 }
 
-const perServerDiscoveryTimeout = 5 * time.Second
+// defaultPerServerDiscoveryTimeout bounds the time spent discovering tools on
+// a single registry-listed server. Tightened to 2s so a slow/unreachable
+// server cannot stall every CLI command — a healthy MCP endpoint negotiates
+// well under a second. See issue #119.
+const defaultPerServerDiscoveryTimeout = 2 * time.Second
 
 func (s *Service) DiscoverAllRuntime(ctx context.Context, servers []market.ServerDescriptor) ([]RuntimeServer, []RuntimeFailure) {
 	type discoveryResult struct {
 		server  RuntimeServer
 		failure *RuntimeFailure
+	}
+
+	perServerTimeout := defaultPerServerDiscoveryTimeout
+	if s.PerServerTimeout > 0 {
+		perServerTimeout = s.PerServerTimeout
 	}
 
 	filtered := make([]market.ServerDescriptor, 0, len(servers))
@@ -194,7 +208,7 @@ func (s *Service) DiscoverAllRuntime(ctx context.Context, servers []market.Serve
 		wg.Add(1)
 		go func(server market.ServerDescriptor) {
 			defer wg.Done()
-			serverCtx, cancel := context.WithTimeout(ctx, perServerDiscoveryTimeout)
+			serverCtx, cancel := context.WithTimeout(ctx, perServerTimeout)
 			defer cancel()
 			start := time.Now()
 			rs, err := s.DiscoverServerRuntime(serverCtx, server)

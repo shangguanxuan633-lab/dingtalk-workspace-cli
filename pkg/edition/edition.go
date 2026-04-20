@@ -73,20 +73,22 @@ type Hooks struct {
 	// --- HTTP headers ---
 	MergeHeaders func(base map[string]string) map[string]string
 
-	// --- auth hooks ---
-	OnAuthError   func(configDir string, err error) error
-	TokenProvider func(ctx context.Context, fallback func() (string, error)) (string, error)
+	// --- auth ---
+	AuthClientID      string // OAuth client ID for device-flow authorisation
+	AuthClientFromMCP bool   // true → fetch client ID from MCP at runtime
+	OnAuthError       func(configDir string, err error) error
+	TokenProvider     func(ctx context.Context, fallback func() (string, error)) (string, error)
 
-	// --- token persistence (overlay-only) ---
-	// When non-nil, these override the default keychain-based token storage.
-	// The data parameter is JSON-serialized TokenData.
-	SaveToken   func(configDir string, data []byte) error
-	LoadToken   func(configDir string) ([]byte, error)
-	DeleteToken func(configDir string) error
+	// --- token persistence (overlay-managed keychain / encrypted storage) ---
+	SaveToken   func(configDir string, data []byte) error // persist token blob
+	LoadToken   func(configDir string) ([]byte, error)    // retrieve token blob
+	DeleteToken func(configDir string) error              // remove persisted token
 
-	// --- auth credentials (overlay-only) ---
-	AuthClientID      string // non-empty overrides DefaultClientID
-	AuthClientFromMCP bool   // true routes OAuth through MCP endpoints
+	// --- MCP result classification ---
+	// ClassifyToolResult inspects raw MCP tool-call content and returns a typed
+	// error (e.g. PATError, CLIError) when the response contains a known
+	// gateway-auth or PAT-permission failure. nil → no special handling.
+	ClassifyToolResult func(content map[string]any) error
 
 	// --- product & endpoint ---
 	StaticServers         func() []ServerInfo                          // non-nil → skip Market discovery
@@ -97,13 +99,6 @@ type Hooks struct {
 	// global setup (OAuth flag overrides, log level, output sink). Overlays use
 	// this for clients that bypass the MCP runner (e.g. A2A gateway).
 	AfterPersistentPreRun func(cmd *cobra.Command, args []string) error
-
-	// ClassifyToolResult is called before the framework's default business-error
-	// detection on MCP tool results. If it returns a non-nil error, that error
-	// is used instead of the generic CategoryAPI business error. Editions use
-	// this to return custom error types with specific exit codes (e.g. PAT
-	// authorization errors with exit code 4).
-	ClassifyToolResult func(content map[string]any) error
 }
 
 var (

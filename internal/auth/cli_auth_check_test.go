@@ -154,9 +154,7 @@ func TestCheckCLIAuthEnabled_TransientThenSuccess(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(CLIAuthStatus{
 			Success: true,
-			Result: struct {
-				CLIAuthEnabled bool `json:"cliAuthEnabled"`
-			}{CLIAuthEnabled: true},
+			Result:  &CLIAuthResult{CLIAuthEnabled: true},
 		})
 	}))
 	defer srv.Close()
@@ -169,7 +167,7 @@ func TestCheckCLIAuthEnabled_TransientThenSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success after transient failures, got error: %v", err)
 	}
-	if !status.Success || !status.Result.CLIAuthEnabled {
+	if !status.Success || status.Result == nil || !status.Result.CLIAuthEnabled {
 		t.Fatalf("expected CLIAuthEnabled=true, got %+v", status)
 	}
 	if c := calls.Load(); c != 3 {
@@ -190,9 +188,7 @@ func TestCheckCLIAuthEnabled_Enabled(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(CLIAuthStatus{
 			Success: true,
-			Result: struct {
-				CLIAuthEnabled bool `json:"cliAuthEnabled"`
-			}{CLIAuthEnabled: true},
+			Result:  &CLIAuthResult{CLIAuthEnabled: true},
 		})
 	}))
 	defer srv.Close()
@@ -204,7 +200,7 @@ func TestCheckCLIAuthEnabled_Enabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !status.Result.CLIAuthEnabled {
+	if status.Result == nil || !status.Result.CLIAuthEnabled {
 		t.Fatal("expected CLIAuthEnabled=true")
 	}
 	t.Logf("✅ Normal enabled response: success=%v, enabled=%v", status.Success, status.Result.CLIAuthEnabled)
@@ -215,9 +211,7 @@ func TestCheckCLIAuthEnabled_Disabled(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(CLIAuthStatus{
 			Success: true,
-			Result: struct {
-				CLIAuthEnabled bool `json:"cliAuthEnabled"`
-			}{CLIAuthEnabled: false},
+			Result:  &CLIAuthResult{CLIAuthEnabled: false},
 		})
 	}))
 	defer srv.Close()
@@ -229,7 +223,7 @@ func TestCheckCLIAuthEnabled_Disabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if status.Result.CLIAuthEnabled {
+	if status.Result == nil || status.Result.CLIAuthEnabled {
 		t.Fatal("expected CLIAuthEnabled=false")
 	}
 	t.Logf("✅ Normal disabled response: success=%v, enabled=%v", status.Success, status.Result.CLIAuthEnabled)
@@ -262,12 +256,10 @@ func TestOAuthCallback_CLIAuthEnabled_ShowsSuccessPage(t *testing.T) {
 	var statusErr error
 	authStatus := &CLIAuthStatus{
 		Success: true,
-		Result: struct {
-			CLIAuthEnabled bool `json:"cliAuthEnabled"`
-		}{CLIAuthEnabled: true},
+		Result:  &CLIAuthResult{CLIAuthEnabled: true},
 	}
 
-	cliAuthEnabled := statusErr == nil && authStatus.Success && authStatus.Result.CLIAuthEnabled
+	cliAuthEnabled := statusErr == nil && authStatus.Success && authStatus.Result != nil && authStatus.Result.CLIAuthEnabled
 	if !cliAuthEnabled {
 		t.Fatal("cliAuthEnabled should be true when API returns enabled")
 	}
@@ -280,12 +272,10 @@ func TestOAuthCallback_CLIAuthDisabledByServer_ShowsNotEnabledPage(t *testing.T)
 	var statusErr error
 	authStatus := &CLIAuthStatus{
 		Success: true,
-		Result: struct {
-			CLIAuthEnabled bool `json:"cliAuthEnabled"`
-		}{CLIAuthEnabled: false},
+		Result:  &CLIAuthResult{CLIAuthEnabled: false},
 	}
 
-	cliAuthEnabled := statusErr == nil && authStatus.Success && authStatus.Result.CLIAuthEnabled
+	cliAuthEnabled := statusErr == nil && authStatus.Success && authStatus.Result != nil && authStatus.Result.CLIAuthEnabled
 	if cliAuthEnabled {
 		t.Fatal("cliAuthEnabled should be false when server says disabled")
 	}
@@ -314,12 +304,18 @@ func TestDeviceFlow_LoginOnce_CLIAuthError_FailClosed(t *testing.T) {
 				VerificationURI: "https://example.com/verify",
 				ExpiresIn:       60,
 				Interval:        1,
+				FlowID:          "test-flow-id",
 			}, "", "")
 
-		case strings.HasSuffix(r.URL.Path, DeviceTokenPath):
-			writeServiceResult(w, true, DeviceTokenResponse{
-				AuthCode: "test-auth-code",
-			}, "", "")
+		case strings.HasSuffix(r.URL.Path, DevicePollPath):
+			// New terminal API: return APPROVED status
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"data": map[string]string{
+					"status":   "APPROVED",
+					"authCode": "test-auth-code",
+				},
+			})
 
 		case strings.HasSuffix(r.URL.Path, MCPOAuthTokenPath):
 			json.NewEncoder(w).Encode(map[string]any{
@@ -340,13 +336,14 @@ func TestDeviceFlow_LoginOnce_CLIAuthError_FailClosed(t *testing.T) {
 
 	configDir := setupMCPConfigDir(t, srv.URL)
 	provider := &DeviceFlowProvider{
-		configDir:  configDir,
-		clientID:   "test-client-id",
-		scope:      DefaultScopes,
-		baseURL:    srv.URL,
-		logger:     newDeviceFlowTestLogger(),
-		Output:     io.Discard,
-		httpClient: srv.Client(),
+		configDir:       configDir,
+		clientID:        "test-client-id",
+		scope:           DefaultScopes,
+		baseURL:         srv.URL,
+		terminalBaseURL: srv.URL,
+		logger:          newDeviceFlowTestLogger(),
+		Output:          io.Discard,
+		httpClient:      srv.Client(),
 	}
 
 	_, err := provider.loginOnce(context.Background(), 1)
@@ -378,12 +375,18 @@ func TestDeviceFlow_LoginOnce_CLIAuthDisabled_ShowsError(t *testing.T) {
 				VerificationURI: "https://example.com/verify",
 				ExpiresIn:       60,
 				Interval:        1,
+				FlowID:          "test-flow-id",
 			}, "", "")
 
-		case strings.HasSuffix(r.URL.Path, DeviceTokenPath):
-			writeServiceResult(w, true, DeviceTokenResponse{
-				AuthCode: "test-auth-code",
-			}, "", "")
+		case strings.HasSuffix(r.URL.Path, DevicePollPath):
+			// New terminal API: return APPROVED status
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"data": map[string]string{
+					"status":   "APPROVED",
+					"authCode": "test-auth-code",
+				},
+			})
 
 		case strings.HasSuffix(r.URL.Path, MCPOAuthTokenPath):
 			json.NewEncoder(w).Encode(map[string]any{
@@ -396,9 +399,7 @@ func TestDeviceFlow_LoginOnce_CLIAuthDisabled_ShowsError(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, CLIAuthEnabledPath):
 			json.NewEncoder(w).Encode(CLIAuthStatus{
 				Success: true,
-				Result: struct {
-					CLIAuthEnabled bool `json:"cliAuthEnabled"`
-				}{CLIAuthEnabled: false},
+				Result:  &CLIAuthResult{CLIAuthEnabled: false},
 			})
 
 		case strings.HasSuffix(r.URL.Path, SuperAdminPath):
@@ -415,13 +416,14 @@ func TestDeviceFlow_LoginOnce_CLIAuthDisabled_ShowsError(t *testing.T) {
 
 	configDir := setupMCPConfigDir(t, srv.URL)
 	provider := &DeviceFlowProvider{
-		configDir:  configDir,
-		clientID:   "test-client-id",
-		scope:      DefaultScopes,
-		baseURL:    srv.URL,
-		logger:     newDeviceFlowTestLogger(),
-		Output:     io.Discard,
-		httpClient: srv.Client(),
+		configDir:       configDir,
+		clientID:        "test-client-id",
+		scope:           DefaultScopes,
+		baseURL:         srv.URL,
+		terminalBaseURL: srv.URL,
+		logger:          newDeviceFlowTestLogger(),
+		Output:          io.Discard,
+		httpClient:      srv.Client(),
 	}
 
 	_, err := provider.loginOnce(context.Background(), 1)
@@ -450,12 +452,18 @@ func TestDeviceFlow_LoginOnce_CLIAuthEnabled_Success(t *testing.T) {
 				VerificationURI: "https://example.com/verify",
 				ExpiresIn:       60,
 				Interval:        1,
+				FlowID:          "test-flow-id",
 			}, "", "")
 
-		case strings.HasSuffix(r.URL.Path, DeviceTokenPath):
-			writeServiceResult(w, true, DeviceTokenResponse{
-				AuthCode: "test-auth-code",
-			}, "", "")
+		case strings.HasSuffix(r.URL.Path, DevicePollPath):
+			// New terminal API: return APPROVED status
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"data": map[string]string{
+					"status":   "APPROVED",
+					"authCode": "test-auth-code",
+				},
+			})
 
 		case strings.HasSuffix(r.URL.Path, MCPOAuthTokenPath):
 			json.NewEncoder(w).Encode(map[string]any{
@@ -468,9 +476,7 @@ func TestDeviceFlow_LoginOnce_CLIAuthEnabled_Success(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, CLIAuthEnabledPath):
 			json.NewEncoder(w).Encode(CLIAuthStatus{
 				Success: true,
-				Result: struct {
-					CLIAuthEnabled bool `json:"cliAuthEnabled"`
-				}{CLIAuthEnabled: true},
+				Result:  &CLIAuthResult{CLIAuthEnabled: true},
 			})
 
 		default:
@@ -481,13 +487,14 @@ func TestDeviceFlow_LoginOnce_CLIAuthEnabled_Success(t *testing.T) {
 
 	configDir := setupMCPConfigDir(t, srv.URL)
 	provider := &DeviceFlowProvider{
-		configDir:  configDir,
-		clientID:   "test-client-id",
-		scope:      DefaultScopes,
-		baseURL:    srv.URL,
-		logger:     newDeviceFlowTestLogger(),
-		Output:     io.Discard,
-		httpClient: srv.Client(),
+		configDir:       configDir,
+		clientID:        "test-client-id",
+		scope:           DefaultScopes,
+		baseURL:         srv.URL,
+		terminalBaseURL: srv.URL,
+		logger:          newDeviceFlowTestLogger(),
+		Output:          io.Discard,
+		httpClient:      srv.Client(),
 	}
 
 	token, err := provider.loginOnce(context.Background(), 1)

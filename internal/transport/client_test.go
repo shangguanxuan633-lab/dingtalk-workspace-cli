@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	stderrors "errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -68,6 +69,72 @@ func TestInitializeNegotiatesProtocolVersion(t *testing.T) {
 	}
 	if result.ProtocolVersion != "2024-11-05" {
 		t.Fatalf("Initialize() selected %q, want 2024-11-05", result.ProtocolVersion)
+	}
+}
+
+func TestInitializeShortCircuitsOnHTTPError(t *testing.T) {
+	t.Parallel()
+
+	// Track which protocol versions actually get sent. With the short-circuit
+	// in place, a transport-layer (HTTP) failure should fail Initialize on the
+	// FIRST version without iterating through every supported version. Without
+	// the short-circuit, three round-trips would happen — needlessly tripling
+	// every CLI startup when a plugin endpoint is broken (issue #119).
+	var seenVersions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		params := req["params"].(map[string]any)
+		seenVersions = append(seenVersions, params["protocolVersion"].(string))
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	client.MaxRetries = 0 // skip the HTTP retry loop — we only care about version iteration
+
+	if _, err := client.Initialize(context.Background(), server.URL); err == nil {
+		t.Fatal("Initialize() error = nil, want HTTP error")
+	}
+
+	if len(seenVersions) != 1 {
+		t.Fatalf("Initialize() attempted %d protocol versions (%v), want 1 — HTTP failures must short-circuit",
+			len(seenVersions), seenVersions)
+	}
+}
+
+func TestInitializeShortCircuitsOnDialFailure(t *testing.T) {
+	t.Parallel()
+
+	// Bind to an ephemeral port, then close the listener. Subsequent connects
+	// to that address fail with "connection refused" almost instantly. With
+	// the short-circuit, three protocol versions would otherwise stack three
+	// dial-error returns; we only want one — and we want Initialize to return
+	// well under the per-dial budget.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	endpoint := "http://" + ln.Addr().String()
+	_ = ln.Close()
+
+	client := NewClient(nil)
+	client.MaxRetries = 0
+
+	start := time.Now()
+	if _, err := client.Initialize(context.Background(), endpoint); err == nil {
+		t.Fatal("Initialize() error = nil, want dial failure")
+	}
+	elapsed := time.Since(start)
+
+	// Three dial attempts (one per supported version) on a refused-connection
+	// path is still fast on loopback, so this assertion is a sanity bound, not
+	// the primary signal — but if the short-circuit regresses, on a real
+	// unreachable address this jumps from one dial timeout to three.
+	if elapsed > 2*time.Second {
+		t.Fatalf("Initialize() took %v, want <2s — dial failure should short-circuit", elapsed)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/config"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/configmeta"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 )
@@ -37,6 +38,11 @@ func init() {
 		Description:  "OAuth AppSecret (DingTalk 应用凭证)",
 		DefaultValue: "(内置)",
 		Sensitive:    true,
+	})
+	configmeta.Register(configmeta.ConfigItem{
+		Name:        "DWS_CHANNEL",
+		Category:    configmeta.CategoryExternal,
+		Description: "第三方渠道编码 (channelCode)，如 Qoderwork",
 	})
 }
 
@@ -78,6 +84,14 @@ const (
 	// DeviceGrantType is the grant_type value defined by RFC 8628.
 	DeviceGrantType = "urn:ietf:params:oauth:grant-type:device_code"
 
+	// Terminal API base URL for developer settings page.
+	DefaultTerminalBaseURL = "https://open-dev.dingtalk.com"
+	// DevicePollPath is the device flow polling path (used with MCP base URL).
+	DevicePollPath = "/cli/oauth/device/poll"
+
+	// DeveloperSettingsPath is the path to the organization developer settings page.
+	DeveloperSettingsPath = "/fe/old#/developerSettings"
+
 	LogoutURL         = "https://login.dingtalk.com/oauth2/logout"
 	LogoutContinueURL = "https://login.dingtalk.com"
 
@@ -93,6 +107,19 @@ const (
 	MCPRefreshTokenPath = "/oauth2/refreshToken"
 	MCPRevokeTokenPath  = "/oauth2/revokeToken"
 )
+
+// GetTerminalBaseURL returns the terminal base URL with priority:
+// 1. ~/.dws/terminal_url file content (for pre-release environment)
+// 2. Default value (https://open-dev.dingtalk.com)
+func GetTerminalBaseURL() string {
+	return config.GetTerminalBaseURL()
+}
+
+// GetDeveloperSettingsURL returns the full URL to the organization developer
+// settings page, derived from the terminal base URL.
+func GetDeveloperSettingsURL() string {
+	return config.GetDeveloperSettingsURL()
+}
 
 // GetMCPBaseURL returns the MCP base URL with priority:
 // 1. ~/.dws/mcp_url file content (for pre-release environment)

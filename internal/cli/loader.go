@@ -47,6 +47,13 @@ func init() {
 		Example:     "/path/to/catalog.json",
 		Hidden:      true,
 	})
+	configmeta.Register(configmeta.ConfigItem{
+		Name:         "DWS_PLUGIN_COLD_TIMEOUT",
+		Category:     configmeta.CategoryCore,
+		Description:  "插件 MCP 冷启动发现的超时时长（Go duration 格式，如 2s / 1500ms）。设置后同时覆盖 HTTP 与 stdio 插件的冷启动预算；未设置时使用内置默认值（HTTP 无鉴权 1s / 有鉴权 1.5s / stdio 2s）。",
+		DefaultValue: "",
+		Example:      "3s",
+	})
 }
 
 // CatalogDegradedReason identifies why catalog discovery returned empty.
@@ -104,10 +111,13 @@ func newCatalogDegraded(reason CatalogDegradedReason, serverCount int) *CatalogD
 const (
 	CatalogFixtureEnv    = "DWS_CATALOG_FIXTURE"
 	CacheDirEnv          = "DWS_CACHE_DIR"
+	PluginColdTimeoutEnv = "DWS_PLUGIN_COLD_TIMEOUT"
 	DefaultMarketBaseURL = "https://mcp.dingtalk.com"
 
 	// defaultDiscoveryTimeout bounds the time spent on live registry discovery.
-	defaultDiscoveryTimeout = 10 * time.Second
+	// Tightened to 4s so a slow/unreachable discovery endpoint cannot block
+	// every CLI command invocation. See issue #119.
+	defaultDiscoveryTimeout = 4 * time.Second
 )
 
 type CatalogLoader interface {

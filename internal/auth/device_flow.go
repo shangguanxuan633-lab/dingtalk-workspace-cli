@@ -33,37 +33,54 @@ import (
 
 const (
 	// defaultPollInterval is the default seconds between device token polls.
-	defaultPollInterval = 5
+	// The server-side Redis TTL is 10 minutes; a 2-second interval keeps the
+	// user-perceived latency low while staying well within rate limits.
+	defaultPollInterval = 2
 	// maxPollInterval caps the polling interval to prevent DoS via slow_down.
 	maxPollInterval = 30
 	// maxPollTotalWait caps the total wait time for device authorization.
-	maxPollTotalWait = 15 * time.Minute
+	// Aligned with the server-side Redis TTL (10 minutes).
+	maxPollTotalWait = 10 * time.Minute
 )
 
 type DeviceFlowProvider struct {
-	configDir  string
-	clientID   string
-	scope      string
-	baseURL    string
-	logger     *slog.Logger
-	Output     io.Writer
-	httpClient *http.Client
+	configDir       string
+	clientID        string
+	scope           string
+	baseURL         string
+	terminalBaseURL string
+	logger          *slog.Logger
+	Output          io.Writer
+	httpClient      *http.Client
 }
 
 func NewDeviceFlowProvider(configDir string, logger *slog.Logger) *DeviceFlowProvider {
 	return &DeviceFlowProvider{
-		configDir:  configDir,
-		clientID:   ClientID(),
-		scope:      DefaultScopes,
-		baseURL:    DefaultDeviceBaseURL,
-		logger:     logger,
-		Output:     os.Stderr,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		configDir:       configDir,
+		clientID:        ClientID(),
+		scope:           DefaultScopes,
+		baseURL:         DefaultDeviceBaseURL,
+		terminalBaseURL: GetMCPBaseURL(),
+		logger:          logger,
+		Output:          os.Stderr,
+		httpClient:      &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
 func (p *DeviceFlowProvider) SetBaseURL(baseURL string) {
 	p.baseURL = strings.TrimRight(baseURL, "/")
+}
+
+// SetTerminalBaseURL sets the terminal API base URL for device flow polling.
+func (p *DeviceFlowProvider) SetTerminalBaseURL(baseURL string) {
+	p.terminalBaseURL = strings.TrimRight(baseURL, "/")
+}
+
+// SetScope overrides the OAuth scope for the device flow.
+func (p *DeviceFlowProvider) SetScope(scope string) {
+	if p != nil {
+		p.scope = scope
+	}
 }
 
 func (p *DeviceFlowProvider) output() io.Writer {
@@ -80,12 +97,27 @@ type DeviceAuthResponse struct {
 	VerificationURIComplete string `json:"verificationUriComplete"`
 	ExpiresIn               int    `json:"expiresIn"`
 	Interval                int    `json:"interval"`
+	FlowID                  string `json:"flowId"`
 }
 
 type DeviceTokenResponse struct {
 	AuthCode    string `json:"authCode"`
 	RedirectURL string `json:"redirectUrl"`
 	Error       string `json:"error"`
+}
+
+// DevicePollResponse represents the response from the terminal API poll endpoint.
+type DevicePollResponse struct {
+	Success bool           `json:"success"`
+	Code    string         `json:"code,omitempty"`
+	Message string         `json:"message,omitempty"`
+	Data    DevicePollData `json:"data"`
+}
+
+type DevicePollData struct {
+	Status   string `json:"status"`
+	AuthCode string `json:"authCode,omitempty"`
+	FlowID   string `json:"flowId,omitempty"`
 }
 
 type serviceResult struct {
@@ -153,6 +185,11 @@ func (p *DeviceFlowProvider) loginOnce(ctx context.Context, attempt int) (*Token
 	if err != nil {
 		return nil, err
 	}
+	if tokenResult == nil {
+		// FlowID was empty — no polling happened; authorization URL was already
+		// printed, so the user can handle it manually.
+		return nil, nil
+	}
 
 	_, _ = fmt.Fprintln(p.output(), "")
 	dfPrintStep(p.output(), 3, i18n.T("使用授权码换取 Access Token..."), 0)
@@ -176,39 +213,74 @@ func (p *DeviceFlowProvider) loginOnce(ctx context.Context, attempt int) (*Token
 		_, _ = fmt.Fprintln(p.output(), i18n.T("   请检查网络连接后重试。"))
 		_, _ = fmt.Fprintln(p.output(), "")
 		return nil, fmt.Errorf("%s: %w", i18n.T("检查 CLI 授权状态失败"), authErr)
-	} else if authStatus.Success && !authStatus.Result.CLIAuthEnabled {
-		// CLI auth is disabled - show detailed error with admin info
+	}
+	denialReason := classifyDenialReason(authStatus, os.Getenv("DWS_CHANNEL"))
+	if denialReason != "" {
 		_, _ = fmt.Fprintln(p.output(), "")
-		_, _ = fmt.Fprintln(p.output(), dfRed(i18n.T("⚠️  该组织尚未开启 CLI 数据访问权限")))
-		_, _ = fmt.Fprintln(p.output(), i18n.T("   你所选择的组织管理员尚未开启「允许成员通过 CLI 访问其个人数据」的权限。"))
-		_, _ = fmt.Fprintln(p.output(), "")
+		switch denialReason {
+		case "user_forbidden":
+			_, _ = fmt.Fprintln(p.output(), dfRed(i18n.T("⚠️  该组织已禁止所有成员使用 CLI")))
+			_, _ = fmt.Fprintln(p.output(), "")
+			return nil, errors.New(i18n.T("该组织已禁止所有成员使用 CLI"))
+		case "user_not_allowed":
+			_, _ = fmt.Fprintln(p.output(), dfRed(i18n.T("⚠️  您不在该组织的 CLI 授权人员范围内")))
+			_, _ = fmt.Fprintln(p.output(), i18n.T("   请联系组织管理员将您加入 CLI 授权人员名单。"))
+			_, _ = fmt.Fprintln(p.output(), "")
+			return nil, errors.New(i18n.T("您不在该组织的 CLI 授权人员范围内，请联系组织管理员"))
+		case "channel_not_allowed":
+			ch := os.Getenv("DWS_CHANNEL")
+			_, _ = fmt.Fprintf(p.output(), dfRed(i18n.T("⚠️  当前渠道 %s 未获得该组织授权"))+"\n", ch)
+			_, _ = fmt.Fprintln(p.output(), i18n.T("   请联系组织管理员开通该渠道的访问权限。"))
+			_, _ = fmt.Fprintln(p.output(), "")
+			return nil, fmt.Errorf(i18n.T("当前渠道 %s 未获得该组织授权，请联系组织管理员"), ch)
+		case "channel_required":
+			_, _ = fmt.Fprintln(p.output(), dfRed(i18n.T("⚠️  当前组织已开启渠道管控")))
+			_, _ = fmt.Fprintln(p.output(), i18n.T("   请升级到最新版本的 CLI 后重试。"))
+			_, _ = fmt.Fprintln(p.output(), "")
+			return nil, errors.New(i18n.T("当前组织已开启渠道管控，请升级到最新版本的 CLI 后重试"))
+		case "no_auth":
+			_, _ = fmt.Fprintln(p.output(), dfRed(i18n.T("⚠️  认证已失效")))
+			_, _ = fmt.Fprintln(p.output(), i18n.T("   请执行 dws auth 重新登录。"))
+			_, _ = fmt.Fprintln(p.output(), "")
+			return nil, errors.New(i18n.T("认证已失效，请执行 dws auth 重新登录"))
+		default:
+			// cli_not_enabled or unknown — show existing admin-apply flow
+			_, _ = fmt.Fprintln(p.output(), dfRed(i18n.T("⚠️  该组织尚未开启 CLI 数据访问权限")))
+			_, _ = fmt.Fprintln(p.output(), i18n.T("   你所选择的组织管理员尚未开启「允许成员通过 CLI 访问其个人数据」的权限。"))
+			_, _ = fmt.Fprintln(p.output(), "")
 
-		// Try to get super admin list
-		admins, adminErr := GetSuperAdmins(ctx, tokenData.AccessToken)
-		if adminErr == nil && admins.Success && len(admins.Result) > 0 {
-			// Show up to 3 admins
-			maxAdmins := 3
-			if len(admins.Result) < maxAdmins {
-				maxAdmins = len(admins.Result)
+			admins, adminErr := GetSuperAdmins(ctx, tokenData.AccessToken)
+			if adminErr == nil && admins.Success && len(admins.Result) > 0 {
+				maxAdmins := 3
+				if len(admins.Result) < maxAdmins {
+					maxAdmins = len(admins.Result)
+				}
+				var adminNames []string
+				for i := 0; i < maxAdmins; i++ {
+					adminNames = append(adminNames, admins.Result[i].Name)
+				}
+				_, _ = fmt.Fprintf(p.output(), "   %s%s\n", i18n.T("组织主管理员："), strings.Join(adminNames, "、"))
 			}
-			var adminNames []string
-			for i := 0; i < maxAdmins; i++ {
-				adminNames = append(adminNames, admins.Result[i].Name)
-			}
-			_, _ = fmt.Fprintf(p.output(), "   %s%s\n", i18n.T("组织主管理员："), strings.Join(adminNames, "、"))
+
+			_, _ = fmt.Fprintln(p.output(), i18n.T("   请联系组织主管理员开启后重新登录。"))
+			_, _ = fmt.Fprintln(p.output(), "")
+			_, _ = fmt.Fprintf(p.output(), "   %s%s\n", i18n.T("管理员操作入口："), config.GetDeveloperSettingsURL())
+			_, _ = fmt.Fprintln(p.output(), "")
+			return nil, errors.New(i18n.T("该组织尚未开启 CLI 数据访问权限，请联系管理员开启"))
 		}
-
-		_, _ = fmt.Fprintln(p.output(), i18n.T("   请联系组织主管理员开启后重新登录。"))
-		_, _ = fmt.Fprintln(p.output(), "")
-		_, _ = fmt.Fprintln(p.output(), i18n.T("   管理员操作入口：https://open-dev.dingtalk.com/fe/old#/developerSettings"))
-		_, _ = fmt.Fprintln(p.output(), "")
-		return nil, errors.New(i18n.T("该组织尚未开启 CLI 数据访问权限，请联系管理员开启"))
 	}
 
 	// Save token data with associated client ID for refresh
 	tokenData.ClientID = p.clientID
 	if err := SaveTokenData(p.configDir, tokenData); err != nil {
 		return nil, fmt.Errorf("%s: %w", i18n.T("保存 token 失败"), err)
+	}
+
+	// Always persist clientId to app.json so future process startups
+	// can load it via ResolveAppCredentials and populate DWS_CLIENT_ID env.
+	if p.clientID != "" {
+		_ = os.Setenv("DWS_CLIENT_ID", p.clientID)
+		_ = SaveAppConfig(p.configDir, &AppConfig{ClientID: p.clientID})
 	}
 
 	// Persist app credentials if using custom client credentials
@@ -279,7 +351,41 @@ func (p *DeviceFlowProvider) pollDeviceToken(ctx context.Context, deviceCode str
 	return &resp, nil
 }
 
+// pollDeviceStatus polls the terminal API for device authorization status.
+//
+// Note: The server returns success=false for REJECTED and EXPIRED terminal
+// states (with a valid data.Status value).  These are normal business outcomes,
+// not transport errors, so we return the response to the caller and let the
+// status-switch handle them.
+func (p *DeviceFlowProvider) pollDeviceStatus(ctx context.Context, flowID string) (*DevicePollResponse, error) {
+	endpoint := fmt.Sprintf("%s%s?flowId=%s", p.terminalBaseURL, DevicePollPath, url.QueryEscape(flowID))
+	body, err := p.doGet(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp DevicePollResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("%s: %w", i18n.T("解析响应失败"), err)
+	}
+	// REJECTED/EXPIRED carry success=false but have a valid data.Status;
+	// only treat as a real server error when data.Status is empty.
+	if !resp.Success && resp.Data.Status == "" {
+		return nil, fmt.Errorf("%s: [%s] %s", i18n.T("服务端返回错误"), resp.Code, resp.Message)
+	}
+	return &resp, nil
+}
+
 func (p *DeviceFlowProvider) waitForAuthorization(ctx context.Context, auth *DeviceAuthResponse) (*DeviceTokenResponse, error) {
+	// No FlowID from server — cannot poll status; return immediately so the
+	// user can still see the authorization URL printed earlier and handle it
+	// manually (same pattern as pat_auth_retry.go L451).
+	if auth.FlowID == "" {
+		dfPrintDim(p.output(), i18n.T("  服务端未返回 flowId，跳过轮询，请在浏览器中手动完成授权后重试"))
+		_, _ = fmt.Fprintln(p.output(), "")
+		return nil, nil
+	}
+
 	startTime := time.Now()
 	interval := time.Duration(auth.Interval) * time.Second
 	deadline := time.Duration(auth.ExpiresIn) * time.Second
@@ -302,7 +408,7 @@ func (p *DeviceFlowProvider) waitForAuthorization(ctx context.Context, auth *Dev
 		elapsedSec := int(time.Since(startTime).Seconds())
 		dfPrintPollStatus(p.output(), pollCount, elapsedSec)
 
-		resp, err := p.pollDeviceToken(ctx, auth.DeviceCode)
+		pollResp, err := p.pollDeviceStatus(ctx, auth.FlowID)
 		if err != nil {
 			dfPrintPollResult(p.output(), "network_error", i18n.T("网络错误，继续重试..."))
 			if p.logger != nil {
@@ -311,27 +417,20 @@ func (p *DeviceFlowProvider) waitForAuthorization(ctx context.Context, auth *Dev
 			continue
 		}
 
-		if resp.Error == "" {
+		switch pollResp.Data.Status {
+		case StatusApproved:
 			dfPrintPollResult(p.output(), "authorized", i18n.T("授权成功!"))
-			return resp, nil
-		}
-		switch resp.Error {
-		case "authorization_pending":
+			return &DeviceTokenResponse{AuthCode: pollResp.Data.AuthCode}, nil
+		case StatusPending:
 			dfPrintPollResult(p.output(), "pending", i18n.T("等待用户授权..."))
-		case "slow_down":
-			interval += 5 * time.Second
-			if interval > maxPollInterval*time.Second {
-				interval = maxPollInterval * time.Second
-			}
-			dfPrintPollResult(p.output(), "slow_down", fmt.Sprintf(i18n.T("轮询过快，间隔增加至 %ds"), int(interval.Seconds())))
-		case "access_denied":
+		case StatusRejected:
 			_, _ = fmt.Fprintln(p.output(), "")
 			return nil, errors.New(i18n.T("用户拒绝了授权请求"))
-		case "expired_token":
+		case StatusExpired:
 			_, _ = fmt.Fprintln(p.output(), "")
 			return nil, errors.New(i18n.T("设备授权码已过期"))
 		default:
-			dfPrintPollResult(p.output(), "unknown", fmt.Sprintf(i18n.T("未知错误: %s"), resp.Error))
+			dfPrintPollResult(p.output(), "unknown", fmt.Sprintf(i18n.T("未知状态: %s"), pollResp.Data.Status))
 		}
 	}
 }
@@ -342,6 +441,29 @@ func (p *DeviceFlowProvider) postForm(ctx context.Context, endpoint string, para
 		return nil, fmt.Errorf("%s: %w", i18n.T("创建请求失败"), err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", i18n.T("发送请求失败"), err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", i18n.T("读取响应失败"), err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateBody(body, 200))
+	}
+	return body, nil
+}
+
+// doGet performs an HTTP GET request and returns the response body.
+func (p *DeviceFlowProvider) doGet(ctx context.Context, endpoint string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", i18n.T("创建请求失败"), err)
+	}
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {

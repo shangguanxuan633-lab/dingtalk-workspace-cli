@@ -15,21 +15,25 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cache"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cli"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/compat"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/discovery"
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
@@ -37,8 +41,10 @@ import (
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/logging"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/market"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/output"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/pat"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/pipeline"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/pipeline/handlers"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/plugin"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/recovery"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/transport"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/config"
@@ -52,9 +58,17 @@ type outputFileContextKey struct{}
 const recoveryEventStderrPrefix = "RECOVERY_EVENT_ID="
 
 // Execute runs the root command and returns the process exit code.
-func Execute() int {
+func Execute() (exitCode int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "Error: internal panic: %v\n", r)
+			exitCode = 5
+		}
+	}()
+
 	timing := NewTimingCollector()
 	defer func() {
+		StopAllStdioClients() // Ensure child processes are terminated on exit
 		timing.PrintIfEnabled()
 		timing.WriteReportIfEnabled(RawVersion(), SanitizeCommand(os.Args))
 	}()
@@ -260,6 +274,7 @@ func NewRootCommandWithEngine(rootCtx context.Context, engine *pipeline.Engine) 
 			return nil
 		},
 		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+			StopAllStdioClients()
 			CloseFileLogger()
 			return closeOutputSink(cmd)
 		},
@@ -283,13 +298,27 @@ func NewRootCommandWithEngine(rootCtx context.Context, engine *pipeline.Engine) 
 		newRecoveryCommand(rootCtx, loader, flags),
 		newUpgradeCommand(),
 		newVersionCommand(),
+		newPluginCommand(),
 		schemaCmd,
 		genSkillsCmd,
 		mcpCmd,
 	}
 	root.AddCommand(utilityCommands...)
+
 	root.AddCommand(newLegacyPublicCommands(rootCtx, runner)...)
 	root.AddCommand(newLegacyHiddenCommands(runner)...)
+
+	// --- Plugin loading: runs AFTER legacy commands so that
+	// AppendDynamicServer adds plugin endpoints on top of Market
+	// endpoints (SetDynamicServers is called inside loadDynamicCommands).
+	pluginCmds := loadPlugins(engine, runner)
+	if len(pluginCmds) > 0 {
+		addPluginCommandsSafe(root, pluginCmds)
+	}
+
+	// PAT authorization commands (open-source core)
+	patCaller := newToolCallerAdapter(runner, flags)
+	pat.RegisterCommands(root, patCaller)
 
 	if fn := edition.Get().RegisterExtraCommands; fn != nil {
 		caller := newToolCallerAdapter(runner, flags)
@@ -638,6 +667,7 @@ func hideNonDirectRuntimeCommands(root *cobra.Command) {
 		"doctor":     true,
 		"completion": true,
 		"skill":      true,
+		"plugin":     true,
 		"version":    true,
 		"help":       true,
 		"recovery":   true,
@@ -656,6 +686,66 @@ func hideNonDirectRuntimeCommands(root *cobra.Command) {
 			continue
 		}
 		cmd.Hidden = true
+	}
+}
+
+// reservedCommands is the set of built-in command names that plugins must
+// not override. This protects core CLI functionality from being hijacked
+// by a malicious or misconfigured plugin.
+var reservedCommands = map[string]bool{
+	"auth": true, "login": true, "logout": true,
+	"plugin": true, "skill": true, "cache": true,
+	"config": true, "doctor": true, "completion": true,
+	"recovery": true, "upgrade": true, "version": true,
+	"schema": true, "mcp": true, "help": true,
+}
+
+// addPluginCommandsSafe registers plugin commands with conflict detection.
+//
+// Rules:
+//   - Plugin vs reserved (auth/plugin/cache/...) → reject, warn
+//   - Plugin vs plugin (same name)               → reject later one, warn
+//   - Plugin vs Market dynamic command            → allow, plugin wins
+func addPluginCommandsSafe(root *cobra.Command, pluginCmds []*cobra.Command) {
+	// Build index of existing commands before plugin registration.
+	existing := make(map[string]bool)
+	for _, cmd := range root.Commands() {
+		existing[cmd.Name()] = true
+	}
+
+	pluginSeen := make(map[string]bool)
+
+	for _, cmd := range pluginCmds {
+		name := cmd.Name()
+
+		// Rule 1: never override reserved built-in commands.
+		if reservedCommands[name] {
+			slog.Warn("plugin: command name conflicts with built-in command, skipping",
+				"command", name)
+			continue
+		}
+
+		// Rule 2: plugin vs plugin — first plugin wins.
+		if pluginSeen[name] {
+			slog.Warn("plugin: duplicate command from another plugin, skipping",
+				"command", name)
+			continue
+		}
+		pluginSeen[name] = true
+
+		// Rule 3: plugin vs Market — plugin wins, remove the old one.
+		if existing[name] {
+			for _, old := range root.Commands() {
+				if old.Name() == name {
+					root.RemoveCommand(old)
+					slog.Debug("plugin: overriding Market command",
+						"command", name)
+					break
+				}
+			}
+		}
+
+		root.AddCommand(cmd)
 	}
 }
 
@@ -680,6 +770,43 @@ func deduplicateCommands(root *cobra.Command) {
 func cacheStoreFromEnv() *cache.Store {
 	cacheDir := strings.TrimSpace(os.Getenv(cli.CacheDirEnv))
 	return cache.NewStore(cacheDir)
+}
+
+// pluginColdTimeouts holds the cold-path discovery budget for plugin MCP
+// servers. Timeouts only apply to the *first* discovery for a given
+// plugin/server; subsequent startups take the warm cache path and bypass
+// the network entirely.
+type pluginColdTimeouts struct {
+	httpNoAuth time.Duration
+	httpAuth   time.Duration
+	stdio      time.Duration
+}
+
+// resolvePluginColdTimeouts returns the cold-discovery budget for plugin MCP
+// servers, applying the DWS_PLUGIN_COLD_TIMEOUT override when set. Defaults
+// are tuned so healthy cross-region HTTP endpoints succeed on a cold start
+// and Python/Node-based stdio plugins have headroom for interpreter load,
+// while an unreachable host still surrenders in bounded time.
+func resolvePluginColdTimeouts() pluginColdTimeouts {
+	t := pluginColdTimeouts{
+		httpNoAuth: 1 * time.Second,
+		httpAuth:   1500 * time.Millisecond,
+		stdio:      2 * time.Second,
+	}
+	raw := strings.TrimSpace(os.Getenv(cli.PluginColdTimeoutEnv))
+	if raw == "" {
+		return t
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		slog.Warn("plugin: ignoring invalid DWS_PLUGIN_COLD_TIMEOUT",
+			"value", raw, "error", err)
+		return t
+	}
+	t.httpNoAuth = d
+	t.httpAuth = d
+	t.stdio = d
+	return t
 }
 
 func configureOutputSink(cmd *cobra.Command) error {
@@ -936,6 +1063,519 @@ func CloseFileLogger() {
 	if fileLogger != nil {
 		fileLogger.Close()
 	}
+}
+
+// loadPlugins scans plugin directories, injects their MCP servers into
+// the dynamic server registry, and registers their pipeline hooks.
+// This runs before legacy command construction so that plugin servers
+// are available for EnvironmentLoader.Load().
+func loadPlugins(engine *pipeline.Engine, runner executor.Runner) []*cobra.Command {
+	pluginLoader := plugin.NewLoader(RawVersion())
+
+	// 0a. Inject plugin config values from settings.json as environment
+	// variables so that expandPluginVars can resolve ${KEY} references
+	// in plugin.json headers, endpoints, etc. User-set env vars take
+	// precedence (InjectPluginConfigEnv skips already-set keys).
+	pluginLoader.InjectPluginConfigEnv()
+
+	// Load TokenData once; reused for stdio injection below.
+	tokenData, _ := authpkg.LoadTokenData(defaultConfigDir())
+	var userCtx *plugin.UserContext
+	if tokenData != nil {
+		// Inject user context if either UserID or CorpID is present.
+		if tokenData.UserID != "" || tokenData.CorpID != "" {
+			userCtx = &plugin.UserContext{
+				UserID: tokenData.UserID,
+				CorpID: tokenData.CorpID,
+			}
+		}
+	}
+
+	// 1. Load plugins from the legacy managed/ directory (backward compat
+	//    for plugins installed by older CLI builds).
+	managedPlugins := pluginLoader.LoadManaged()
+
+	// 2. Load user plugins (per settings.json)
+	userPlugins := pluginLoader.LoadUser()
+
+	// 3. Load dev plugins (registered via `dws plugin dev`)
+	devPlugins := pluginLoader.LoadDev()
+
+	allPlugins := append(managedPlugins, userPlugins...)
+	allPlugins = append(allPlugins, devPlugins...)
+
+	// 3. Discover tools from streamable-http servers and build CLI commands.
+	//    Third-party servers with auth headers are discovered in parallel
+	//    to avoid sequential 10s timeouts when multiple remote servers exist.
+	var pluginCmds []*cobra.Command
+	tc := transport.NewClient(nil)
+
+	// Collect all server descriptors and register auth first (fast, no I/O).
+	type pluginServer struct {
+		plugin *plugin.Plugin
+		srv    market.ServerDescriptor
+	}
+	var httpServers []pluginServer
+
+	for _, p := range allPlugins {
+		for _, srv := range p.ToServerDescriptors() {
+			AppendDynamicServer(srv)
+
+			if len(srv.AuthHeaders) > 0 {
+				registerPluginAuthFromHeaders(srv)
+			}
+
+			if srv.HasCLIMeta {
+				httpServers = append(httpServers, pluginServer{plugin: p, srv: srv})
+			}
+		}
+	}
+
+	// Collect all stdio clients up front so HTTP + stdio discovery can run
+	// concurrently — the slowest plugin (typically an unreachable HTTP
+	// endpoint hitting its dial timeout) dominates the parallel wall-clock,
+	// not the sum of every plugin's cold timeout.
+	type stdioEntry struct {
+		plugin *plugin.Plugin
+		sc     plugin.StdioServerClient
+	}
+	var stdioEntries []stdioEntry
+	for _, p := range allPlugins {
+		for _, sc := range p.StdioClients(userCtx) {
+			// Use background context so the subprocess lives for the CLI
+			// process lifetime (not killed by a short timeout).
+			if err := sc.Client.Start(context.Background()); err != nil {
+				slog.Warn("plugin: failed to start stdio server",
+					"plugin", p.Manifest.Name, "server", sc.Key, "error", err)
+				continue
+			}
+			stdioEntries = append(stdioEntries, stdioEntry{plugin: p, sc: sc})
+		}
+	}
+
+	// Share one cache.Store across all discovery goroutines. Each goroutine
+	// writes to a distinct serverKey path ("tools/<plugin>_<server>.json") with
+	// atomic tmp+rename, so concurrent writes to different keys never collide
+	// on the filesystem. Global in-process registries (AppendDynamicServer,
+	// RegisterStdioClient) carry their own sync.Mutex; see direct_runtime.go
+	// and stdio_registry.go.
+	sharedStore := cacheStoreFromEnv()
+	coldTimeouts := resolvePluginColdTimeouts()
+
+	// Fan out HTTP and stdio discovery in parallel. Each goroutine resolves
+	// its cache hit locally (no network) or runs a bounded cold-path probe.
+	// Wall-clock cost ≈ max(individual plugin latencies), not the sum.
+	httpResults := make([][]*cobra.Command, len(httpServers))
+	stdioResults := make([][]*cobra.Command, len(stdioEntries))
+	var wg sync.WaitGroup
+	for i, ps := range httpServers {
+		wg.Add(1)
+		go func(idx int, ps pluginServer) {
+			defer wg.Done()
+			httpResults[idx] = registerHTTPServer(ps.plugin, ps.srv, tc, runner, sharedStore, coldTimeouts)
+		}(i, ps)
+	}
+	for i, e := range stdioEntries {
+		wg.Add(1)
+		go func(idx int, e stdioEntry) {
+			defer wg.Done()
+			stdioResults[idx] = registerStdioServer(e.plugin, e.sc, runner, sharedStore, coldTimeouts)
+		}(i, e)
+	}
+	wg.Wait()
+	for _, cmds := range httpResults {
+		pluginCmds = append(pluginCmds, cmds...)
+	}
+	for _, cmds := range stdioResults {
+		pluginCmds = append(pluginCmds, cmds...)
+	}
+
+	// 5. Register plugin hooks into pipeline engine
+	if engine != nil {
+		for _, p := range allPlugins {
+			hooksCfg, err := p.LoadHooks()
+			if err != nil {
+				slog.Warn("plugin: failed to load hooks",
+					"plugin", p.Manifest.Name, "error", err)
+				continue
+			}
+			if hooksCfg == nil {
+				continue
+			}
+			for _, entry := range hooksCfg.Hooks {
+				engine.Register(plugin.NewHookAdapter(p.Manifest.Name, entry))
+			}
+		}
+	}
+
+	// 7. Sync plugin skills to agent directories
+	plugin.SyncSkills(allPlugins)
+
+	if len(allPlugins) > 0 {
+		slog.Debug("plugins loaded",
+			"managed", len(managedPlugins),
+			"user", len(userPlugins),
+			"dev", len(devPlugins),
+		)
+	}
+
+	return pluginCmds
+}
+
+// pluginCacheKey derives the cache key used to persist a plugin MCP server's
+// tool list. Prefixed with "plugin:" so entries are namespaced apart from the
+// Market-derived cache, and visible distinctly via `dws cache status`.
+func pluginCacheKey(pluginName, serverKey string) string {
+	return "plugin:" + pluginName + ":" + serverKey
+}
+
+// registerHTTPServer discovers tools from a streamable-http MCP server and
+// builds CLI commands. Used for plugin-owned HTTP servers that provide CLI metadata.
+//
+// Startup-latency strategy (issue #119):
+//   - Warm cache: build commands from the persisted tools snapshot
+//     synchronously — no network I/O. `dws --help` returns in ms even when
+//     the plugin endpoint is unreachable.
+//   - Cold cache: synchronous discovery (Initialize + ListTools) with a tight
+//     timeout. The outcome — success or failure — is persisted so the next
+//     invocation hits the warm path. Refresh on demand via `dws cache clean`
+//     / `dws cache refresh`; the cache TTL (7d) otherwise expires naturally.
+//
+// When the server descriptor carries AuthHeaders (from plugin.json "headers"),
+// a dedicated transport.Client is created with the plugin's Bearer token and
+// trusted domains so that third-party MCP servers requiring independent
+// authentication (e.g. Alibaba Cloud Bailian) can be discovered at startup.
+func registerHTTPServer(p *plugin.Plugin, srv market.ServerDescriptor, tc *transport.Client, runner executor.Runner, store *cache.Store, timeouts pluginColdTimeouts) []*cobra.Command {
+	partition := config.DefaultPartition
+	cacheKey := pluginCacheKey(p.Manifest.Name, srv.Key)
+
+	if snapshot, freshness, err := store.LoadTools(partition, cacheKey); err == nil {
+		slog.Debug("plugin: http server served from cache",
+			"plugin", p.Manifest.Name, "server", srv.Key,
+			"tools", len(snapshot.Tools), "freshness", string(freshness))
+		return buildHTTPCommandsFromTools(srv, snapshot.Tools, runner)
+	}
+
+	// Cold cache: synchronous discovery. Persist the outcome even on failure
+	// (empty tools == negative cache) so the next invocation takes the fast
+	// path regardless of endpoint health.
+	tools := discoverHTTPTools(p, srv, tc, timeouts)
+	_ = store.SaveTools(partition, cacheKey, cache.ToolsSnapshot{
+		ServerKey: cacheKey,
+		Tools:     tools,
+	})
+	return buildHTTPCommandsFromTools(srv, tools, runner)
+}
+
+// discoverHTTPTools performs the blocking Initialize + ListTools handshake
+// for an HTTP MCP server and returns the discovered tools. Returns nil on
+// any transport/protocol error; errors are logged at Debug level.
+func discoverHTTPTools(p *plugin.Plugin, srv market.ServerDescriptor, tc *transport.Client, timeouts pluginColdTimeouts) []transport.ToolDescriptor {
+	// Cold-path budget. An unreachable endpoint will burn the full window
+	// via the TCP dial timeout; a healthy localhost/third-party endpoint
+	// typically responds in <200 ms. Third-party servers with auth get a
+	// slightly larger window to accommodate TLS + auth RTT. Operators with
+	// cross-region endpoints can relax the window via DWS_PLUGIN_COLD_TIMEOUT.
+	// The outcome is persisted as a negative cache so subsequent startups
+	// (80 ms warm) are unaffected. See issue #119.
+	timeout := timeouts.httpNoAuth
+	if len(srv.AuthHeaders) > 0 {
+		timeout = timeouts.httpAuth
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	discoveryClient := tc
+	if len(srv.AuthHeaders) > 0 {
+		discoveryClient = buildPluginAuthClient(tc, srv)
+	}
+
+	if _, err := discoveryClient.Initialize(ctx, srv.Endpoint); err != nil {
+		slog.Debug("plugin: http server offline, skipping tool discovery",
+			"plugin", p.Manifest.Name, "server", srv.Key)
+		return nil
+	}
+
+	toolsResult, err := discoveryClient.ListTools(ctx, srv.Endpoint)
+	if err != nil {
+		slog.Debug("plugin: http ListTools failed",
+			"plugin", p.Manifest.Name, "server", srv.Key, "error", err)
+		return nil
+	}
+	return toolsResult.Tools
+}
+
+// buildHTTPCommandsFromTools converts a tool list into Cobra commands via
+// the BuildDynamicCommands path. Returns nil for an empty tool list.
+func buildHTTPCommandsFromTools(srv market.ServerDescriptor, tools []transport.ToolDescriptor, runner executor.Runner) []*cobra.Command {
+	if len(tools) == 0 {
+		return nil
+	}
+
+	detailsByID := make(map[string][]market.DetailTool)
+	var detailTools []market.DetailTool
+	for _, tool := range tools {
+		schemaJSON := ""
+		if tool.InputSchema != nil {
+			if data, marshalErr := json.Marshal(tool.InputSchema); marshalErr == nil {
+				schemaJSON = string(data)
+			}
+		}
+		detailTools = append(detailTools, market.DetailTool{
+			ToolName:    tool.Name,
+			ToolTitle:   tool.Title,
+			ToolDesc:    tool.Description,
+			IsSensitive: tool.Sensitive,
+			ToolRequest: schemaJSON,
+		})
+	}
+	detailsByID[strings.TrimSpace(srv.CLI.ID)] = detailTools
+
+	// If the server has no ToolOverrides (e.g. third-party MCP servers that
+	// only declare cli.id and cli.command), auto-generate one override per
+	// discovered tool so BuildDynamicCommands can create leaf commands.
+	if len(srv.CLI.ToolOverrides) == 0 {
+		srv.CLI.ToolOverrides = make(map[string]market.CLIToolOverride, len(tools))
+		for _, tool := range tools {
+			srv.CLI.ToolOverrides[tool.Name] = market.CLIToolOverride{
+				CLIName: deriveToolCLIName(tool.Name),
+			}
+		}
+	}
+
+	return compat.BuildDynamicCommands(
+		[]market.ServerDescriptor{srv}, runner, detailsByID)
+}
+
+// deriveToolCLIName converts an MCP tool name (e.g. "web_search" or
+// "maps.search_poi") into a kebab-case CLI command name ("search" or
+// "search-poi"). It strips common prefixes and replaces underscores/dots
+// with hyphens.
+func deriveToolCLIName(toolName string) string {
+	// Use the last segment after "." as the base name.
+	if idx := strings.LastIndex(toolName, "."); idx >= 0 {
+		toolName = toolName[idx+1:]
+	}
+	// Replace underscores with hyphens for kebab-case.
+	return strings.ReplaceAll(toolName, "_", "-")
+}
+
+// buildPluginAuthClient creates a transport.Client copy with the plugin's
+// Bearer token and trusted domains injected. This allows third-party MCP
+// servers that require independent authentication to be discovered at startup.
+func buildPluginAuthClient(base *transport.Client, srv market.ServerDescriptor) *transport.Client {
+	authToken := ""
+	extraHeaders := make(map[string]string)
+	for key, value := range srv.AuthHeaders {
+		if strings.EqualFold(key, "Authorization") {
+			authToken = strings.TrimPrefix(value, "Bearer ")
+			authToken = strings.TrimSpace(authToken)
+		} else {
+			extraHeaders[key] = value
+		}
+	}
+	if authToken == "" {
+		return base
+	}
+	client := base.WithAuth(authToken, extraHeaders)
+	// Trust the endpoint's hostname so the token is actually sent.
+	if parsed, err := url.Parse(srv.Endpoint); err == nil {
+		host := parsed.Hostname()
+		client.TrustedDomains = []string{host, "*." + host}
+	}
+	return client
+}
+
+// registerPluginAuthFromHeaders extracts authentication credentials from
+// a server descriptor's AuthHeaders and registers them in the global
+// PluginAuth registry. The runner uses this registry at execution time
+// to inject the correct Bearer token for third-party MCP servers.
+func registerPluginAuthFromHeaders(srv market.ServerDescriptor) {
+	authToken := ""
+	extraHeaders := make(map[string]string)
+	for key, value := range srv.AuthHeaders {
+		if strings.EqualFold(key, "Authorization") {
+			authToken = strings.TrimPrefix(value, "Bearer ")
+			authToken = strings.TrimSpace(authToken)
+		} else {
+			extraHeaders[key] = value
+		}
+	}
+	if authToken == "" {
+		return
+	}
+	var trustedDomains []string
+	if parsed, err := url.Parse(srv.Endpoint); err == nil {
+		host := parsed.Hostname()
+		trustedDomains = []string{host, "*." + host}
+	}
+	productID := strings.TrimSpace(srv.CLI.ID)
+	if productID == "" {
+		productID = srv.Key
+	}
+	RegisterPluginAuth(productID, &PluginAuth{
+		Token:          authToken,
+		ExtraHeaders:   extraHeaders,
+		TrustedDomains: trustedDomains,
+	})
+}
+
+// registerStdioServer initializes a stdio MCP server, discovers its tools
+// via ListTools, builds CLI commands, and registers the StdioClient for
+// runtime dispatch. Returns generated cobra commands.
+//
+// Warm-cache fast path (issue #119): when a tools snapshot is already cached
+// for this plugin/server, skip the Initialize + ListTools RPC round-trip and
+// rebuild commands directly from the snapshot. Cold cache falls back to
+// synchronous discovery with a 4s cap and persists the outcome.
+func registerStdioServer(p *plugin.Plugin, sc plugin.StdioServerClient, runner executor.Runner, store *cache.Store, timeouts pluginColdTimeouts) []*cobra.Command {
+	partition := config.DefaultPartition
+	cacheKey := pluginCacheKey(p.Manifest.Name, sc.Key)
+
+	if snapshot, freshness, err := store.LoadTools(partition, cacheKey); err == nil {
+		slog.Debug("plugin: stdio server served from cache",
+			"plugin", p.Manifest.Name, "server", sc.Key,
+			"tools", len(snapshot.Tools), "freshness", string(freshness))
+		return buildStdioCommands(p, sc, snapshot.Tools, runner)
+	}
+
+	tools := discoverStdioTools(p, sc, timeouts)
+	_ = store.SaveTools(partition, cacheKey, cache.ToolsSnapshot{
+		ServerKey: cacheKey,
+		Tools:     tools,
+	})
+	return buildStdioCommands(p, sc, tools, runner)
+}
+
+// discoverStdioTools performs the blocking Initialize + ListTools handshake
+// on a stdio MCP subprocess. Returns nil on any error (logged at Warn level).
+// The default 2s budget comfortably accommodates Python/Node runtimes whose
+// interpreter + dependency load dominates the first response. Operators with
+// heavier startup chains can relax further via DWS_PLUGIN_COLD_TIMEOUT.
+func discoverStdioTools(p *plugin.Plugin, sc plugin.StdioServerClient, timeouts pluginColdTimeouts) []transport.ToolDescriptor {
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.stdio)
+	defer cancel()
+
+	if _, err := sc.Client.Initialize(ctx); err != nil {
+		slog.Warn("plugin: stdio initialize failed",
+			"plugin", p.Manifest.Name, "server", sc.Key, "error", err)
+		return nil
+	}
+	toolsResult, err := sc.Client.ListTools(ctx)
+	if err != nil {
+		slog.Warn("plugin: stdio ListTools failed",
+			"plugin", p.Manifest.Name, "server", sc.Key, "error", err)
+		return nil
+	}
+	return toolsResult.Tools
+}
+
+// buildStdioCommands constructs Cobra commands from a tool list and
+// registers the runtime dispatch state (StdioClient + dynamic server).
+// Returns nil for an empty tool list.
+func buildStdioCommands(p *plugin.Plugin, sc plugin.StdioServerClient, tools []transport.ToolDescriptor, runner executor.Runner) []*cobra.Command {
+	if len(tools) == 0 {
+		slog.Debug("plugin: stdio server has no tools",
+			"plugin", p.Manifest.Name, "server", sc.Key)
+		return nil
+	}
+
+	// Build CLIOverlay: use manifest CLI metadata if present, else auto-generate.
+	serverID := sc.Key
+	overlay := market.CLIOverlay{
+		ID:      serverID,
+		Command: serverID,
+	}
+	if srv, ok := p.Manifest.MCPServers[sc.Key]; ok && len(srv.CLI) > 0 {
+		cliData := srv.CLI
+		// If cli is a JSON string, treat it as a relative file path to an overlay file.
+		if len(cliData) > 0 && cliData[0] == '"' {
+			var cliPath string
+			if err := json.Unmarshal(cliData, &cliPath); err == nil && cliPath != "" {
+				absPath := filepath.Join(p.Root, cliPath)
+				if fileData, readErr := os.ReadFile(absPath); readErr == nil {
+					cliData = fileData
+				} else {
+					slog.Warn("plugin: failed to read CLI overlay file",
+						"plugin", p.Manifest.Name, "path", absPath, "error", readErr)
+				}
+			}
+		}
+		if err := json.Unmarshal(cliData, &overlay); err != nil {
+			slog.Warn("plugin: failed to parse CLI overlay for stdio server",
+				"plugin", p.Manifest.Name, "server", sc.Key, "error", err)
+		}
+		if overlay.ID == "" {
+			overlay.ID = serverID
+		}
+		if overlay.Command == "" {
+			overlay.Command = serverID
+		}
+	}
+
+	// Auto-generate ToolOverrides from discovered tools when not provided.
+	if len(overlay.ToolOverrides) == 0 {
+		overlay.ToolOverrides = make(map[string]market.CLIToolOverride)
+		if len(overlay.Prefixes) == 0 {
+			overlay.Prefixes = []string{serverID}
+		}
+		for _, tool := range tools {
+			overlay.ToolOverrides[tool.Name] = market.CLIToolOverride{
+				IsSensitive: tool.Sensitive,
+			}
+		}
+	}
+
+	// Construct virtual endpoint and server descriptor.
+	endpoint := StdioEndpoint(p.Manifest.Name, sc.Key)
+
+	source := "plugin"
+	if p.IsManaged {
+		source = "plugin-managed"
+	}
+
+	descriptor := market.ServerDescriptor{
+		Key:         sc.Key,
+		DisplayName: p.Manifest.Name + "/" + sc.Key,
+		Description: p.Manifest.Description,
+		Endpoint:    endpoint,
+		Source:      source,
+		CLI:         overlay,
+		HasCLIMeta:  true,
+	}
+
+	AppendDynamicServer(descriptor)
+	// Register with pluginName/serverKey format for cleanup by plugin name
+	RegisterStdioClient(p.Manifest.Name+"/"+serverID, sc.Client)
+
+	// Convert tool descriptors to DetailTool entries for flag generation.
+	detailsByID := make(map[string][]market.DetailTool)
+	var detailTools []market.DetailTool
+	for _, tool := range tools {
+		schemaJSON := ""
+		if tool.InputSchema != nil {
+			if data, marshalErr := json.Marshal(tool.InputSchema); marshalErr == nil {
+				schemaJSON = string(data)
+			}
+		}
+		detailTools = append(detailTools, market.DetailTool{
+			ToolName:    tool.Name,
+			ToolTitle:   tool.Title,
+			ToolDesc:    tool.Description,
+			IsSensitive: tool.Sensitive,
+			ToolRequest: schemaJSON,
+		})
+	}
+	detailsByID[serverID] = detailTools
+
+	cmds := compat.BuildDynamicCommands(
+		[]market.ServerDescriptor{descriptor}, runner, detailsByID)
+
+	slog.Debug("plugin: stdio server registered",
+		"plugin", p.Manifest.Name, "server", sc.Key,
+		"tools", len(tools), "commands", len(cmds))
+
+	return cmds
 }
 
 // newPipelineEngine creates and configures the pipeline engine with

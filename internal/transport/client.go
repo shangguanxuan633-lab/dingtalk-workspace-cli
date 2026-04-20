@@ -212,7 +212,7 @@ func (r *ToolCallResult) UnmarshalJSON(data []byte) error {
 func defaultTransport() *http.Transport {
 	return &http.Transport{
 		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
+			Timeout:   3 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
@@ -298,6 +298,7 @@ func SupportedProtocolVersions() []string {
 }
 
 func (c *Client) Initialize(ctx context.Context, endpoint string) (InitializeResult, error) {
+	var lastErr error
 	for _, version := range SupportedProtocolVersions() {
 		params := map[string]any{
 			"capabilities": map[string]any{},
@@ -309,18 +310,33 @@ func (c *Client) Initialize(ctx context.Context, endpoint string) (InitializeRes
 		}
 
 		var payload InitializeResult
-		if err := c.callJSONRPC(ctx, endpoint, requestEnvelope{
+		err := c.callJSONRPC(ctx, endpoint, requestEnvelope{
 			JSONRPC: "2.0",
 			ID:      1,
 			Method:  "initialize",
 			Params:  params,
-		}, true, &payload); err == nil {
+		}, true, &payload)
+		if err == nil {
 			if payload.ProtocolVersion == "" {
 				payload.ProtocolVersion = version
 			}
 			payload.RequestedProtocolVersion = version
 			return payload, nil
 		}
+		lastErr = err
+		// Only protocol-level JSON-RPC errors justify trying another version.
+		// Transport/HTTP failures (dial timeout, connection refused, HTTP 5xx,
+		// etc.) fail identically regardless of protocol version, so looping
+		// over three versions only multiplies the dial cost — e.g. on an
+		// unreachable endpoint, three 3-second dials amount to 9 seconds
+		// before the outer context surrenders.
+		var callErr *CallError
+		if !errors.As(err, &callErr) || callErr.Stage != CallStageJSONRPC {
+			return InitializeResult{}, err
+		}
+	}
+	if lastErr != nil {
+		return InitializeResult{}, lastErr
 	}
 	return InitializeResult{}, apperrors.NewDiscovery(fmt.Sprintf("initialize failed for all supported protocol versions at %s", RedactURL(endpoint)))
 }
@@ -507,6 +523,15 @@ func (c *Client) doWithRetry(ctx context.Context, endpoint string, body []byte) 
 			if key != "" && value != "" {
 				req.Header.Set(key, value)
 			}
+		}
+
+		// Diagnostic: log identity-related headers on first attempt.
+		if attempt == 0 && c.FileLogger != nil {
+			c.FileLogger.LogAttrs(context.Background(), slog.LevelDebug, "http_request_headers",
+				slog.String("endpoint", endpoint),
+				slog.String("x-user-access-token-present", fmt.Sprintf("%t", req.Header.Get("x-user-access-token") != "")),
+				slog.Int("extra_headers_count", len(c.ExtraHeaders)),
+			)
 		}
 
 		resp, err := c.HTTPClient.Do(req)
