@@ -23,14 +23,14 @@ import (
 )
 
 // caller is the package-level ToolCaller shared by the apply / status /
-// scopes subcommands. chmod intentionally does NOT read this variable (see
-// newChmodCommand, which takes caller as a closure param per upstream PR
-// #129's shared-state fix) so multiple RegisterCommands invocations keep
-// producing independent chmod instances.
+// scopes / diagnose subcommands. chmod intentionally does NOT read this
+// variable (see newChmodCommand, which takes caller as a closure param per
+// upstream PR #129's shared-state fix) so multiple RegisterCommands
+// invocations keep producing independent chmod instances.
 //
-// TODO(pat-caller-factory): migrate apply / status / scopes to the same
-// factory pattern to retire this package-level variable. Tracked alongside
-// the TestPrintExecutionError* race fix.
+// TODO(pat-caller-factory): migrate apply / status / scopes / diagnose to
+// the same factory pattern to retire this package-level variable. Tracked
+// alongside the TestPrintExecutionError* race fix.
 var caller edition.ToolCaller
 
 // RegisterCommands adds the pat command tree to rootCmd.
