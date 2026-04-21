@@ -46,6 +46,9 @@ func TestOpenSourceTreeOmitsEmbeddedHostMarkers(t *testing.T) {
 		"EnablePrivate" + "UtilityCommands",
 		"UseExecutable" + "ConfigDir",
 		"DeleteExeRelative" + "TokenOnAuthErr",
+		"WriteToken" + "Marker",
+		"Token" + "Marker",
+		"tokenJSON" + "File",
 		"MergeWukong" + "MCPHeaders",
 		"buildMode ==" + " \"real\"",
 	}
