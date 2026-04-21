@@ -1,10 +1,9 @@
-# PAT + A2A Wire Contract
+# PAT Wire Contract
 
 > 本文档是 `dws` CLI 与第三方宿主之间的 **wire contract**（线上契约）。
 > 所有外部可见字符串、退出码、字段名、枚举值均以本文档为准。
 > 双语并列表示 CLI ↔ 宿主必须以**完全一致**的常量跨进程 / 跨语言识别。
 
-<!-- evidence: docs/_research/w1-lane1-wukong-pat-a2a.md, w1-lane2-rewind-pat-consumer.md, w1-lane3-oss-pat-current-gap.md -->
 
 ---
 

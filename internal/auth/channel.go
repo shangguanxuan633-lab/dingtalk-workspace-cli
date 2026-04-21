@@ -29,8 +29,6 @@ const (
 )
 
 // CurrentChannelCode returns the raw upstream channel code as configured locally.
-//
-// Deprecated: use internal/a2a.CurrentChannelCode.
 func CurrentChannelCode() string {
 	return os.Getenv(DWSChannelEnv)
 }
@@ -47,8 +45,6 @@ func HostOwnsPATFlow() bool {
 }
 
 // ApplyChannelHeader injects the configured channel code into a request.
-//
-// Deprecated: use internal/a2a.ApplyChannelHeader.
 func ApplyChannelHeader(req *http.Request) {
 	if req == nil {
 		return

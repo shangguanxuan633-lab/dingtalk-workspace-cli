@@ -13,7 +13,7 @@
 | `DWS_TRUSTED_DOMAINS` | Comma-separated trusted domains for bearer token (default: `*.dingtalk.com`). `*` for dev only / Bearer token 允许发送的域名白名单，默认 `*.dingtalk.com`，仅开发环境可设为 `*` |
 | `DWS_ALLOW_HTTP_ENDPOINTS` | Set `1` to allow HTTP for loopback during dev / 设为 `1` 允许回环地址 HTTP，仅用于开发调试 |
 
-### PAT / A2A
+### PAT
 
 | Variable | Purpose / 用途 | Tier |
 |---------|---------|---|
@@ -30,7 +30,6 @@
 | `REWIND_SESSION_ID` | Chain A compatibility alias for `DWS_SESSION_ID` (PAT subcommand `--session-id` fallback only; **NOT** consulted for trace-header injection). Retained for already-shipped reference host integrations; new integrations SHOULD use `DWS_SESSION_ID` / 链路 A 的 `DWS_SESSION_ID` 兼容别名（仅 PAT 子命令 `--session-id` 回退；trace 头注入**不**读此变量）；仅为兼容已有参考宿主实现保留 | Stable (compat) |
 | `REWIND_REQUEST_ID` | Optional compatibility alias (legacy trace request id); only consumed by edition hooks that predate the `DWS_TRACE_ID` rename / trace 请求 id 的兼容别名；仅被早于重命名的 edition hook 消费 | Stable (compat) |
 | `REWIND_MESSAGE_ID` | Optional compatibility alias (legacy trace message id) / trace 消息 id 的兼容别名 | Stable (compat) |
-| `DWS_A2A_GATEWAY` | Planned (A2A command tree): will override A2A gateway base URL once `dws a2a` CLI ships. Currently unused by the OSS CLI / **计划中**：当 `dws a2a` 子命令树落地后用于覆盖 A2A 网关地址；当前开源 CLI 尚未消费 | Planned |
 
 > **Non-consumed aliases / 不识别的别名**：以下环境变量 **CLI 当前版本不读**，宿主不应依赖——`DWS_AGENTCODE`、`DINGTALK_AGENTCODE`、`REWIND_AGENTCODE`、`DINGTALK_PAT_AUTH_REQUEST_ID`、`REWIND_PAT_AUTH_REQUEST_ID`。<!-- evidence: internal/pat/chmod.go resolveAgentCodeFromEnv + internal/pat/status.go runStatus -->
 
@@ -178,17 +177,6 @@ An omitted `--agentCode` (after env fallback) signals the server to use its defa
 
 > **No legacy tool-name fallback**: same as `pat status` — `TOOL_NOT_FOUND` propagates if `pat.scopes` is not registered server-side.
 
-### A2A 子命令 / A2A commands
-
-> ⚠️ **Status: Planned (milestone `dws-a2a-cli`)** — 以下 `dws a2a ...` 子命令**尚未在开源 CLI 中实现**。`internal/a2a/` 包目前只提供 host-side Go SDK helpers（token / channel / headers / registry），第三方宿主可 import 后在自身进程内实现 A2A client；CLI 命令树为后续版本的工作。协议细节见 [docs/pat/a2a-protocol.md](./pat/a2a-protocol.md)。
-
-| Command | Status | Purpose |
-|---|---|---|
-| `dws a2a agents list [-f json]` | Planned | List discoverable remote agents |
-| `dws a2a agents info --agent <name>` | Planned | Fetch a full `AgentCard` |
-| `dws a2a send --agent <name> --text "..." [--context-id <id>] [--stream]` | Planned | Send a message (sync or SSE streaming) |
-| `dws a2a send --agent <name> --data '<json>'` | Planned | Send structured data as `Part.data` instead of text |
-
 ## Request Headers Injected by CLI / CLI 注入的请求头
 
 下列请求头由 CLI 统一注入；宿主**不需要**手动设置。
@@ -202,7 +190,5 @@ An omitted `--agentCode` (after env fallback) signals the server to use its defa
 | `x-dws-source` | Distribution channel (OSS default `github`) | Stable |
 | `x-dingtalk-scenario-code` | Edition hook (OSS default: unset) | Stable |
 | `x-dingtalk-source` | Distribution channel marker | Stable |
-| `A2A-Version` | Constant `1.0` (A2A requests only) | Frozen |
-| `x-user-access-token` | Local credential (A2A requests only) | Frozen |
 
 字段级契约与 tier 说明见 [docs/pat/contract.md §7](./pat/contract.md)。

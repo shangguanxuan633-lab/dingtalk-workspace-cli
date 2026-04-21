@@ -22,6 +22,15 @@ import (
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 )
 
+// caller is the package-level ToolCaller shared by the apply / status /
+// scopes subcommands. chmod intentionally does NOT read this variable (see
+// newChmodCommand, which takes caller as a closure param per upstream PR
+// #129's shared-state fix) so multiple RegisterCommands invocations keep
+// producing independent chmod instances.
+//
+// TODO(pat-caller-factory): migrate apply / status / scopes to the same
+// factory pattern to retire this package-level variable. Tracked alongside
+// the TestPrintExecutionError* race fix.
 var caller edition.ToolCaller
 
 // RegisterCommands adds the pat command tree to rootCmd.
@@ -58,7 +67,7 @@ DWS_CHANNEL 只用于上游 channelCode。`,
 		RunE: cmdutil.GroupRunE,
 	}
 
-	patCmd.AddCommand(chmodCmd)
+	patCmd.AddCommand(newChmodCommand(c))
 	patCmd.AddCommand(applyCmd)
 	patCmd.AddCommand(statusCmd)
 	patCmd.AddCommand(scopesCmd)
