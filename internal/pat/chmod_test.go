@@ -418,6 +418,30 @@ func TestChmod_agentCode_env_fallback(t *testing.T) {
 	}
 }
 
+func TestChmod_withoutAgentCodeUsesServerDefault(t *testing.T) {
+	t.Setenv(agentCodeEnv, "")
+
+	fake := &fakeToolCaller{resultOK: true}
+	cmd := buildChmod(t, fake)
+	_ = cmd.Flags().Set("grant-type", "once")
+
+	if err := cmd.RunE(cmd, []string{"aitable.record:read"}); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
+	}
+	if fake.gotTool != patBatchGrantToolName {
+		t.Fatalf("gotTool = %q, want %q", fake.gotTool, patBatchGrantToolName)
+	}
+	if got := fake.gotAgentEnv; got != "" {
+		t.Fatalf("agent env = %q, want empty so server default agentCode is used", got)
+	}
+	if _, ok := fake.gotArgs["agentCode"]; ok {
+		t.Fatalf("batch argv must omit agentCode when caller leaves it unset: %#v", fake.gotArgs)
+	}
+	if got := fake.gotArgs["scopes"]; !stringSliceArgEqual(got, []string{"aitable.record:read"}) {
+		t.Fatalf("scopes in argv = %#v, want %#v", got, []string{"aitable.record:read"})
+	}
+}
+
 func TestCallPATToolWithLegacyFallback_emptyCanonicalResultDoesNotRetryLegacyAlias(t *testing.T) {
 	fake := &fallbackToolCaller{}
 	canonicalArgs := map[string]any{
@@ -712,10 +736,8 @@ func TestChmod_agentCode_flag_wins_over_env(t *testing.T) {
 
 // TestChmod_agentCode_legacy_env_not_recognized is a reverse-guard: after
 // the SSOT hard-removal of the DWS_AGENTCODE alias, exporting only the
-// legacy env MUST NOT satisfy the --agentCode requirement. The command
-// is expected to fail with an error that explicitly names the canonical
-// DINGTALK_DWS_AGENTCODE env, and MUST NOT mention DWS_AGENTCODE as a
-// usable fallback. No MCP call is permitted.
+// legacy env MUST NOT be consumed. The command is still allowed to run,
+// omits agentCode, and lets lippi-pat-core write its default agentCode.
 func TestChmod_agentCode_legacy_env_not_recognized(t *testing.T) {
 	t.Setenv(agentCodeEnv, "")
 	t.Setenv("DWS_AGENTCODE", "legacyval")
@@ -724,23 +746,17 @@ func TestChmod_agentCode_legacy_env_not_recognized(t *testing.T) {
 	cmd := buildChmod(t, fake)
 	_ = cmd.Flags().Set("grant-type", "once")
 
-	err := cmd.RunE(cmd, []string{"aitable.record:read"})
-	if err == nil {
-		t.Fatalf("expected hard error when only legacy DWS_AGENTCODE is set, got nil")
+	if err := cmd.RunE(cmd, []string{"aitable.record:read"}); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "DINGTALK_DWS_AGENTCODE") {
-		t.Fatalf("error = %q, want to name canonical DINGTALK_DWS_AGENTCODE env", err.Error())
+	if fake.callN != 1 {
+		t.Fatalf("CallTool was invoked %d times, want 1", fake.callN)
 	}
-	// Defensive: the canonical env naturally contains the substring
-	// "DWS_AGENTCODE" as part of "DINGTALK_DWS_AGENTCODE"; the above
-	// assertion plus the absence check below precisely guard against
-	// advertising the legacy alias as usable.
-	hint := strings.ReplaceAll(err.Error(), "DINGTALK_DWS_AGENTCODE", "")
-	if strings.Contains(hint, "DWS_AGENTCODE") {
-		t.Fatalf("error = %q must not advertise DWS_AGENTCODE as usable", err.Error())
+	if got := fake.gotAgentEnv; got != "" {
+		t.Fatalf("agent env = %q, want empty; legacy DWS_AGENTCODE must not be consumed", got)
 	}
-	if fake.callN != 0 {
-		t.Fatalf("CallTool was invoked %d times; legacy env must not satisfy --agentCode", fake.callN)
+	if _, ok := fake.gotArgs["agentCode"]; ok {
+		t.Fatalf("batch argv must omit agentCode when only legacy env is set: %#v", fake.gotArgs)
 	}
 }
 

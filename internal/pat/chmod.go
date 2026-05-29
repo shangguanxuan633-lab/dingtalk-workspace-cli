@@ -54,12 +54,12 @@ func resolveSessionIDFromEnv() string {
 // used as a per-shell fallback for the --agentCode flag on `dws pat *`
 // commands.
 //
-// Why: agent hosts typically set their business agent code once when
-// spawning a long-lived shell / sub-process; requiring `--agentCode` on
-// every command in that shell forces the host to rewrite every argv.
-// Exposing DINGTALK_DWS_AGENTCODE lets the host export the code once and
-// let the CLI resolve it on every pat subcommand. The flag always wins
-// when both are set so scripted one-offs remain deterministic.
+// Why: agent hosts may set their business agent code once when spawning
+// a long-lived shell / sub-process. Exposing DINGTALK_DWS_AGENTCODE lets
+// the host export the code once and let the CLI resolve it on every pat
+// subcommand. The flag always wins when both are set so scripted one-offs
+// remain deterministic. When neither flag nor env is set, the request is
+// sent without agentCode and lippi-pat-core applies its default agentCode.
 //
 // Namespace note: DWS_AGENTCODE / DINGTALK_AGENTCODE / REWIND_AGENTCODE
 // are explicitly NOT consumed. The legacy DWS_AGENTCODE alias was
@@ -186,14 +186,14 @@ grantType 规则:
 			}
 			return cobra.MinimumNArgs(1)(cmd, args)
 		},
-		Example: `  dws pat chmod aitable.record:read --agentCode agt-xxxx --grant-type session --session-id session-xxx
-  dws pat chmod chat.message:list --grant-type once --agentCode agt-xxxx
-  dws pat chmod aitable.record:read aitable.record:write --agentCode agt-xxxx --grant-type permanent
+		Example: `  dws pat chmod aitable.record:read --grant-type session --session-id session-xxx
+  dws pat chmod chat.message:list --grant-type once
+  dws pat chmod aitable.record:read aitable.record:write --grant-type permanent
   dws pat chmod --products calendar,aitable --grant-type session --session-id session-xxx
   dws pat chmod --recommend --grant-type session --session-id session-xxx`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			flagVal, _ := cmd.Flags().GetString("agentCode")
-			agentCode, err := resolveAgentCode(flagVal, true)
+			agentCode, err := resolveAgentCode(flagVal, false)
 			if err != nil {
 				return err
 			}
@@ -208,7 +208,7 @@ grantType 规则:
 			}
 
 			if grantType == "session" && sessionID == "" && resolveSessionIDFromEnv() == "" {
-				return fmt.Errorf("--session-id is required when --grant-type is session\n  hint: dws pat chmod <scope> --agentCode <id> --grant-type session --session-id <id>")
+				return fmt.Errorf("--session-id is required when --grant-type is session\n  hint: dws pat chmod <scope> --grant-type session --session-id <id>")
 			}
 
 			if c != nil && c.DryRun() {
@@ -223,7 +223,11 @@ grantType 规则:
 				bold := color.New(color.FgYellow, color.Bold)
 				bold.Println("[DRY-RUN] Preview only, not executed:")
 				fmt.Printf("%-16s%s\n", "Tool:", patBatchGrantToolName)
-				fmt.Printf("%-16s%s\n", "AgentCode:", agentCode)
+				if agentCode != "" {
+					fmt.Printf("%-16s%s\n", "AgentCode:", agentCode)
+				} else {
+					fmt.Printf("%-16s%s\n", "AgentCode:", "(server default)")
+				}
 				fmt.Printf("%-16s%v\n", "Scope:", scopes)
 				fmt.Printf("%-16s%s\n", "GrantType:", grantType)
 				if sessionID != "" {
@@ -258,9 +262,11 @@ grantType 规则:
 				"grantType": grantType,
 			}
 			toolArgs := map[string]any{
-				"agentCode": agentCode,
 				"scopes":    scopes,
 				"grantType": grantType,
+			}
+			if agentCode != "" {
+				toolArgs["agentCode"] = agentCode
 			}
 			if sessionID != "" {
 				toolArgs["sessionId"] = sessionID
@@ -295,12 +301,8 @@ grantType 规则:
 		},
 	}
 
-	// --agentCode is required, but we deliberately do NOT call
-	// MarkFlagRequired here. The agent code may also come from the
-	// DINGTALK_DWS_AGENTCODE env var; cobra's MarkFlagRequired would
-	// refuse to run before our resolver has a chance to consume the env.
 	chmodCmd.Flags().String("agentCode", "",
-		"Agent 唯一标识（必填；亦可通过 env DINGTALK_DWS_AGENTCODE 注入，flag 优先）")
+		"Agent 唯一标识（可选；不填则由服务端写入默认 AgentCode；env DINGTALK_DWS_AGENTCODE 可注入，flag 优先）")
 	chmodCmd.Flags().String("grant-type", "session", "授权策略: once|session|permanent")
 	chmodCmd.Flags().String("session-id", "", "会话标识（session 模式下必填）")
 	chmodCmd.Flags().StringArrayVar(&productFlags, "product", nil, "产品编码，可重复；与 --products 等价")
