@@ -785,6 +785,9 @@ func compactTool(t ir.ToolDescriptor) map[string]any {
 	if t.Annotations != nil {
 		tool["annotations"] = t.Annotations
 	}
+	if t.Auth != nil {
+		tool["auth"] = t.Auth
+	}
 	if len(t.FlagOverlay) > 0 {
 		tool["flag_overlay"] = t.FlagOverlay
 	}

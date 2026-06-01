@@ -16,6 +16,8 @@ package pat
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -30,12 +32,14 @@ import (
 // assert how the two-tier --agentCode / DINGTALK_DWS_AGENTCODE / error
 // resolver feeds into the outgoing MCP argv.
 type fakeToolCaller struct {
-	mu       sync.Mutex
-	dryRun   bool
-	gotTool  string
-	gotArgs  map[string]any
-	callN    int
-	resultOK bool
+	mu            sync.Mutex
+	dryRun        bool
+	gotTool       string
+	gotArgs       map[string]any
+	gotAgentEnv   string
+	gotSessionEnv string
+	callN         int
+	resultOK      bool
 }
 
 func (f *fakeToolCaller) CallTool(_ context.Context, _ string, toolName string, args map[string]any) (*edition.ToolResult, error) {
@@ -43,6 +47,8 @@ func (f *fakeToolCaller) CallTool(_ context.Context, _ string, toolName string, 
 	defer f.mu.Unlock()
 	f.callN++
 	f.gotTool = toolName
+	f.gotAgentEnv = os.Getenv(agentCodeEnv)
+	f.gotSessionEnv = os.Getenv("DWS_SESSION_ID")
 	// defensive copy — RunE / runApply may mutate the map after return
 	f.gotArgs = make(map[string]any, len(args))
 	for k, v := range args {
@@ -187,6 +193,28 @@ func (f *fallbackPATContractErrorToolCaller) CallTool(_ context.Context, _ strin
 func (f *fallbackPATContractErrorToolCaller) Format() string { return "json" }
 func (f *fallbackPATContractErrorToolCaller) DryRun() bool   { return false }
 
+type sequenceToolCaller struct {
+	calls     []recordedToolCall
+	responses []string
+	dryRun    bool
+}
+
+func (s *sequenceToolCaller) CallTool(_ context.Context, _ string, toolName string, args map[string]any) (*edition.ToolResult, error) {
+	copied := make(map[string]any, len(args))
+	for k, v := range args {
+		copied[k] = v
+	}
+	s.calls = append(s.calls, recordedToolCall{tool: toolName, args: copied})
+	response := `{"success":true,"data":{}}`
+	if len(s.responses) >= len(s.calls) {
+		response = s.responses[len(s.calls)-1]
+	}
+	return &edition.ToolResult{Content: []edition.ContentBlock{{Type: "text", Text: response}}}, nil
+}
+
+func (s *sequenceToolCaller) Format() string { return "json" }
+func (s *sequenceToolCaller) DryRun() bool   { return s.dryRun }
+
 func stringSliceArgEqual(got any, want []string) bool {
 	gotSlice, ok := got.([]string)
 	if !ok || len(gotSlice) != len(want) {
@@ -200,12 +228,158 @@ func stringSliceArgEqual(got any, want []string) bool {
 	return true
 }
 
+func captureStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	oldStdout := os.Stdout
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe error = %v", err)
+	}
+	os.Stdout = writePipe
+	runErr := fn()
+	_ = writePipe.Close()
+	os.Stdout = oldStdout
+	out, readErr := io.ReadAll(readPipe)
+	_ = readPipe.Close()
+	if readErr != nil {
+		t.Fatalf("ReadAll stdout error = %v", readErr)
+	}
+	return string(out), runErr
+}
+
 // buildChmod returns a freshly constructed chmod cobra.Command wired to
 // fake. Using the factory (instead of a package-level var) keeps every
 // subtest hermetic and matches the upstream shared-state fix in PR #129.
 func buildChmod(t *testing.T, fake *fakeToolCaller) *cobra.Command {
 	t.Helper()
 	return newChmodCommand(fake)
+}
+
+func TestRegisterCommands_OnlyExposesChmodForAuthorization(t *testing.T) {
+	root := &cobra.Command{Use: "dws"}
+	RegisterCommands(root, &fakeToolCaller{})
+
+	patCmd, _, err := root.Find([]string{"pat"})
+	if err != nil {
+		t.Fatalf("pat command not found: %v", err)
+	}
+	children := map[string]bool{}
+	for _, child := range patCmd.Commands() {
+		children[child.Name()] = true
+	}
+	if !children["chmod"] {
+		t.Fatal("pat chmod command not registered")
+	}
+	for _, unexpected := range []string{"grant-batch", "grant-recommend", "scopes", "check"} {
+		if children[unexpected] {
+			t.Fatalf("unexpected pat subcommand %q registered; authorization must stay on chmod", unexpected)
+		}
+	}
+}
+
+func TestChmod_productsFlagPlansThenGrantsSelectedScopes(t *testing.T) {
+	t.Setenv(agentCodeEnv, "qoderwork")
+	fake := &sequenceToolCaller{responses: []string{
+		`{"success":true,"data":{"selectedScopes":["calendar.event:read","aitable.record:read"]}}`,
+		`{"success":true,"data":{"grantedScopes":["calendar.event:read","aitable.record:read"]}}`,
+	}}
+	cmd := newChmodCommand(fake)
+	_ = cmd.Flags().Set("grant-type", "once")
+	_ = cmd.Flags().Set("products", "calendar,aitable")
+
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
+	}
+
+	if len(fake.calls) != 2 {
+		t.Fatalf("CallTool count = %d, want 2", len(fake.calls))
+	}
+	if fake.calls[0].tool != patBatchPlanToolName {
+		t.Fatalf("first tool = %q, want %q", fake.calls[0].tool, patBatchPlanToolName)
+	}
+	if got := fake.calls[0].args["productCodes"]; !stringSliceArgEqual(got, []string{"calendar", "aitable"}) {
+		t.Fatalf("productCodes = %#v, want calendar/aitable", got)
+	}
+	if got := fake.calls[0].args["recommend"]; got != false {
+		t.Fatalf("recommend = %#v, want false", got)
+	}
+	if fake.calls[1].tool != patBatchGrantToolName {
+		t.Fatalf("second tool = %q, want %q", fake.calls[1].tool, patBatchGrantToolName)
+	}
+	if got := fake.calls[1].args["scopes"]; !stringSliceArgEqual(got, []string{"calendar.event:read", "aitable.record:read"}) {
+		t.Fatalf("grant scopes = %#v, want selected scopes", got)
+	}
+	if _, ok := fake.calls[1].args["agentCode"]; ok {
+		t.Fatalf("batch grant args must not contain agentCode: %#v", fake.calls[1].args)
+	}
+}
+
+func TestChmod_recommendFlagPlansThenGrantsWithoutPositionalScopes(t *testing.T) {
+	t.Setenv(agentCodeEnv, "qoderwork")
+	fake := &sequenceToolCaller{responses: []string{
+		`{"success":true,"data":{"selectedScopes":["recommended.scope:read"]}}`,
+		`{"success":true,"data":{"grantedScopes":["recommended.scope:read"]}}`,
+	}}
+	cmd := newChmodCommand(fake)
+	_ = cmd.Flags().Set("grant-type", "once")
+	_ = cmd.Flags().Set("recommend", "true")
+
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
+	}
+
+	if len(fake.calls) != 2 {
+		t.Fatalf("CallTool count = %d, want 2", len(fake.calls))
+	}
+	if fake.calls[0].tool != patBatchPlanToolName {
+		t.Fatalf("first tool = %q, want %q", fake.calls[0].tool, patBatchPlanToolName)
+	}
+	if got := fake.calls[0].args["recommend"]; got != true {
+		t.Fatalf("recommend = %#v, want true", got)
+	}
+	if fake.calls[1].tool != patBatchGrantToolName {
+		t.Fatalf("second tool = %q, want %q", fake.calls[1].tool, patBatchGrantToolName)
+	}
+}
+
+func TestChmod_productsAllGrantedStopsAfterPlan(t *testing.T) {
+	t.Setenv(agentCodeEnv, "qoderwork")
+	fake := &sequenceToolCaller{responses: []string{
+		`{"success":true,"data":{"allGranted":true,"selectedScopes":[]}}`,
+	}}
+	cmd := newChmodCommand(fake)
+	_ = cmd.Flags().Set("grant-type", "once")
+	_ = cmd.Flags().Set("products", "calendar")
+
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("CallTool count = %d, want only plan call", len(fake.calls))
+	}
+	if fake.calls[0].tool != patBatchPlanToolName {
+		t.Fatalf("first tool = %q, want %q", fake.calls[0].tool, patBatchPlanToolName)
+	}
+}
+
+func TestChmod_explicitScopesDryRunShowsBatchGrantTool(t *testing.T) {
+	t.Setenv(agentCodeEnv, "qoderwork")
+	fake := &fakeToolCaller{dryRun: true}
+	cmd := newChmodCommand(fake)
+	_ = cmd.Flags().Set("grant-type", "once")
+
+	output, err := captureStdout(t, func() error {
+		return cmd.RunE(cmd, []string{"aitable.record:read"})
+	})
+	if err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
+	}
+	if !strings.Contains(output, patBatchGrantToolName) {
+		t.Fatalf("dry-run output = %q, want %q", output, patBatchGrantToolName)
+	}
+	if strings.Contains(output, patGrantToolName+"\n") {
+		t.Fatalf("dry-run output = %q, must not advertise legacy %q", output, patGrantToolName)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -227,14 +401,44 @@ func TestChmod_agentCode_env_fallback(t *testing.T) {
 		t.Fatalf("chmod RunE error = %v (must not report flag missing)", err)
 	}
 
-	if got := fake.gotArgs["agentCode"]; got != "qoderwork" {
-		t.Fatalf("agentCode in argv = %v, want %q (env fallback)", got, "qoderwork")
+	if fake.gotTool != patBatchGrantToolName {
+		t.Fatalf("gotTool = %q, want %q", fake.gotTool, patBatchGrantToolName)
+	}
+	if got := fake.gotAgentEnv; got != "qoderwork" {
+		t.Fatalf("agent env = %q, want %q", got, "qoderwork")
+	}
+	if _, ok := fake.gotArgs["agentCode"]; ok {
+		t.Fatalf("batch argv must not carry agentCode identity field: %#v", fake.gotArgs)
 	}
 	if got := fake.gotArgs["scopes"]; !stringSliceArgEqual(got, []string{"aitable.record:read"}) {
 		t.Fatalf("scopes in argv = %#v, want %#v", got, []string{"aitable.record:read"})
 	}
 	if _, ok := fake.gotArgs["scope"]; ok {
 		t.Fatalf("unexpected legacy singular scope arg in argv: %#v", fake.gotArgs)
+	}
+}
+
+func TestChmod_withoutAgentCodeUsesServerDefault(t *testing.T) {
+	t.Setenv(agentCodeEnv, "")
+
+	fake := &fakeToolCaller{resultOK: true}
+	cmd := buildChmod(t, fake)
+	_ = cmd.Flags().Set("grant-type", "once")
+
+	if err := cmd.RunE(cmd, []string{"aitable.record:read"}); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
+	}
+	if fake.gotTool != patBatchGrantToolName {
+		t.Fatalf("gotTool = %q, want %q", fake.gotTool, patBatchGrantToolName)
+	}
+	if got := fake.gotAgentEnv; got != "" {
+		t.Fatalf("agent env = %q, want empty so server default agentCode is used", got)
+	}
+	if _, ok := fake.gotArgs["agentCode"]; ok {
+		t.Fatalf("batch argv must omit agentCode when caller leaves it unset: %#v", fake.gotArgs)
+	}
+	if got := fake.gotArgs["scopes"]; !stringSliceArgEqual(got, []string{"aitable.record:read"}) {
+		t.Fatalf("scopes in argv = %#v, want %#v", got, []string{"aitable.record:read"})
 	}
 }
 
@@ -288,8 +492,8 @@ func TestChmod_emptyCanonicalResultReturnsError(t *testing.T) {
 	if len(fake.calls) != 1 {
 		t.Fatalf("CallTool call count = %d, want 1", len(fake.calls))
 	}
-	if fake.calls[0].tool != patGrantToolName {
-		t.Fatalf("first tool = %q, want %q", fake.calls[0].tool, patGrantToolName)
+	if fake.calls[0].tool != patBatchGrantToolName {
+		t.Fatalf("first tool = %q, want %q", fake.calls[0].tool, patBatchGrantToolName)
 	}
 }
 
@@ -519,17 +723,21 @@ func TestChmod_agentCode_flag_wins_over_env(t *testing.T) {
 	if err := cmd.RunE(cmd, []string{"aitable.record:read"}); err != nil {
 		t.Fatalf("chmod RunE error = %v", err)
 	}
-	if got := fake.gotArgs["agentCode"]; got != "flagval" {
-		t.Fatalf("agentCode in argv = %v, want %q (flag must win over env)", got, "flagval")
+	if fake.gotTool != patBatchGrantToolName {
+		t.Fatalf("gotTool = %q, want %q", fake.gotTool, patBatchGrantToolName)
+	}
+	if got := fake.gotAgentEnv; got != "flagval" {
+		t.Fatalf("agent env = %q, want %q (flag must win over env)", got, "flagval")
+	}
+	if _, ok := fake.gotArgs["agentCode"]; ok {
+		t.Fatalf("batch argv must not carry agentCode identity field: %#v", fake.gotArgs)
 	}
 }
 
 // TestChmod_agentCode_legacy_env_not_recognized is a reverse-guard: after
 // the SSOT hard-removal of the DWS_AGENTCODE alias, exporting only the
-// legacy env MUST NOT satisfy the --agentCode requirement. The command
-// is expected to fail with an error that explicitly names the canonical
-// DINGTALK_DWS_AGENTCODE env, and MUST NOT mention DWS_AGENTCODE as a
-// usable fallback. No MCP call is permitted.
+// legacy env MUST NOT be consumed. The command is still allowed to run,
+// omits agentCode, and lets lippi-pat-core write its default agentCode.
 func TestChmod_agentCode_legacy_env_not_recognized(t *testing.T) {
 	t.Setenv(agentCodeEnv, "")
 	t.Setenv("DWS_AGENTCODE", "legacyval")
@@ -538,23 +746,17 @@ func TestChmod_agentCode_legacy_env_not_recognized(t *testing.T) {
 	cmd := buildChmod(t, fake)
 	_ = cmd.Flags().Set("grant-type", "once")
 
-	err := cmd.RunE(cmd, []string{"aitable.record:read"})
-	if err == nil {
-		t.Fatalf("expected hard error when only legacy DWS_AGENTCODE is set, got nil")
+	if err := cmd.RunE(cmd, []string{"aitable.record:read"}); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "DINGTALK_DWS_AGENTCODE") {
-		t.Fatalf("error = %q, want to name canonical DINGTALK_DWS_AGENTCODE env", err.Error())
+	if fake.callN != 1 {
+		t.Fatalf("CallTool was invoked %d times, want 1", fake.callN)
 	}
-	// Defensive: the canonical env naturally contains the substring
-	// "DWS_AGENTCODE" as part of "DINGTALK_DWS_AGENTCODE"; the above
-	// assertion plus the absence check below precisely guard against
-	// advertising the legacy alias as usable.
-	hint := strings.ReplaceAll(err.Error(), "DINGTALK_DWS_AGENTCODE", "")
-	if strings.Contains(hint, "DWS_AGENTCODE") {
-		t.Fatalf("error = %q must not advertise DWS_AGENTCODE as usable", err.Error())
+	if got := fake.gotAgentEnv; got != "" {
+		t.Fatalf("agent env = %q, want empty; legacy DWS_AGENTCODE must not be consumed", got)
 	}
-	if fake.callN != 0 {
-		t.Fatalf("CallTool was invoked %d times; legacy env must not satisfy --agentCode", fake.callN)
+	if _, ok := fake.gotArgs["agentCode"]; ok {
+		t.Fatalf("batch argv must omit agentCode when only legacy env is set: %#v", fake.gotArgs)
 	}
 }
 
