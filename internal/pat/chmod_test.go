@@ -32,14 +32,15 @@ import (
 // assert how the two-tier --agentCode / DINGTALK_DWS_AGENTCODE / error
 // resolver feeds into the outgoing MCP argv.
 type fakeToolCaller struct {
-	mu            sync.Mutex
-	dryRun        bool
-	gotTool       string
-	gotArgs       map[string]any
-	gotAgentEnv   string
-	gotSessionEnv string
-	callN         int
-	resultOK      bool
+	mu                sync.Mutex
+	dryRun            bool
+	gotTool           string
+	gotArgs           map[string]any
+	gotAgentEnv       string
+	gotSessionEnv     string
+	gotDingSessionEnv string
+	callN             int
+	resultOK          bool
 }
 
 func (f *fakeToolCaller) CallTool(_ context.Context, _ string, toolName string, args map[string]any) (*edition.ToolResult, error) {
@@ -48,7 +49,8 @@ func (f *fakeToolCaller) CallTool(_ context.Context, _ string, toolName string, 
 	f.callN++
 	f.gotTool = toolName
 	f.gotAgentEnv = os.Getenv(agentCodeEnv)
-	f.gotSessionEnv = os.Getenv("DWS_SESSION_ID")
+	f.gotSessionEnv = os.Getenv(sessionIDEnvDWS)
+	f.gotDingSessionEnv = os.Getenv(sessionIDEnvDingtalk)
 	// defensive copy — RunE / runApply may mutate the map after return
 	f.gotArgs = make(map[string]any, len(args))
 	for k, v := range args {
@@ -347,7 +349,7 @@ func TestChmod_productsSessionModePassesSessionIDToPlanAndGrant(t *testing.T) {
 
 func TestChmod_productsDryRunUsesSessionIDFromEnv(t *testing.T) {
 	t.Setenv(agentCodeEnv, "qoderwork")
-	t.Setenv("DWS_SESSION_ID", "env-session-123")
+	t.Setenv(sessionIDEnvDWS, "env-session-123")
 	fake := &sequenceToolCaller{
 		dryRun: true,
 		responses: []string{
@@ -369,6 +371,69 @@ func TestChmod_productsDryRunUsesSessionIDFromEnv(t *testing.T) {
 	}
 	if got := fake.calls[0].args["sessionId"]; got != "env-session-123" {
 		t.Fatalf("plan sessionId = %#v, want env-session-123", got)
+	}
+}
+
+func TestResolveSessionIDFromEnvMatchesHeaderPriority(t *testing.T) {
+	t.Setenv(sessionIDEnvDingtalk, "ding-session")
+	t.Setenv(sessionIDEnvDWS, "dws-session")
+	t.Setenv(sessionIDEnvRewind, "rewind-session")
+
+	if got := resolveSessionIDFromEnv(); got != "ding-session" {
+		t.Fatalf("resolveSessionIDFromEnv() = %q, want DINGTALK_SESSION_ID", got)
+	}
+
+	t.Setenv(sessionIDEnvDingtalk, "")
+	if got := resolveSessionIDFromEnv(); got != "dws-session" {
+		t.Fatalf("resolveSessionIDFromEnv() = %q, want DWS_SESSION_ID", got)
+	}
+
+	t.Setenv(sessionIDEnvDWS, "")
+	if got := resolveSessionIDFromEnv(); got != "rewind-session" {
+		t.Fatalf("resolveSessionIDFromEnv() = %q, want REWIND_SESSION_ID", got)
+	}
+}
+
+func TestChmod_sessionModeUsesDingtalkSessionEnv(t *testing.T) {
+	t.Setenv(sessionIDEnvDingtalk, "ding-session-123")
+
+	fake := &fakeToolCaller{resultOK: true}
+	cmd := buildChmod(t, fake)
+
+	if err := cmd.RunE(cmd, []string{"aitable.record:read"}); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
+	}
+
+	if got := fake.gotArgs["sessionId"]; got != "ding-session-123" {
+		t.Fatalf("sessionId arg = %#v, want ding-session-123", got)
+	}
+	if fake.gotDingSessionEnv != "ding-session-123" {
+		t.Fatalf("%s during CallTool = %q, want ding-session-123", sessionIDEnvDingtalk, fake.gotDingSessionEnv)
+	}
+	if fake.gotSessionEnv != "ding-session-123" {
+		t.Fatalf("%s during CallTool = %q, want ding-session-123", sessionIDEnvDWS, fake.gotSessionEnv)
+	}
+}
+
+func TestChmod_explicitSessionIDOverridesStaleDingtalkSessionEnv(t *testing.T) {
+	t.Setenv(sessionIDEnvDingtalk, "stale-session")
+
+	fake := &fakeToolCaller{resultOK: true}
+	cmd := buildChmod(t, fake)
+	_ = cmd.Flags().Set("session-id", "flag-session")
+
+	if err := cmd.RunE(cmd, []string{"aitable.record:read"}); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
+	}
+
+	if got := fake.gotArgs["sessionId"]; got != "flag-session" {
+		t.Fatalf("sessionId arg = %#v, want flag-session", got)
+	}
+	if fake.gotDingSessionEnv != "flag-session" {
+		t.Fatalf("%s during CallTool = %q, want flag-session", sessionIDEnvDingtalk, fake.gotDingSessionEnv)
+	}
+	if fake.gotSessionEnv != "flag-session" {
+		t.Fatalf("%s during CallTool = %q, want flag-session", sessionIDEnvDWS, fake.gotSessionEnv)
 	}
 }
 
@@ -726,6 +791,25 @@ func TestIsToolNotRegisteredError_ChineseGatewayDiagnostics(t *testing.T) {
 	)
 	if !isToolNotRegisteredError(err) {
 		t.Fatalf("isToolNotRegisteredError(%q) = false, want true", err.Error())
+	}
+}
+
+func TestIsPATBatchUnsupportedResultCaseInsensitive(t *testing.T) {
+	result := &edition.ToolResult{Content: []edition.ContentBlock{{Type: "text", Text: `{"success":false,"errorCode":"pat_batch_auth_unsupported"}`}}}
+	if !isPATBatchUnsupportedResult(result) {
+		t.Fatal("isPATBatchUnsupportedResult() = false, want true")
+	}
+}
+
+func TestIsPATBatchUnsupportedErrorUsesNormalizedDiagnostics(t *testing.T) {
+	err := apperrors.NewAPI("business error: success=false",
+		apperrors.WithReason("business_error"),
+		apperrors.WithServerDiag(apperrors.ServerDiagnostics{
+			ServerErrorCode: "PAT_BATCH_AUTH_UNSUPPORTED",
+		}),
+	)
+	if !isPATBatchUnsupportedError(err) {
+		t.Fatal("isPATBatchUnsupportedError() = false, want true")
 	}
 }
 

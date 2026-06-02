@@ -29,25 +29,33 @@ import (
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 )
 
+const (
+	sessionIDEnvDingtalk = "DINGTALK_SESSION_ID"
+	sessionIDEnvDWS      = "DWS_SESSION_ID"
+	sessionIDEnvRewind   = "REWIND_SESSION_ID"
+)
+
 // resolveSessionIDFromEnv returns the effective session id from environment
-// variables. Resolution order:
-//  1. DWS_SESSION_ID (primary, stable env name).
-//  2. REWIND_SESSION_ID (compatibility alias; kept only so hosts that
+// variables. Resolution order matches the MCP header resolver:
+//  1. DINGTALK_SESSION_ID (primary gateway header env).
+//  2. DWS_SESSION_ID (stable CLI/session-grant env name).
+//  3. REWIND_SESSION_ID (compatibility alias; kept only so hosts that
 //     already inject the legacy trace triple keep working without code
 //     churn).
 //
-// When both are set to different non-empty values, DWS_SESSION_ID wins
-// silently. We deliberately do NOT log either raw session id value or
-// any derived fingerprint: this resolver is invoked by `dws pat chmod`
-// session grants, and any stderr / ~/.dws/logs capture of those
-// identifiers can land verbatim in attached troubleshooting bundles.
-// Hosts that need to detect a mismatch between the two env vars must do
-// so on the host side before invoking the CLI.
+// When multiple env vars are set to different non-empty values, the first
+// one above wins silently. We deliberately do NOT log either raw session id
+// value or any derived fingerprint: this resolver is invoked by `dws pat
+// chmod` session grants, and any stderr / ~/.dws/logs capture of those
+// identifiers can land verbatim in attached troubleshooting bundles. Hosts
+// that need to detect a mismatch must do so before invoking the CLI.
 func resolveSessionIDFromEnv() string {
-	if dws := os.Getenv("DWS_SESSION_ID"); dws != "" {
-		return dws
+	for _, key := range []string{sessionIDEnvDingtalk, sessionIDEnvDWS, sessionIDEnvRewind} {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
 	}
-	return os.Getenv("REWIND_SESSION_ID")
+	return ""
 }
 
 // agentCodeEnv is the canonical (and only) environment variable name
@@ -148,6 +156,9 @@ const (
 	// patGrantToolNameLegacyAlias is retained for server builds that still
 	// expose only the legacy Chinese display name.
 	patGrantToolNameLegacyAlias = "个人授权"
+
+	patBatchUnsupportedCode      = "PAT_BATCH_AUTH_UNSUPPORTED"
+	patBatchUnsupportedCodeLower = "pat_batch_auth_unsupported"
 )
 
 var validGrantTypes = map[string]bool{
@@ -350,7 +361,8 @@ func withPATContextEnv(agentCode, sessionID string, fn func() (*edition.ToolResu
 		_ = os.Setenv(key, value)
 	}
 	setEnv(agentCodeEnv, agentCode)
-	setEnv("DWS_SESSION_ID", sessionID)
+	setEnv(sessionIDEnvDingtalk, sessionID)
+	setEnv(sessionIDEnvDWS, sessionID)
 	defer func() {
 		for key, old := range restore {
 			if old == nil {
@@ -478,7 +490,7 @@ func isPATBatchUnsupportedResult(result *edition.ToolResult) bool {
 		return false
 	}
 	for _, key := range []string{"code", "errorCode", "error_code"} {
-		if code, ok := body[key].(string); ok && code == "PAT_BATCH_AUTH_UNSUPPORTED" {
+		if code, ok := body[key].(string); ok && strings.EqualFold(strings.TrimSpace(code), patBatchUnsupportedCode) {
 			return true
 		}
 	}
@@ -486,7 +498,7 @@ func isPATBatchUnsupportedResult(result *edition.ToolResult) bool {
 }
 
 func isPATBatchUnsupportedError(err error) bool {
-	return err != nil && strings.Contains(normalizedPATErrorText(err), strings.ToLower("PAT_BATCH_AUTH_UNSUPPORTED"))
+	return err != nil && strings.Contains(normalizedPATErrorText(err), patBatchUnsupportedCodeLower)
 }
 
 // callPATToolWithLegacyFallback invokes the canonical PAT grant tool first,
