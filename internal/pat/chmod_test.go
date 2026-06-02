@@ -345,6 +345,33 @@ func TestChmod_productsSessionModePassesSessionIDToPlanAndGrant(t *testing.T) {
 	}
 }
 
+func TestChmod_productsDryRunUsesSessionIDFromEnv(t *testing.T) {
+	t.Setenv(agentCodeEnv, "qoderwork")
+	t.Setenv("DWS_SESSION_ID", "env-session-123")
+	fake := &sequenceToolCaller{
+		dryRun: true,
+		responses: []string{
+			`{"success":true,"data":{"selectedScopes":["calendar.event:read"]}}`,
+		},
+	}
+	cmd := newChmodCommand(fake)
+	_ = cmd.Flags().Set("products", "calendar")
+
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("chmod RunE error = %v", err)
+	}
+
+	if len(fake.calls) != 1 {
+		t.Fatalf("CallTool count = %d, want 1", len(fake.calls))
+	}
+	if fake.calls[0].tool != patBatchPlanToolName {
+		t.Fatalf("plan tool = %q, want %q", fake.calls[0].tool, patBatchPlanToolName)
+	}
+	if got := fake.calls[0].args["sessionId"]; got != "env-session-123" {
+		t.Fatalf("plan sessionId = %#v, want env-session-123", got)
+	}
+}
+
 func TestChmod_recommendFlagPlansThenGrantsWithoutPositionalScopes(t *testing.T) {
 	t.Setenv(agentCodeEnv, "qoderwork")
 	fake := &sequenceToolCaller{responses: []string{

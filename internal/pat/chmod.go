@@ -202,12 +202,15 @@ grantType 规则:
 			usesPlan := recommend || len(productCodes) > 0
 			grantType, _ := cmd.Flags().GetString("grant-type")
 			sessionID, _ := cmd.Flags().GetString("session-id")
+			if sessionID == "" {
+				sessionID = resolveSessionIDFromEnv()
+			}
 
 			if !validGrantTypes[grantType] {
 				return fmt.Errorf("invalid --grant-type %q, must be one of: once, session, permanent", grantType)
 			}
 
-			if grantType == "session" && sessionID == "" && resolveSessionIDFromEnv() == "" {
+			if grantType == "session" && sessionID == "" {
 				return fmt.Errorf("--session-id is required when --grant-type is session\n  hint: dws pat chmod <scope> --grant-type session --session-id <id>")
 			}
 
@@ -240,9 +243,6 @@ grantType 规则:
 				return fmt.Errorf("internal error: tool runtime not initialized")
 			}
 
-			if sessionID == "" {
-				sessionID = resolveSessionIDFromEnv()
-			}
 			if usesPlan {
 				planArgs := buildBatchPlanArgs(scopes, productCodes, recommend, grantType, sessionID, true)
 				planResult, err := callPATBatchPlan(cmd.Context(), c, agentCode, sessionID, planArgs)
