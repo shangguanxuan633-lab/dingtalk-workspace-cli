@@ -32,6 +32,7 @@ import (
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/jsonutil"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/pat"
 	"github.com/fatih/color"
 )
@@ -229,7 +230,7 @@ func enrichPATErrorWithOpenBrowser(raw string, openBrowser bool) string {
 	}
 	data["openBrowser"] = openBrowser
 
-	encoded, err := json.Marshal(payload)
+	encoded, err := jsonutil.Marshal(payload)
 	if err != nil {
 		return raw
 	}
@@ -595,7 +596,7 @@ func enrichPATErrorForHostControl(raw string) string {
 	apperrors.ApplyHostMutations(payload)
 
 	// stderr JSON MUST be single-line.
-	encoded, err := json.Marshal(payload)
+	encoded, err := jsonutil.Marshal(payload)
 	if err != nil {
 		return raw
 	}
@@ -629,7 +630,7 @@ func buildPATScopeJSON(scopeErr *PatScopeError, includeHostControl bool) string 
 		"data":    data,
 	}
 	// stderr JSON MUST be single-line.
-	b, err := json.Marshal(payload)
+	b, err := jsonutil.Marshal(payload)
 	if err != nil {
 		return `{"success":false,"code":"PAT_SCOPE_AUTH_REQUIRED"}`
 	}
