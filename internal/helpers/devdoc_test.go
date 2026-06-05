@@ -16,6 +16,7 @@ package helpers
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
@@ -43,8 +44,8 @@ func TestDevdocArticleSearchAcceptsWukongKeywordAlias(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v\nstderr:\n%s", err, errOut.String())
 	}
-	if runner.last.Tool != "search_open_platform_docs" {
-		t.Fatalf("tool = %q, want search_open_platform_docs", runner.last.Tool)
+	if runner.last.Tool != "search_open_platform_docs_rag" {
+		t.Fatalf("tool = %q, want search_open_platform_docs_rag", runner.last.Tool)
 	}
 	if got := runner.last.Params["keyword"]; got != "openConversationId" {
 		t.Fatalf("keyword = %#v, want openConversationId", got)
@@ -72,5 +73,104 @@ func TestDevdocArticleSearchAcceptsPositionalKeyword(t *testing.T) {
 	}
 	if got := runner.last.Params["keyword"]; got != "MCP" {
 		t.Fatalf("keyword = %#v, want MCP", got)
+	}
+}
+
+func TestDevdocErrorDiagnosePassesRequestID(t *testing.T) {
+	t.Parallel()
+
+	runner := &devdocCommandRunner{}
+	cmd := devdocHandler{}.Command(runner)
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"error", "diagnose", "--request-id", "req-123", "--page", "2", "--size", "5"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v\nstderr:\n%s", err, errOut.String())
+	}
+	if runner.last.Tool != "search_open_error_code_rag" {
+		t.Fatalf("tool = %q, want search_open_error_code_rag", runner.last.Tool)
+	}
+	if got := runner.last.Params["requestId"]; got != "req-123" {
+		t.Fatalf("requestId = %#v, want req-123", got)
+	}
+	if got := runner.last.Params["page"]; got != 2 {
+		t.Fatalf("page = %#v, want 2", got)
+	}
+	if got := runner.last.Params["size"]; got != 5 {
+		t.Fatalf("size = %#v, want 5", got)
+	}
+}
+
+func TestDevdocErrorDiagnoseMapsTraceIDAlias(t *testing.T) {
+	t.Parallel()
+
+	runner := &devdocCommandRunner{}
+	cmd := devdocHandler{}.Command(runner)
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"error", "diagnose", "--trace-id", "trace-abc", "--api", "创建日程"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v\nstderr:\n%s", err, errOut.String())
+	}
+	if got := runner.last.Params["requestId"]; got != "trace-abc" {
+		t.Fatalf("requestId = %#v, want trace-abc", got)
+	}
+	if got := runner.last.Params["apiName"]; got != "创建日程" {
+		t.Fatalf("apiName = %#v, want 创建日程", got)
+	}
+}
+
+func TestDevdocErrorDiagnosePassesErrorContext(t *testing.T) {
+	t.Parallel()
+
+	runner := &devdocCommandRunner{}
+	cmd := devdocHandler{}.Command(runner)
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{
+		"error", "troubleshoot",
+		"--error-code", "33012",
+		"--error-message", "missing scope",
+		"--context", "create calendar failed",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v\nstderr:\n%s", err, errOut.String())
+	}
+	if got := runner.last.Params["errorCode"]; got != "33012" {
+		t.Fatalf("errorCode = %#v, want 33012", got)
+	}
+	if got := runner.last.Params["errorMessage"]; got != "missing scope" {
+		t.Fatalf("errorMessage = %#v, want missing scope", got)
+	}
+	if got := runner.last.Params["context"]; got != "create calendar failed" {
+		t.Fatalf("context = %#v, want create calendar failed", got)
+	}
+}
+
+func TestDevdocErrorDiagnoseRequiresTroubleshootInput(t *testing.T) {
+	t.Parallel()
+
+	runner := &devdocCommandRunner{}
+	cmd := devdocHandler{}.Command(runner)
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"error", "diagnose", "--api", "创建日程"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("Execute() error = nil, want validation error")
+	}
+	if !strings.Contains(err.Error(), "one of --query") {
+		t.Fatalf("error = %q, want required input hint", err.Error())
+	}
+	if runner.last.Tool != "" {
+		t.Fatalf("tool = %q, want no call", runner.last.Tool)
 	}
 }
