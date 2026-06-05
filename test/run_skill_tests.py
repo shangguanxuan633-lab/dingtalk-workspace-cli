@@ -261,7 +261,7 @@ def run_test(test_case: TestCase) -> dict:
         'flags_pass': False,
         'overall_pass': False,
         'details': [],
-        'skill_reference': f'references/products/{get_reference_file(test_case.product)}'
+        'skill_reference': get_reference_path(test_case.product)
     }
 
     # Extract expected command path
@@ -336,6 +336,12 @@ def get_reference_file(product: str) -> str:
         'workbench': 'workbench.md',
     }
     return product_to_file.get(product, f'{product}.md')
+
+def get_reference_path(product: str) -> str:
+    """Get the display path for the skill reference used by a product test."""
+    if product == 'routing':
+        return 'references/intent-guide.md'
+    return f'references/products/{get_reference_file(product)}'
 
 def generate_report(results: list[dict]) -> str:
     """Generate markdown report from test results"""

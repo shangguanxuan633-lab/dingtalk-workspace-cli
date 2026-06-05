@@ -2,8 +2,8 @@
 
 ## Summary
 
-- **Total Test Cases**: 227
-- **Passed**: 227
+- **Total Test Cases**: 230
+- **Passed**: 230
 - **Failed**: 0
 - **Pass Rate**: 100.0%
 
@@ -20,6 +20,7 @@
 | devdoc | 7 | 7 | 0 | 100.0% |
 | ding | 5 | 5 | 0 | 100.0% |
 | report | 26 | 26 | 0 | 100.0% |
+| routing | 3 | 3 | 0 | 100.0% |
 | todo | 30 | 30 | 0 | 100.0% |
 | workbench | 6 | 6 | 0 | 100.0% |
 
@@ -1572,6 +1573,35 @@
 - Skill Reference: references/products/report.md
 - Command path: PASS (report template list)
 - Flags: N/A (no flags specified)
+
+### routing
+
+**routing_routing_clarify_001** ✅ PASS
+
+- Prompt: 帮我创建一个应用
+- Expected: `dws --help`
+- Skill Reference: references/intent-guide.md
+- Command path: PASS (--help)
+- Flags: N/A (no flags specified)
+- Note: [ASK_USER] case - only command path validated
+
+**routing_routing_clarify_002** ✅ PASS
+
+- Prompt: 做一个 AI 应用
+- Expected: `dws --help`
+- Skill Reference: references/intent-guide.md
+- Command path: PASS (--help)
+- Flags: N/A (no flags specified)
+- Note: [ASK_USER] case - only command path validated
+
+**routing_routing_clarify_003** ✅ PASS
+
+- Prompt: 创建 MCP 服务并配置 HSF tool
+- Expected: `dws --help`
+- Skill Reference: references/intent-guide.md
+- Command path: PASS (--help)
+- Flags: N/A (no flags specified)
+- Note: [ASK_USER] case - only command path validated
 
 ### todo
 
