@@ -494,8 +494,10 @@ func (c *Client) callJSONRPC(ctx context.Context, endpoint string, request reque
 }
 
 func (c *Client) doWithRetry(ctx context.Context, endpoint string, body []byte) (*http.Response, error) {
-	// Strip any query/fragment from the endpoint to prevent parameter injection.
-	endpoint = validate.StripQueryFragment(endpoint)
+	// Streamable HTTP MCP endpoints may carry gateway credentials in the query
+	// string (for example ?key=...). Preserve query parameters, but drop URL
+	// fragments because they are client-side only and can confuse diagnostics.
+	endpoint = stripEndpointFragment(endpoint)
 	var lastErr error
 	for attempt := 0; attempt <= c.MaxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -533,7 +535,7 @@ func (c *Client) doWithRetry(ctx context.Context, endpoint string, body []byte) 
 		// Diagnostic: log identity-related headers on first attempt.
 		if attempt == 0 && c.FileLogger != nil {
 			c.FileLogger.LogAttrs(context.Background(), slog.LevelDebug, "http_request_headers",
-				slog.String("endpoint", endpoint),
+				slog.String("endpoint", RedactURL(endpoint)),
 				slog.String("x-user-access-token-present", fmt.Sprintf("%t", req.Header.Get("x-user-access-token") != "")),
 				slog.Int("extra_headers_count", len(c.ExtraHeaders)),
 			)
@@ -591,6 +593,19 @@ func (c *Client) doWithRetry(ctx context.Context, endpoint string, body []byte) 
 			Cause: lastErr,
 		}),
 	)
+}
+
+func stripEndpointFragment(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return endpoint
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Fragment == "" {
+		return endpoint
+	}
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 func retryable(statusCode int) bool {

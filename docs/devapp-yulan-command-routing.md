@@ -8,10 +8,12 @@ This document splits the application-side command set for yulan. It is written f
 
 ## 0. Current Repository Deliverables
 
-The current branch contains the application-side command contract and Agent
-routing assets. It does not by itself prove that the `devapp` runtime command
-tree is already published in an MCP registry. Treat runtime availability as an
-external release condition until the rollout checklist in section 13 passes.
+The current branch contains the application-side command contract, Agent
+routing assets, and a hardcoded `devapp` helper command tree. `devapp` does not
+depend on MCP service discovery or registry overlay publication. Runtime calls
+resolve the MCP endpoint from the internal edition's `SupplementServers` or
+`StaticServers` hook; local debug may override it with
+`DINGTALK_DEVAPP_MCP_URL`. Do not commit the endpoint URL or its `?key=` value.
 
 | Artifact | Status | Evidence |
 | --- | --- | --- |
@@ -22,18 +24,18 @@ external release condition until the rollout checklist in section 13 passes.
 | Multi product skill | Done in repo | `skills/multi/dingtalk-devapp/` defines the standalone `dingtalk-devapp` skill and reference file. |
 | Agent intent test cases | Done in repo | `test/skill_tests.md` includes 21 devapp cases, devdoc/workbench counterexamples, and routing clarification cases for the overloaded word `应用`; `test/skill_tests_results.md` reports those cases passing. |
 | Skill test parser | Done in repo | `test/run_skill_tests.py` now preserves the current `#### dws ...` command section for each case. |
-| Static/e2e skill verifier handling | Done in repo | `test/skill_static` and `test/skill_e2e` skip `dws devapp ...` as design-only until the MCP product is published. |
+| Static/e2e skill verifier handling | Done in repo | `test/skill_static` and `test/skill_e2e` cover routing docs; runtime smoke uses an externally configured MCP endpoint. |
 | Sensitive config guard | Done in repo | `.gitignore` excludes local `docs/mcp/serviceconfig-pre*` files so personal MCP gateway keys are not staged. |
 | MCP HSF tool configuration | External dependency | Configure and publish tools on the DingTalk MCP developer platform using sections 3, 4, and 13. |
-| DWS runtime command availability | External dependency | Verify with `dws cache refresh --product devapp`, `dws schema`, and `dws devapp --help` after MCP registry publication. |
+| DWS runtime command availability | Done in repo | `dws devapp ...` and alias `dws app ...` are hardcoded helper commands. No service discovery is required for this command tree. |
 | Full production readiness | Not yet proven | Requires section 13 release exit criteria, including MCP `tools/list`, DWS schema, APP/SNS permission smoke, and write guard smoke. |
 
 State labels:
 
 1. `Done in repo` means the open-source branch contains the artifact and it is
    covered by local checks.
-2. `External dependency` means backend/MCP registry publication must happen
-   outside this repository.
+2. `External dependency` means backend/MCP tool publication must happen outside
+   this repository.
 3. `Not yet proven` means do not claim the application command set is ready for
    Agent production usage until runtime smoke evidence exists.
 
@@ -45,25 +47,28 @@ Use `devapp` as the canonical open-source product id:
 dws devapp ...
 ```
 
-`app` can be kept as a compatibility alias if the runtime overlay or hardcoded helper supports it. Do not introduce `opendev` or `apps` as new canonical roots; if they are needed for migration, make them redirect or hidden aliases.
+`app` is kept as a compatibility alias by the hardcoded helper. Do not
+introduce `opendev` or `apps` as new canonical roots; if they are needed for
+migration, make them redirect or hidden aliases.
 
 Reasoning:
 
 1. `devapp` is specific enough for Open Platform developer applications.
 2. `app` is the PRD/user-facing shorthand and can remain as an alias.
-3. The open-source DWS repository is protocol-first; command availability ultimately comes from service discovery or helper commands.
+3. The open-source DWS repository is protocol-first; `devapp` uses helper commands so it can run without service discovery.
 
 Branch context:
 
 ```text
 branch: feat/dws-devapp
 base: latest upstream/main has been merged into the local design branch
-runtime: devapp command availability still depends on MCP registry publication
+runtime: devapp command availability does not depend on MCP service discovery
 ```
 
-The checked-in open-source helper code does not hardcode a complete `dws devapp`
-command tree. The command design below is the target contract for MCP overlay
-and/or helper implementation.
+The checked-in open-source helper code owns the `dws devapp` command tree. The
+MCP endpoint is owned by the internal edition layer, typically through
+`edition.SupplementServers`; `DINGTALK_DEVAPP_MCP_URL` remains a local debug
+override.
 
 ## 2. Command Tree
 
@@ -76,7 +81,6 @@ dws devapp
   delete                       Delete an enterprise internal app
   credentials get              Controlled credential read, especially appSecret/clientSecret
   webapp get                   Get web app configuration
-  webapp config                Configure web app entry URLs
   permission list              List APP and SNS permissions
   permission search            Search permission candidates, alias over list semantics
   permission detail            Show one permission's full API coverage
@@ -111,16 +115,16 @@ Do not send confirmation fields such as `confirmCreate`, `confirmUpdate`, `confi
 
 | Area | CLI command | MCP tool | Backend HSF facade | Current backend status | Open-source DWS status |
 | --- | --- | --- | --- | --- | --- |
-| App query | `devapp list` | `list_open_dev_apps_by_condition` | `OpenInnerAppQueryFacade.listByCondition` | Implemented | Needs discovery/overlay/helper |
-| App detail | `devapp get` | `get_open_dev_app_detail` | `OpenInnerAppQueryFacade.getDetail` | Implemented | Needs discovery/overlay/helper |
-| App create | `devapp create` | `create_open_dev_app` | `OpenInnerAppManageFacade.create` | Implemented | Needs discovery/overlay/helper |
-| App update | `devapp update` | `update_open_dev_app` | `OpenInnerAppManageFacade.update` | Implemented | Needs discovery/overlay/helper |
-| App delete | `devapp delete` | `delete_open_dev_app` | `OpenInnerAppManageFacade.delete` | Implemented | Needs MCP config + DWS wiring |
+| App query | `devapp list` | `list_open_dev_apps_by_condition` | `OpenInnerAppQueryFacade.listByCondition` | Implemented | Hardcoded helper |
+| App detail | `devapp get` | `get_open_dev_app_detail` | `OpenInnerAppQueryFacade.getDetail` | Implemented | Hardcoded helper |
+| App create | `devapp create` | `create_inner_app` | `OpenInnerAppManageFacade.create` | Implemented | Hardcoded helper |
+| App update | `devapp update` | `update_inner_app` | `OpenInnerAppManageFacade.update` | Implemented | Hardcoded helper |
+| App delete | `devapp delete` | `delete_inner_app` | `OpenInnerAppManageFacade.delete` | Implemented | Hardcoded helper |
 | Credentials | `devapp credentials get` | `get_open_dev_app_credentials` | Credential facade pending | Pending | Spec only |
-| Web app | `devapp webapp get/config` | `get/config_open_dev_app_webapp` | Webapp facade pending | Pending | Spec only |
-| Permission list | `devapp permission list/search/detail` | `list_open_dev_app_permissions` | `OpenInnerAppPermissionFacade.list` | Implemented | Needs MCP config + DWS wiring |
-| Permission apply | `devapp permission add` | `add_open_dev_app_permissions` | `OpenInnerAppPermissionFacade.apply` | Implemented | Needs MCP config + DWS wiring |
-| Permission remove | `devapp permission remove` | `remove_open_dev_app_permission` | `OpenInnerAppPermissionFacade.remove` | Implemented | Needs MCP config + DWS wiring |
+| Web app | `devapp webapp get/config` | `get_webapp_config`/`set_webapp_config` | Webapp facade | Implemented | Hardcoded helper; current pre MCP output mapping only returns `agentId`, needs `h5PageType/homepageLink/pcHomepageLink/ompLink` mapping fix |
+| Permission list | `devapp permission list/search/detail` | `list_open_dev_app_permissions` | `OpenInnerAppPermissionFacade.list` | Implemented | Hardcoded helper |
+| Permission apply | `devapp permission add` | `apply_open_dev_app_permissions` | `OpenInnerAppPermissionFacade.apply` | Implemented | Hardcoded helper |
+| Permission remove | `devapp permission remove` | `remove_open_dev_app_permission` | `OpenInnerAppPermissionFacade.remove` | Implemented | Hardcoded helper |
 | Events | `devapp event list/config` | `list/config_open_dev_app_events` | Event facade pending | Pending | Spec only |
 | Version publish | `devapp version create/check-approval/publish/status` | `create/check/publish/get_open_dev_app_version_*` | Version facade pending | Pending | Spec only |
 
@@ -175,7 +179,7 @@ Input fields:
 | Field | Type | CLI flag | Required | Notes |
 | --- | --- | --- | --- | --- |
 | `currentPage` | number | `--page` | no | 1-based page number. |
-| `pageSize` | number | `--page-size` | no | Default 20; cap by backend/overlay. |
+| `pageSize` | number | `--page-size` | no | Default 20; cap by backend. |
 | `appName` | string | `--name` | no | App name keyword. |
 | `agentId` | number | `--agent-id` | no | Exact DingTalk app agentId. |
 | `appId` | number | `--app-id` | no | Compatible app id. |
@@ -258,14 +262,14 @@ full `clientSecret/appSecret`:
 }
 ```
 
-#### create_open_dev_app
+#### create_inner_app
 
 | Item | Contract |
 | --- | --- |
 | CLI | `dws devapp create` |
 | HSF facade | `OpenInnerAppManageFacade.create` |
 | Request shape | One object with system context and app base fields. |
-| Required public fields | `appName`; default `type=internal`. |
+| Required public fields | `appName`; `--type` is a CLI-only guard and currently must be `internal`. |
 | Write guard | CLI `--dry-run`, then `--yes`; no MCP confirm field. |
 
 Input fields:
@@ -274,9 +278,7 @@ Input fields:
 | --- | --- | --- | --- | --- |
 | `appName` | string | `--name` | yes | Enterprise internal app name. |
 | `appDesc` | string | `--desc` | no | App description. |
-| `type` | string | `--type` | no | P0 default: `internal`. |
 | `appIcon` | string | `--icon` | no | Existing media/resource id if backend accepts it. |
-| `hidden` | boolean | `--hidden` | no | Whether hidden from normal members. |
 
 Response:
 
@@ -295,7 +297,7 @@ Response:
 }
 ```
 
-#### update_open_dev_app
+#### update_inner_app
 
 | Item | Contract |
 | --- | --- |
@@ -321,7 +323,7 @@ Update fields:
 Response should return the updated app summary plus a `changedFields` array when
 available.
 
-#### delete_open_dev_app
+#### delete_inner_app
 
 | Item | Contract |
 | --- | --- |
@@ -386,7 +388,7 @@ Normalized response should flatten `appScopes` and `snsScopes` into one
 }
 ```
 
-#### add_open_dev_app_permissions
+#### apply_open_dev_app_permissions
 
 | Item | Contract |
 | --- | --- |
@@ -450,17 +452,19 @@ Expected structured failures:
 | Scope cannot be edited | `PERMISSION_NOT_EDITABLE` |
 | Scope cannot be found | `PERMISSION_NOT_FOUND` |
 
-## 4. MCP Product Overlay
+## 4. Hardcoded Helper Mapping
 
-The MCP registry overlay should use a product id that matches the canonical command root:
+The open-source branch hardcodes the following command root and tool mapping.
+This JSON is kept as a compact mapping reference only; `devapp` runtime command
+availability must not depend on MCP registry publication or service discovery.
 
 ```json
 {
-  "com.dingtalk.mcp.registry/cli": {
+  "com.dingtalk.dws/helper/cli": {
     "id": "devapp",
     "command": "devapp",
     "description": "开放平台应用管理",
-    "prefixes": ["devapp", "app"],
+    "aliases": ["app"],
     "groups": {
       "credentials": {"description": "应用凭证"},
       "permission": {"description": "应用权限"},
@@ -506,19 +510,17 @@ Tool override examples:
         "appName": {"alias": "name"}
       }
     },
-    "create_open_dev_app": {
+    "create_inner_app": {
       "cliName": "create",
       "description": "创建开放平台企业内部应用",
       "isSensitive": true,
       "flags": {
         "appName": {"alias": "name", "required": true},
         "appDesc": {"alias": "desc"},
-        "type": {"alias": "type", "default": "internal"},
-        "appIcon": {"alias": "icon"},
-        "hidden": {"alias": "hidden", "type": "bool"}
+        "appIcon": {"alias": "icon"}
       }
     },
-    "update_open_dev_app": {
+    "update_inner_app": {
       "cliName": "update",
       "description": "修改开放平台企业内部应用基础信息",
       "isSensitive": true,
@@ -536,7 +538,7 @@ Tool override examples:
         "supportHarmony": {"alias": "support-harmony", "type": "bool"}
       }
     },
-    "delete_open_dev_app": {
+    "delete_inner_app": {
       "cliName": "delete",
       "description": "删除开放平台企业内部应用",
       "isSensitive": true,
@@ -564,7 +566,7 @@ Tool override examples:
         "limit": {"alias": "limit", "default": "20"}
       }
     },
-    "add_open_dev_app_permissions": {
+    "apply_open_dev_app_permissions": {
       "cliName": "add",
       "group": "permission",
       "description": "申请开放平台应用权限点；需审核权限写入当前应用版本变更",
@@ -599,7 +601,7 @@ Tool override examples:
 }
 ```
 
-`permission search/detail` are UX aliases over `list_open_dev_app_permissions`. If the runtime overlay only exposes dynamic commands, keep one canonical command:
+`permission search/detail` are UX aliases over `list_open_dev_app_permissions`. The helper exposes one canonical MCP call and keeps alias behavior at the CLI layer:
 
 ```bash
 dws devapp permission list --keyword "机器人发送消息"
@@ -707,8 +709,7 @@ MCP payload:
 ```json
 {
   "appName": "DemoApp",
-  "appDesc": "internal app",
-  "type": "internal"
+  "appDesc": "internal app"
 }
 ```
 
@@ -1074,16 +1075,28 @@ Intent table:
 | --- | --- | --- |
 | "查应用/搜索应用" | `devapp list` | `list_open_dev_apps_by_condition` |
 | "看应用详情/clientId/agentId" | `devapp get` | `get_open_dev_app_detail` |
-| "创建应用" | `devapp create` | `create_open_dev_app` |
-| "修改名称/描述/图标" | `devapp update` | `update_open_dev_app` |
-| "删除应用" | `devapp delete` | `delete_open_dev_app` |
+| "创建应用" | `devapp create` | `create_inner_app` |
+| "修改名称/描述/图标" | `devapp update` | `update_inner_app` |
+| "删除应用" | `devapp delete` | `delete_inner_app` |
 | "查权限/搜索 API 权限" | `permission list` | `list_open_dev_app_permissions` |
 | "这个权限覆盖哪些 API" | `permission list --scope` | `list_open_dev_app_permissions` |
-| "申请权限/开通权限" | `permission add` | `add_open_dev_app_permissions` |
+| "申请权限/开通权限" | `permission add` | `apply_open_dev_app_permissions` |
 | "取消权限/移除权限" | `permission remove` | `remove_open_dev_app_permission` |
 | "拿 appSecret/clientSecret" | `credentials get` | Pending |
 | "配置事件订阅" | `event config` | Pending |
 | "发布/审核/选审批人" | `version ...` | Pending |
+
+Yulan invocation examples:
+
+| User wording | Expected first command | Reason |
+| --- | --- | --- |
+| "查一下开发者后台应用 DemoApp" | `dws devapp list --name DemoApp --format json` | OpenDev context plus app name means listByCondition search. |
+| "把应用图标换成 ICON_RESOURCE" | `dws devapp update --unified-app-id ... --icon ICON_RESOURCE --dry-run --format json` | Icon change is app base info update and must be guarded. |
+| "已确认删除这个开放平台应用" | `dws devapp delete --unified-app-id ... --yes --format json` | Destructive write only after unique app resolution and confirmation. |
+| "手机号权限要申请，虽然需要审核" | `dws devapp permission add --permissions Contact.User.mobile --dry-run/--yes` | `requiredApproval=true` is still appliable; approval moves to version publish. |
+| "配置事件订阅回调" | `dws devapp event config ... --dry-run --format json` | Event subscription is app configuration, not permission or docs search. |
+| "保存版本并看审核状态" | `version create`, `check-approval`, `publish`, `status` | Version flow owns approver selection and publish audit state. |
+| "创建 MCP 服务并配置 HSF tool" | OpenDev MCP platform workflow, not `dws devapp create` | MCP connector/tool is a platform artifact, not an enterprise internal app. |
 
 ServiceResult handling:
 
@@ -1101,28 +1114,31 @@ This section is the operational rulebook for yulan-style Agents. It is meant to
 avoid the common failure mode where an Agent knows the right business concept but
 calls the wrong DWS product, stale MCP tool, or over-broad permission list.
 
-### 11.1 Discovery Preflight
+### 11.1 Runtime Preflight
 
 Before running a devapp command in a new environment, the Agent should verify the
-runtime surface instead of assuming the branch document has already become a
-published MCP command tree.
+hardcoded helper surface. Endpoint configuration is an internal edition concern;
+the Agent should not require users to paste or export MCP gateway keys.
 
 ```bash
-dws schema --jq '.products[] | select(.id=="devapp") | {id, command, tool_count: (.tools | length)}'
 dws devapp --help
-dws schema devapp.list_open_dev_apps_by_condition --jq '.tool.flag_overlay'
+dws app --help
 ```
 
-If the product or tool is missing:
+If the command or endpoint is missing:
 
-1. Run `dws cache refresh` once and retry schema inspection.
-2. If it is still missing, report `DEVAPP_NOT_DISCOVERED`.
+1. If `dws devapp --help` fails, report `DEVAPP_COMMAND_UNAVAILABLE`.
+2. If execution reports `endpoint_not_resolved`, report
+   `DEVAPP_ENDPOINT_NOT_CONFIGURED` and ask the owner to check the internal
+   edition `SupplementServers/StaticServers` injection. Local developers may
+   override with `DINGTALK_DEVAPP_MCP_URL`, but Agents should not request it
+   from end users.
 3. Do not reroute the task to `devdoc`, `doc`, or generic `mcp` commands unless
    the user is asking for documentation rather than application management.
 
-If a command flag in this document conflicts with `--help` or `dws schema`, use
-the runtime schema. The document defines the target contract; discovery defines
-what is currently callable.
+If a command flag in this document conflicts with `--help`, use `--help`. The
+document defines the target contract; the checked-in helper code defines the
+current callable command surface.
 
 ### 11.2 Command Construction
 
@@ -1132,7 +1148,7 @@ Use this order when constructing a call:
    positive signals or the active yulan OpenDev app workstream. Do not use
    `devapp` for every bare `应用`.
 2. Resolve application identity before any detail or write operation.
-3. Prefer CLI flags exposed by `dws schema` over raw `--json`.
+3. Prefer checked-in CLI flags over raw `--json`.
 4. Use raw `--json` only when a required MCP field has no CLI flag yet.
 5. Always add `--format json` for Agent execution.
 6. For writes, call `--dry-run --format json` first, then call the same command
@@ -1191,7 +1207,8 @@ Agent should normalize behavior without hiding raw backend fields.
 
 | Normalized reason | Typical source | Agent behavior |
 | --- | --- | --- |
-| `DEVAPP_NOT_DISCOVERED` | `unknown command`, schema product missing, discovery exit code | Run `dws cache refresh` once; if still missing, say MCP product/tool is not published or not visible to this account. |
+| `DEVAPP_COMMAND_UNAVAILABLE` | `unknown command` for `dws devapp` | Report that the local CLI build does not contain the devapp helper. Do not try cache refresh as the primary fix. |
+| `DEVAPP_ENDPOINT_NOT_CONFIGURED` | `endpoint_not_resolved`, missing internal edition endpoint | Ask the owner to check `SupplementServers/StaticServers`; local debug may use `DINGTALK_DEVAPP_MCP_URL`, but do not ask users for gateway keys. |
 | `DEVAPP_TOOL_NOT_PUBLISHED` | Product exists but one tool is missing | Report the missing MCP tool key and avoid substituting a different operation. |
 | `AUTH_CONTEXT_MISSING` | Backend cannot resolve `corpId/userId` | Tell the user to re-login or check organization context; do not ask for internal `orgId/uid`. |
 | `APP_NOT_FOUND` | Empty list/detail result | Ask for another app identifier; do not create or update implicitly. |
@@ -1259,22 +1276,34 @@ headers.
 
 ## 12. Open-Source DWS Implementation Notes
 
-Two implementation paths are valid.
-
-Dynamic discovery path:
-
-1. Publish MCP tools with the `devapp` CLI metadata.
-2. Ensure the Streamable HTTP URL is discoverable by DWS without dropping query parameters.
-3. Use `dws schema devapp.<tool>` and `dws devapp ... --help` as the source of truth.
-4. Use `isSensitive=true` for create, update, delete, permission add, permission remove, credentials full secret read, event config, and version publish.
-
-Hardcoded helper path:
+The open-source branch uses a hardcoded helper path for `devapp`; do not depend
+on service discovery for command visibility.
 
 1. Add `internal/helpers/devapp.go`, following `internal/helpers/devdoc.go`.
 2. Register the root with `RegisterPublic`.
 3. Route helper invocations with `executor.NewHelperInvocation`.
-4. Preserve dynamic discovery as the authority when the same leaf exists; helper-only leaves can provide aliases such as `permission search/detail`.
+4. Keep command aliases such as `app` and `permission search/detail` in the
+   helper layer, not as separate MCP tools.
 5. Add tests for dry-run payloads, `--yes` guard, app resolution, and permission routing.
+
+Internal edition endpoint injection:
+
+```go
+SupplementServers: func() []edition.ServerInfo {
+    return []edition.ServerInfo{
+        {
+            ID:       "devapp",
+            Name:     "钉钉开放平台应用管理",
+            Endpoint: loadDevappMCPEndpointFromInternalConfig(),
+            Prefixes: []string{"devapp", "app"},
+        },
+    }
+}
+```
+
+The endpoint loader must read from internal config or secret storage. Do not put
+the Streamable HTTP URL or `?key=` value in this repository. `StaticServers` is
+also valid for an internal build that wants to skip Market discovery entirely.
 
 Recommended helper root:
 
@@ -1287,15 +1316,14 @@ Do not manually edit generated command indexes unless the generator is part of t
 
 ```bash
 dws devapp --help
-dws schema --jq '.products[] | select(.id=="devapp")'
-dws schema devapp.list_open_dev_apps_by_condition
+dws app --help
 ```
 
 ## 13. Rollout And Verification
 
 Use this checklist when moving from backend HSF implementation to usable DWS
 commands. The goal is to prove that the same operation works at the MCP layer,
-the DWS dynamic schema layer, and the Agent recipe layer.
+the DWS helper layer, and the Agent recipe layer.
 
 ### 13.1 MCP Tool Configuration Checklist
 
@@ -1325,11 +1353,11 @@ P0 debug inputs:
 | --- | --- |
 | `list_open_dev_apps_by_condition` | `{"currentPage":1,"pageSize":10}` |
 | `get_open_dev_app_detail` | `{"unifiedAppId":"UNIFIED_APP_ID"}` |
-| `create_open_dev_app` | `{"appName":"DemoApp","appDesc":"internal app","type":"internal"}` |
-| `update_open_dev_app` | `{"unifiedAppId":"UNIFIED_APP_ID","appDesc":"new desc"}` |
-| `delete_open_dev_app` | `{"unifiedAppId":"UNIFIED_APP_ID"}` |
+| `create_inner_app` | `{"appName":"DemoApp","appDesc":"internal app"}` |
+| `update_inner_app` | `{"unifiedAppId":"UNIFIED_APP_ID","appDesc":"new desc"}` |
+| `delete_inner_app` | `{"unifiedAppId":"UNIFIED_APP_ID"}` |
 | `list_open_dev_app_permissions` | `{"unifiedAppId":"UNIFIED_APP_ID","authStatus":"ALL","limit":20}` |
-| `add_open_dev_app_permissions` | `{"unifiedAppId":"UNIFIED_APP_ID","scopeValues":["SCOPE_VALUE"]}` |
+| `apply_open_dev_app_permissions` | `{"unifiedAppId":"UNIFIED_APP_ID","scopeValues":["SCOPE_VALUE"]}` |
 | `remove_open_dev_app_permission` | `{"unifiedAppId":"UNIFIED_APP_ID","scopeValue":"SCOPE_VALUE"}` |
 
 For destructive debug cases, use a disposable application and permission scope.
@@ -1350,28 +1378,29 @@ After publish, verify the service through MCP before using DWS:
 Do not store the Streamable HTTP URL or `?key=` value in repository files,
 README, skills, or issue text.
 
-### 13.3 DWS Discovery Smoke
+### 13.3 DWS Helper Smoke
 
-After the MCP service is published or the registry overlay is updated, refresh
-DWS and verify discovery:
+After the MCP service is published and the internal edition injects the endpoint
+through `SupplementServers` or `StaticServers`, verify the hardcoded helper path:
 
 ```bash
-dws cache refresh --product devapp
-dws schema --jq '.products[] | select(.id=="devapp") | {id, command, tool_count: (.tools | length)}'
-dws schema devapp.list_open_dev_apps_by_condition --jq '.tool.flag_overlay'
 dws devapp --help
+dws app --help
+dws devapp list --page 1 --page-size 10 --format json
 ```
 
 Expected:
 
 1. Product id is `devapp`.
-2. Optional command alias `app` may exist, but `devapp` is canonical.
-3. P0 tools appear in schema or equivalent command leaves appear in help.
+2. Command alias `app` exists, but `devapp` is canonical.
+3. P0 command leaves appear in help.
 4. `--format json` is available through global output flags.
 5. Sensitive writes are marked or guarded so Agent uses `--dry-run` then `--yes`.
 
-If `devapp` is missing after refresh, treat it as
-`DEVAPP_NOT_DISCOVERED`. If `devapp` exists but a P0 tool is missing, treat it as
+If `devapp` is missing, treat it as `DEVAPP_COMMAND_UNAVAILABLE`. If command
+execution reports `endpoint_not_resolved`, check the internal edition endpoint
+injection. Local debug may use `DINGTALK_DEVAPP_MCP_URL` as a temporary override.
+If the endpoint is configured but a backend tool is unavailable, treat it as
 `DEVAPP_TOOL_NOT_PUBLISHED`.
 
 ### 13.4 Agent Smoke
@@ -1382,7 +1411,7 @@ error propagation.
 
 | Scenario | Smoke command | Pass criteria |
 | --- | --- | --- |
-| Discover product | `dws schema --jq '.products[] | select(.id=="devapp")'` | Product exists and exposes devapp CLI metadata. |
+| Discover product | `dws devapp --help` | Helper command exists and exposes devapp CLI metadata. |
 | List baseline | `dws devapp list --page 1 --page-size 10 --format json` | JSON contains page summary and app array. |
 | Search by name | `dws devapp list --name DemoApp --format json` | One result opens path to get; multiple results return candidates. |
 | Detail by id | `dws devapp get --unified-app-id UNIFIED_APP_ID --format json` | Response includes ids but no full secret. |
@@ -1399,7 +1428,8 @@ The application-side command set is ready for yulan Agent usage only when all of
 the following are true:
 
 1. P0 MCP tools are published and visible through `tools/list`.
-2. DWS `schema` shows `devapp` with P0 tools or equivalent helper leaves.
+2. `dws devapp --help` shows P0 helper leaves and `dws app --help` resolves as
+   the compatibility alias.
 3. App list/detail/create/update/delete smoke cases pass.
 4. Permission list/add/remove smoke cases pass for APP and SNS scopes.
 5. `requiredApproval=true` permission add stages into version changes instead of
@@ -1418,8 +1448,8 @@ the following are true:
 | `dws devapp get --name DemoApp --format json` with multiple matches | Stops and returns candidates. |
 | `dws devapp create --name T --type internal --dry-run --format json` | Prints payload only; no MCP call. |
 | `dws devapp create --name T --type internal --format json` | Refuses because write confirmation is missing. |
-| `dws devapp create --name T --type internal --yes --format json` | Calls `create_open_dev_app`. |
-| `dws devapp update --unified-app-id X --desc Y --yes --format json` | Calls `update_open_dev_app`. |
+| `dws devapp create --name T --type internal --yes --format json` | Calls `create_inner_app`. |
+| `dws devapp update --unified-app-id X --desc Y --yes --format json` | Calls `update_inner_app`. |
 | `dws devapp delete --unified-app-id X --format json` | Refuses because delete confirmation is missing. |
 | `dws devapp permission list --unified-app-id X --format json` | Returns flattened APP and SNS permissions. |
 | `dws devapp permission list --unified-app-id X --keyword "发送消息" --format json` | Returns candidate `permissions[]`; no automatic apply. |

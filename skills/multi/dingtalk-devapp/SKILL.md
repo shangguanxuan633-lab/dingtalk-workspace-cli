@@ -18,7 +18,7 @@ metadata:
 
 <!-- SAFETY_PREAMBLE_INJECT -->
 
-> ⚠️ **命令可用性可能因企业服务发现配置而异**。本文档列出的命令基于目标 MCP overlay 设计；实际可调用命令取决于企业 MCP gateway 是否已注册 `devapp` 产品和对应 tool。执行前用 `dws devapp --help`、`dws schema devapp...` 或 `--dry-run` 验证。
+> ⚠️ `dws devapp ...` 是开源分支内置 helper 命令，不依赖 MCP 服务发现；真实调用 endpoint 由内部 edition 通过 `SupplementServers/StaticServers` 注入，`DINGTALK_DEVAPP_MCP_URL` 仅作本地调试覆盖。不得把 endpoint/key 写进仓库。执行前用 `dws devapp --help` 或 `--dry-run` 验证。
 
 > 命令参考：[devapp.md](references/devapp.md)。
 

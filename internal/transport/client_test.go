@@ -373,6 +373,38 @@ func TestCallToolAcceptsStructuredContentResults(t *testing.T) {
 	}
 }
 
+func TestCallToolPreservesEndpointQuery(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("key"); got != "secret-key" {
+			t.Fatalf("endpoint key query = %q, want secret-key", got)
+		}
+		if r.URL.Fragment != "" {
+			t.Fatalf("server should not receive URL fragment, got %q", r.URL.Fragment)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      3,
+			"result": map[string]any{
+				"content": []map[string]any{
+					{"type": "text", "text": `{"ok":true}`},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	result, err := client.CallTool(context.Background(), server.URL+"?key=secret-key#ignored", "test_tool", nil)
+	if err != nil {
+		t.Fatalf("CallTool() error = %v", err)
+	}
+	if result.Content["ok"] != true {
+		t.Fatalf("ok = %#v, want true", result.Content["ok"])
+	}
+}
+
 func TestCallToolClassifiesUnauthorizedHTTPAsAuthError(t *testing.T) {
 	t.Parallel()
 

@@ -2,8 +2,8 @@
 
 管理钉钉开放平台企业内部应用。用于应用列表查询、应用详情、创建/修改/删除、凭证读取、权限查询/申请/取消，以及事件订阅和版本发布目标链路。
 
-> 当前开源分支以服务发现和 MCP overlay 为事实源。若 `dws devapp --help` 或 `dws schema devapp...` 与本文冲突，以运行时输出为准。
-> 当前仓库已落地设计文档、skill 路由和 Agent 测试用例；运行态是否可调取决于 MCP registry 是否发布 `devapp` 产品与 P0 tools。
+> 当前开源分支已内置 `dws devapp ...` helper 命令树，兼容别名为 `dws app ...`。本能力不依赖 MCP 服务发现或 registry overlay；真实调用 endpoint 由内部 edition 通过 `SupplementServers/StaticServers` 注入。`DINGTALK_DEVAPP_MCP_URL` 仅用于本地调试覆盖，严禁把 endpoint/key 写入仓库。
+> 若 `dws devapp --help` 与本文冲突，以运行时输出为准。
 
 ## 命名
 
@@ -107,14 +107,14 @@ dws devapp create --name DemoApp --desc "内部应用" --type internal --dry-run
 dws devapp create --name DemoApp --desc "内部应用" --type internal --yes --format json
 ```
 
-MCP tool: `create_open_dev_app`
+MCP tool: `create_inner_app`
 
 当前 P0 只支持企业内部应用基础创建：
 
 | 类型 | 支持 | 说明 |
 | --- | --- | --- |
-| `internal` | 是 | 默认企业内部应用。 |
-| `h5` | 视后端 schema | 可作为内部 H5 能力口径。 |
+| `internal` | 是 | 默认企业内部应用；`--type internal` 只做 CLI guard，不下发 MCP。 |
+| `h5` | 否 | 当前 helper 不通过创建接口直接创建 H5 类型；网页应用当前仅有 `webapp get` 查询入口，配置能力未上架。 |
 | `robot` | 否 | 机器人配置是独立能力。 |
 | `miniapp/isv/connector` | 否 | 不属于 yulan P0 创建。 |
 
@@ -125,7 +125,7 @@ dws devapp update --unified-app-id UNIFIED_APP_ID --name DemoApp2 --desc "新描
 dws devapp update --unified-app-id UNIFIED_APP_ID --name DemoApp2 --desc "新描述" --yes --format json
 ```
 
-MCP tool: `update_open_dev_app`
+MCP tool: `update_inner_app`
 
 至少提供一个更新字段：`appName/appDesc/appIcon/international/supportHarmony`。
 
@@ -136,7 +136,7 @@ dws devapp delete --unified-app-id UNIFIED_APP_ID --dry-run --format json
 dws devapp delete --unified-app-id UNIFIED_APP_ID --yes --format json
 ```
 
-MCP tool: `delete_open_dev_app`
+MCP tool: `delete_inner_app`
 
 删除前必须展示被删应用摘要。允许的定位字段是 `unifiedAppId/agentId/appId/appName/appKey/customKey`，但名称和 key 必须唯一命中。
 
@@ -199,7 +199,7 @@ dws devapp permission add --unified-app-id UNIFIED_APP_ID --permissions qyapi_ro
 dws devapp permission add --unified-app-id UNIFIED_APP_ID --permissions qyapi_robot_sendmsg --yes --format json
 ```
 
-MCP tool: `add_open_dev_app_permissions`
+MCP tool: `apply_open_dev_app_permissions`
 
 - `scopeValues` 必须来自权限列表返回的 `permissions[].scopeValue`。
 - 已开通权限跳过或提示，不重复申请。
@@ -251,22 +251,22 @@ dws devapp version status --unified-app-id APP_ID --version-id VERSION_ID --form
 
 ## 调用与排错
 
-新环境先做发现预检：
+新环境先做运行时预检：
 
 ```bash
-dws schema --jq '.products[] | select(.id=="devapp")'
 dws devapp --help
-dws schema devapp.list_open_dev_apps_by_condition --jq '.tool.flag_overlay'
+dws app --help
 ```
 
-如果 `devapp` 或目标 tool 不存在，先 `dws cache refresh` 再重试；仍不存在时说明 MCP 产品或 tool 未发布/当前账号不可见，不要改用 `devdoc/doc` 处理应用管理请求。
+如果 `dws devapp --help` 不存在，说明本地 CLI 构建没有 devapp helper；如果执行时报 `endpoint_not_resolved`，让内部发行版负责人检查 `SupplementServers/StaticServers` 注入。不要改用 `devdoc/doc` 处理应用管理请求。
 
 错误处理：
 
 | 情况 | Agent 行为 |
 | --- | --- |
-| `unknown command` / schema 无 `devapp` | 报告 `DEVAPP_NOT_DISCOVERED`，提示刷新缓存或发布 MCP。 |
-| 产品存在但 tool 缺失 | 报告缺失的 MCP tool key，不用相近命令替代。 |
+| `unknown command` | 报告 `DEVAPP_COMMAND_UNAVAILABLE`，提示使用包含 devapp helper 的 CLI 构建。 |
+| `endpoint_not_resolved` | 报告 `DEVAPP_ENDPOINT_NOT_CONFIGURED`，要求检查内部 edition endpoint 注入；本地调试可临时用 `DINGTALK_DEVAPP_MCP_URL`。 |
+| 后端 tool 缺失 | 报告缺失的 MCP tool key，不用相近命令替代。 |
 | 多应用命中 | 展示 `appName/unifiedAppId/agentId/appKey/creator/gmtModified`，停止写操作。 |
 | 权限候选过多 | 加 `--keyword`、`--scope-type` 或 `--scope` 缩小；不要直接申请第一条。 |
 | `requiredApproval=true` | 可以申请；申请后进入版本变更，发布时审核。 |
@@ -275,7 +275,7 @@ dws schema devapp.list_open_dev_apps_by_condition --jq '.tool.flag_overlay'
 
 ## 仓库内完整设计
 
-如果正在源码仓库中开发，完整 MCP overlay、P0 RPC 出入参契约、Agent 裁剪规则、上线验收清单和验收用例见：
+如果正在源码仓库中开发，完整 helper 映射、P0 RPC 出入参契约、Agent 裁剪规则、上线验收清单和验收用例见：
 
 ```text
 docs/devapp-yulan-command-routing.md
