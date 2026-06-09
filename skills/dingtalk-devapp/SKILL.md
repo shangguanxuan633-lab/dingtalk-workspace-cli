@@ -41,7 +41,7 @@ metadata:
 | 层 | 参考文档 | 覆盖命令 |
 |----|---------|---------|
 | 基础 | [app-crud.md](references/app-crud.md) | list / get / create / update / delete / inactive / active |
-| 凭证与网页应用 | [credentials-webapp.md](references/credentials-webapp.md) | credentials get / webapp get / webapp config |
+| 凭证与网页应用 | [cred-webapp.md](references/cred-webapp.md) | credentials get / webapp get / webapp config |
 | 权限管理 | [permissions.md](references/permissions.md) | permission list / permission add / permission remove |
 | 成员与安全 | [member-security.md](references/member-security.md) | member list / add / remove / security config |
 | 机器人 | [robot.md](references/robot.md) | robot create / submit / result / get / config / update / enable / offline |

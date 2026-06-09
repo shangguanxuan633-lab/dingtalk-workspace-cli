@@ -149,4 +149,4 @@
 
 - 多应用命中时展示候选，不自动选择
 - `ServiceResult.success=false` 原样透传 `errorCode/errorMsg`
-- 待实现的 event/version 命令遇到时报告功能待上线
+- 待实现的 event 命令遇到时报告功能待上线
