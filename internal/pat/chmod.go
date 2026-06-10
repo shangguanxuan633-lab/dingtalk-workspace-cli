@@ -66,10 +66,10 @@ func resolveSessionIDFromEnv() string {
 // a long-lived shell / sub-process. Exposing DINGTALK_DWS_AGENTCODE lets
 // the host export the code once and let the CLI resolve it on every pat
 // subcommand. The flag always wins when both are set so scripted one-offs
-// remain deterministic. When neither flag nor env is set, `pat chmod` fails
-// locally instead of letting the server reject the request later. Batch PAT
-// tools receive the resolved agentCode in arguments, while the CLI also keeps
-// exporting it through env for older gateway paths.
+// remain deterministic. When neither flag nor env is set, `pat chmod` omits
+// agentCode and lets the PAT server apply its open-source default. Batch PAT
+// tools receive the resolved agentCode in arguments when present, while the CLI
+// also keeps exporting it through env for older gateway paths.
 //
 // Namespace note: DWS_DINGTALK_AGENTCODE is kept as a compatibility alias for
 // hosts that shipped the reversed prefix early. DWS_AGENTCODE /
@@ -110,35 +110,22 @@ func validateAgentCode(code string) error {
 	return nil
 }
 
-// resolveAgentCode implements the canonical two-tier lookup for
-// --agentCode:
+// resolveAgentCode implements the canonical optional lookup for --agentCode:
 //
 //  1. explicit --agentCode flag value (highest priority; wins over env)
 //  2. DINGTALK_DWS_AGENTCODE env var (per-shell primary fallback)
 //  3. DWS_DINGTALK_AGENTCODE env var (compatibility fallback)
-//  4. empty ("") when required=false; typed error when required=true.
+//  4. empty ("") so PAT-core can apply its open-source default.
 //
 // Any non-empty resolved value is validated via validateAgentCode, so
 // callers never have to re-validate.
-func resolveAgentCode(flagVal string, required bool) (string, error) {
+func resolveAgentCode(flagVal string) (string, error) {
 	code := strings.TrimSpace(flagVal)
 	envSource := ""
 	if code == "" {
 		code, envSource = resolveAgentCodeFromEnv()
 	}
 	if code == "" {
-		if required {
-			return "", apperrors.NewValidation(
-				fmt.Sprintf("flag --agentCode is required (or set env %s or %s)", agentCodeEnv, agentCodeEnvCompat),
-				apperrors.WithReason("missing_agent_code"),
-				apperrors.WithHint(fmt.Sprintf("dws pat chmod <scope>... --agentCode <id>\n  or: export %s=<id>", agentCodeEnv)),
-				apperrors.WithActions(
-					"dws pat chmod <scope>... --agentCode <id>",
-					fmt.Sprintf("export %s=<id>", agentCodeEnv),
-					fmt.Sprintf("export %s=<id>", agentCodeEnvCompat),
-				),
-			)
-		}
 		return "", nil
 	}
 	if err := validateAgentCode(code); err != nil {
@@ -234,7 +221,7 @@ grantType 规则:
   dws pat chmod --recommend --grant-type session --session-id session-xxx`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			flagVal, _ := cmd.Flags().GetString("agentCode")
-			agentCode, err := resolveAgentCode(flagVal, true)
+			agentCode, err := resolveAgentCode(flagVal)
 			if err != nil {
 				return err
 			}
@@ -343,7 +330,7 @@ grantType 规则:
 	}
 
 	chmodCmd.Flags().String("agentCode", "",
-		"Agent 唯一标识（必填；也可通过 env DINGTALK_DWS_AGENTCODE/DWS_DINGTALK_AGENTCODE 注入，flag 优先；会进入 batch 参数并同步注入兼容 env）")
+		"Agent 唯一标识（可选；也可通过 env DINGTALK_DWS_AGENTCODE/DWS_DINGTALK_AGENTCODE 注入，flag 优先；未传则由服务端默认兜底）")
 	chmodCmd.Flags().String("grant-type", "session", "授权策略: once|session|permanent")
 	chmodCmd.Flags().String("session-id", "", "会话标识（session 模式下必填）")
 	chmodCmd.Flags().StringArrayVar(&productFlags, "product", nil, "产品编码，可重复；与 --products 等价")

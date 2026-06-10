@@ -29,8 +29,8 @@ import (
 )
 
 // fakeToolCaller captures the toolArgs passed to CallTool so tests can
-// assert how the two-tier --agentCode / DINGTALK_DWS_AGENTCODE / error
-// resolver feeds into the outgoing MCP argv.
+// assert how the optional --agentCode / DINGTALK_DWS_AGENTCODE resolver feeds
+// into the outgoing batch request.
 type fakeToolCaller struct {
 	mu                sync.Mutex
 	dryRun            bool
@@ -700,7 +700,7 @@ func TestChmod_agentCode_compatEnvFallback(t *testing.T) {
 	}
 }
 
-func TestChmod_withoutAgentCodeFailsBeforeMCP(t *testing.T) {
+func TestChmod_withoutAgentCodeLetsServerDefault(t *testing.T) {
 	t.Setenv(agentCodeEnv, "")
 	t.Setenv(agentCodeEnvCompat, "")
 
@@ -708,15 +708,20 @@ func TestChmod_withoutAgentCodeFailsBeforeMCP(t *testing.T) {
 	cmd := buildChmod(t, fake)
 	_ = cmd.Flags().Set("grant-type", "once")
 
-	err := cmd.RunE(cmd, []string{"aitable.record:read"})
-	if err == nil {
-		t.Fatal("chmod RunE error = nil, want missing agentCode error")
+	if err := cmd.RunE(cmd, []string{"aitable.record:read"}); err != nil {
+		t.Fatalf("chmod RunE error = %v, want server-side default agentCode path", err)
 	}
-	if !strings.Contains(err.Error(), "flag --agentCode is required") {
-		t.Fatalf("error = %q, want missing agentCode hint", err.Error())
+	if fake.callN != 1 {
+		t.Fatalf("CallTool was invoked %d times; missing agentCode must still reach the batch caller", fake.callN)
 	}
-	if fake.callN != 0 {
-		t.Fatalf("CallTool was invoked %d times; missing agentCode must fail before MCP", fake.callN)
+	if fake.gotTool != patBatchGrantToolName {
+		t.Fatalf("gotTool = %q, want %q", fake.gotTool, patBatchGrantToolName)
+	}
+	if _, ok := fake.gotArgs["agentCode"]; ok {
+		t.Fatalf("agentCode arg must be omitted for server default path: %#v", fake.gotArgs)
+	}
+	if got := fake.gotAgentEnv; got != "" {
+		t.Fatalf("%s during CallTool = %q, want empty for server default path", agentCodeEnv, got)
 	}
 }
 
@@ -1180,7 +1185,8 @@ func TestChmod_agentCode_flag_wins_over_env(t *testing.T) {
 
 // TestChmod_agentCode_legacy_env_not_recognized is a reverse-guard: after
 // the SSOT hard-removal of the DWS_AGENTCODE alias, exporting only the
-// legacy env MUST NOT satisfy the required agentCode contract.
+// legacy env MUST NOT be consumed as agentCode. The request is still sent so
+// PAT-core can apply its open-source default.
 func TestChmod_agentCode_legacy_env_not_recognized(t *testing.T) {
 	t.Setenv(agentCodeEnv, "")
 	t.Setenv(agentCodeEnvCompat, "")
@@ -1190,15 +1196,14 @@ func TestChmod_agentCode_legacy_env_not_recognized(t *testing.T) {
 	cmd := buildChmod(t, fake)
 	_ = cmd.Flags().Set("grant-type", "once")
 
-	err := cmd.RunE(cmd, []string{"aitable.record:read"})
-	if err == nil {
-		t.Fatal("chmod RunE error = nil, want missing agentCode error")
+	if err := cmd.RunE(cmd, []string{"aitable.record:read"}); err != nil {
+		t.Fatalf("chmod RunE error = %v, want server-side default agentCode path", err)
 	}
-	if !strings.Contains(err.Error(), "flag --agentCode is required") {
-		t.Fatalf("error = %q, want missing agentCode hint", err.Error())
+	if fake.callN != 1 {
+		t.Fatalf("CallTool was invoked %d times; legacy env should be ignored but request should continue", fake.callN)
 	}
-	if fake.callN != 0 {
-		t.Fatalf("CallTool was invoked %d times; legacy env must not satisfy agentCode", fake.callN)
+	if _, ok := fake.gotArgs["agentCode"]; ok {
+		t.Fatalf("agentCode arg must be omitted; legacy DWS_AGENTCODE must not be consumed: %#v", fake.gotArgs)
 	}
 	if got := fake.gotAgentEnv; got != "" {
 		t.Fatalf("agent env = %q, want empty; legacy DWS_AGENTCODE must not be consumed", got)
