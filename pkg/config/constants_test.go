@@ -194,6 +194,16 @@ func TestDefaultFetchServersLimit(t *testing.T) {
 	}
 }
 
+func TestGetMCPBaseURLDefaultsToPrepub(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DWS_CONFIG_DIR", dir)
+
+	got := GetMCPBaseURL()
+	if got != "https://pre-mcp.dingtalk.com" {
+		t.Fatalf("GetMCPBaseURL() = %q, want prepub MCP URL", got)
+	}
+}
+
 func TestGetMCPBaseURLUsesConfigFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DWS_CONFIG_DIR", dir)

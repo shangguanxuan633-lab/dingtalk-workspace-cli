@@ -6,13 +6,44 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/) and th
 
 ## [Unreleased]
 
-### Added
+## [1.0.35] - 2026-06-08
 
-- **`dws auth export` / `dws auth import`** — portable auth bundle for migrating Linux sandbox credentials. Exports the encrypted keychain (`~/.local/share/dws-cli`, including `auth-token.enc` and `dek`) plus required `~/.dws` config so refresh tokens survive import; copying only `app.json` leaves access tokens expiring after ~2 hours. Supports `-o` / `-i` tar.gz paths and `--base64` for copy/paste between sandboxes. `dws auth status` now shows refresh-token validity in table output.
+### Fixed
+
+- **`chat message send` @-mentions not rendered in group / direct chat** (#433, `internal/helpers/chat.go`) — when sending a group message or an openDingTalkId direct message (`send_personal_message`) as the current user, the `content` body was packed with `json.Marshal`, whose default HTML escaping turns the `<` `>` in `<@openDingTalkId>` / `<@all>` into `<` `>`. The DingTalk client renders @-mentions by matching the **literal** `<@...>` token, so after escaping the match fails and the mention shows as plain text — while the API still returns `success`, masking the bug. Fix: add `marshalMessageContent`, which serializes `{title,text}` with `json.Encoder` + `SetEscapeHTML(false)`; both the group and openDingTalkId-direct `send_personal_message` paths now use it, preserving the literal `<@...>`. Added regression test `TestChatMessageSendContentNotHTMLEscaped` asserting the content keeps the literal token and is never HTML-escaped. Verified on a real device: `@someone` and `@all` both render as clickable blue mentions.
+- **`chat` skill docs & scripts aligned to direct-chat `list-direct`** (#424) — `chat message list` now supports group chats only (`--user` / `--open-dingtalk-id` removed); reading a direct chat moves to the dedicated `list-direct` command, but the skill docs and scripts still taught `chat message list --user`, which now errors with `unknown flag: --user`, also breaking `chat_history_with_user.py` (listed as the "preferred" way to query direct chats). This update: `skills/{mono,multi/dingtalk-chat}/references/products/chat.md` switches `message list` to group-only and documents the new `list-direct` command, syncing the intent routing / key-distinction / context-passing tables / caveats; `skills/mono/references/best_practices/01-messaging.md` changes query-private-chat from `list --user` to `list-direct` (the multi version was already updated); `chat_history_with_user.py` (mono + multi) now calls `list-direct` and fixes response parsing (unwraps `result.messages`, aligns `createTime/content/sender` fields — it previously crashed on `'str' object has no attribute 'get'`). Direct-chat sending still uses `chat message send --user` (since v1.0.34 the direct-send rpc is folded into the `send` command; there is no separate `send-direct`). Docs/scripts only; no change to CLI binary behavior.
+- **`pat chmod` batch authorization did not pass through `agentCode`** (#414, `internal/pat/chmod.go`) — the batch plan / grant paths (`buildBatchPlanArgs` / `batchArgs`) previously carried `agentCode` only in the single-grant `toolArgs`; batch calls omitted it, so a batch authorization with an explicit `agentCode` was processed under the default agent. Fix: the batch plan / grant args now also carry `agentCode`, matching the single-grant path.
+- **`pat` JSON output escaped the authorization URL into an unreadable form** (#401, `internal/pat`) — the authorization URL attached to PAT error messages, after default HTML escaping, turned `&` into `&`, breaking the link when copied / recognized on mobile. Fix: the PAT error-enrichment JSON output now uses `SetEscapeHTML(false)` (scoped to PAT JSON only), preserving the readable `&` separators.
+
+## [1.0.34] - 2026-06-03
 
 ### Changed
 
-- **Breaking: `dws pat chmod` now prints a compact authorization summary by default** — scripts that parse the raw MCP JSON response from stdout must pass `--format json` or `--verbose` to preserve the previous machine-readable payload. The summary keeps the grant status, agentCode, grantType, scope counts, and next-action hint without dumping full scope detail.
+- **Service discovery path now carries a version-coded segment** (`internal/market/registry.go`) — the server-list endpoint moves from `/cli/discovery/apis` to `/cli/discovery/apis/bamboo`. The path is now a single `discoveryAPIPath` constant so future version bumps touch one place. Only the path changes; the MCP base host stays on production `https://mcp.dingtalk.com` and the auth / skill / doctor endpoints are untouched. Discovery via the edition `DiscoveryURL` hook (full-URL `FetchServersFromURL`) is unaffected. Server side must serve the new path.
+
+### Removed
+
+- **`dws aiapp` — AI application product taken offline** — removed the `aiapp` product surface (`create` / `query` / `modify`) from the CLI: deleted `internal/helpers/aiapp.go`, dropped it from the generator coverage targets and `knownRegistryProducts`, removed the `aiapp` skill references (mono `references/products/aiapp.md` + `dingtalk-aiapp` multi skill), and unpublished the `aiapp` server from the service-discovery envelope. Product count drops from 19 to 18.
+
+## [1.0.33] - 2026-06-02
+
+This release merges the multi-contributor `pre-mcp-discovery` feature branch into `main` as a single squash (#391), bringing a large batch of new product surface — full DingTalk **docs** (`doc`), **knowledge base** (`wiki`), **AI app** (`aiapp`), AI-table **forms** + **import/export**, and reworked **mail** / **todo** / **report** command trees — while keeping service discovery pinned to production `https://mcp.dingtalk.com` (the branch's `pre-mcp.dingtalk.com` endpoint change was deliberately excluded; the four host constants in `skill_command.go` / `auth/endpoints.go` / `cli/loader.go` / `market/registry.go` stay on prod). It also folds in the portable auth bundle (`dws auth export` / `import`, #357) and PAT batch authorization (#389).
+
+### Added
+
+- **`dws doc` — full DingTalk document command family** (#387, #362, #388, #390; `internal/helpers/doc.go`, `internal/helpers/doc_jsonml.go`, `internal/helpers/docjsonml/`) — search / list / info / read / create / update / upload / download / copy / move / rename, plus `file`, `folder`, `block`-level editing and `comment` (list / create / reply / create-inline). Authoring supports both DocxXML and a JSONML format with a v2 schema validator (`docjsonml/jsonml-schema-v2.json` + `doc_jsonml_validate_v2.go`). Document export and OA alignment land here.
+- **`dws wiki` — knowledge base management** (`internal/helpers/wiki.go`, `internal/helpers/wiki_proxy.go`) — knowledge space `create` / `get` / `list` / `search` and member `add` / `list` / `update`, routed through a wiki proxy server.
+- **`dws aiapp` — AI application lifecycle** (`internal/helpers/aiapp.go`) — `create` (with prompt / attachments / skills), `query` by task ID, `modify` by thread ID.
+- **`dws aitable` forms + import/export** (`internal/helpers/aitable_form.go`, `internal/helpers/aitable_export_import.go`) — datasheet form management and full record import/export, the latter driven through the async-task helper for large datasets.
+- **Reworked `chat` / `report` / `todo` / `contact` / `mail` command trees aligned to the Wukong baseline** (#355; `internal/compat/mail_hooks.go`, `internal/compat/todo_hooks.go`, `internal/helpers/report_readable.go`) — mail and todo gain dedicated compat hooks; `report` gains a human-readable rendering path alongside the raw JSON, plus deprecation shims for the old report shape.
+- **`dws auth export` / `dws auth import`** (#357) — portable auth bundle for migrating Linux sandbox credentials. Exports the encrypted keychain (`~/.local/share/dws-cli`, including `auth-token.enc` and `dek`) plus required `~/.dws` config so refresh tokens survive import; copying only `app.json` leaves access tokens expiring after ~2 hours. Supports `-o` / `-i` tar.gz paths and `--base64` for copy/paste between sandboxes. `dws auth status` now shows refresh-token validity in table output.
+- **Async-task and paging infrastructure** (`pkg/asynctask/`, `pkg/paging/`) — shared helpers underpinning long-running operations (e.g. aitable import/export, doc export) and cursor/page traversal.
+
+### Changed
+
+- **`envelope` now registers `cli.Aliases` as cobra aliases** (#391) — discovery-generated commands expose their declared aliases natively in the command tree, with accompanying command-structure and JSON-parsing cleanups.
+- **Breaking: `dws pat chmod` prints a compact authorization summary by default, and gains batch authorization flows** (#389; `internal/pat/chmod.go`) — scripts that parse the raw MCP JSON from stdout must now pass `--format json` or `--verbose` to keep the machine-readable payload; the default summary keeps grant status, agentCode, grantType, scope counts, and a next-action hint. New batch grant/plan flows (`pat.batch_grant` / `pat.batch_plan`) authorize multiple products in one session, fall back to the legacy single-grant path when the server reports `PAT_BATCH_AUTH_UNSUPPORTED`, use the server's default `agentCode` when none is given, and surface per-tool authorization metadata for grant planning.
+- **Skill packs synced to the Wukong-aligned content** across attendance / calendar / minutes / oa / sheet and others (#391).
 
 ## [1.0.32] - 2026-05-25
 
