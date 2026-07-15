@@ -785,6 +785,65 @@ func TestResolvePATPollInterval(t *testing.T) {
 	}
 }
 
+func TestResolvePATPollTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+		want time.Duration
+	}{
+		{name: "missing uses compatibility default", want: patPollTimeout},
+		{name: "server remaining lifetime", raw: json.RawMessage(`75`), want: 75 * time.Second},
+		{name: "zero uses compatibility default", raw: json.RawMessage(`0`), want: patPollTimeout},
+		{name: "negative uses compatibility default", raw: json.RawMessage(`-1`), want: patPollTimeout},
+		{name: "null uses compatibility default", raw: json.RawMessage(`null`), want: patPollTimeout},
+		{name: "string uses compatibility default", raw: json.RawMessage(`"75"`), want: patPollTimeout},
+		{name: "fraction uses compatibility default", raw: json.RawMessage(`1.5`), want: patPollTimeout},
+		{name: "duration overflow uses compatibility default", raw: json.RawMessage(`9223372037`), want: patPollTimeout},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolvePATPollTimeout(tt.raw); got != tt.want {
+				t.Fatalf("resolvePATPollTimeout(%s) = %s, want %s", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandlePatAuthCheck_UsesServerExpiryForPollDeadlineAndDisplay(t *testing.T) {
+	t.Setenv(authpkg.AgentCodeEnv, "")
+	server, configDir := setupHandlePATServer(t, "APPROVED", "test-auth-code")
+	defer server.Close()
+
+	mock := &mockRunner{
+		runFunc: func(ctx context.Context, inv executor.Invocation) (executor.Result, error) {
+			t.Fatal("runner should not be called after the flow deadline expires")
+			return executor.Result{}, nil
+		},
+	}
+	raw := `{"code":"PAT_BATCH_AUTH_PENDING","data":{"flowId":"flow-expiring","clientId":"test-client-id","pollIntervalSeconds":30,"expiresInSeconds":1}}`
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	startedAt := time.Now()
+	var output bytes.Buffer
+	_, err := handlePatAuthCheck(ctx, &runtimeRunner{fallback: mock}, executor.Invocation{
+		CanonicalProduct: "test",
+		Tool:             "test_tool",
+	}, &apperrors.PATError{RawJSON: raw}, configDir, &output)
+	elapsed := time.Since(startedAt)
+
+	if err == nil || !strings.Contains(err.Error(), "授权超时") {
+		t.Fatalf("handlePatAuthCheck error = %v, want authorization timeout", err)
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("polling elapsed %s, want server expiry to stop it near 1s", elapsed)
+	}
+	if got := output.String(); !strings.Contains(got, "超时时间: 1s") {
+		t.Fatalf("output should display the effective server timeout, got %q", got)
+	}
+}
+
 func TestRunDirectPATAuthCheck_JSONModeReturnsStructuredPending(t *testing.T) {
 	t.Setenv(authpkg.AgentCodeEnv, "")
 	configDir := t.TempDir()
