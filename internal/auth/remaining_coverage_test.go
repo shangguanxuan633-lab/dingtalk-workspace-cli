@@ -42,7 +42,11 @@ func TestCrossPlatformCoverageTokenPersistencePreflightRemainingEdges(t *testing
 		profilesReadFile = origProfilesReadFile
 	})
 
-	edition.Override(&edition.Hooks{SaveToken: func(string, []byte) error { return nil }})
+	edition.Override(&edition.Hooks{
+		SaveToken:   func(string, []byte) error { return nil },
+		LoadToken:   func(string) ([]byte, error) { return nil, ErrTokenDataNotFound },
+		DeleteToken: func(string) error { return nil },
+	})
 	if err := preflightTokenPersistence(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}

@@ -32,13 +32,6 @@ type rejectedTokenRefresher interface {
 }
 
 var (
-	markAccessTokenStale = authpkg.MarkAccessTokenStale
-	newRefreshProvider   = func(configDir string) accessTokenGetter {
-		disc := slog.New(slog.NewTextHandler(io.Discard, nil))
-		provider := authpkg.NewOAuthProvider(configDir, disc)
-		configureOAuthProviderCompatibility(provider, configDir)
-		return provider
-	}
 	newRejectedTokenRefresher = func(configDir string) rejectedTokenRefresher {
 		disc := slog.New(slog.NewTextHandler(io.Discard, nil))
 		provider := authpkg.NewOAuthProvider(configDir, disc)
@@ -52,17 +45,9 @@ var (
 // server-side rejection (HTTP 401 or business code such as
 // TOKEN_VERIFIED_FAILED) on what locally appeared to be a still-valid token.
 //
-// Steps:
-//  1. MarkAccessTokenStale rewrites ExpiresAt to a past instant so
-//     OAuthProvider.GetAccessToken's fast-path will miss.
-//  2. NewOAuthProvider + GetAccessToken triggers lockedRefresh, which uses the
-//     existing dual-layer lock (process + file) to serialize concurrent
-//     refresh attempts across goroutines and processes.
-//  3. ResetRuntimeTokenCache clears the per-process sync.Once cache so the
-//     next resolveAuthToken call re-reads from disk.
-//
-// Existing OAuthProvider.GetAccessToken behaviour is unchanged; this helper
-// is the only entry point that orchestrates "force refresh" semantics.
+// It snapshots token+generation, then delegates to the same dual-locked CAS
+// refresh used by the runner. A concurrent rotation is reused rather than
+// overwritten, and ResetRuntimeTokenCache publishes the committed snapshot.
 func ForceRefreshAccessToken(ctx context.Context, configDir string) (string, error) {
 	if strings.TrimSpace(configDir) == "" {
 		return "", fmt.Errorf("config directory is empty")

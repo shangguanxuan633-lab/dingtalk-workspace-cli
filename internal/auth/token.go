@@ -67,6 +67,8 @@ var (
 	tokenUpsertProfile          = upsertProfileFromTokenWithCurrentLocked
 	tokenRemoveProfile          = removeProfileLocked
 	tokenSyncLegacyMirror       = syncLegacyTokenMirrorLocked
+	tokenSyncSelectedMirror     = syncSelectedLegacyTokenMirrorLocked
+	tokenBumpMarkerGeneration   = bumpTokenMarkerGeneration
 	tokenSyncOrganizationMirror = syncOrganizationTokenMirrorForProfile
 	tokenLoadProfiles           = LoadProfiles
 	tokenSaveProfiles           = SaveProfiles
@@ -254,6 +256,24 @@ func writeTokenMarkerGeneration(configDir string, manual bool, generation uint64
 	return writeTokenMarker(configDir, manual, generation)
 }
 
+// bumpTokenMarkerGeneration publishes a metadata-only credential change
+// (for example current-profile selection) without rewriting token blobs. The
+// optional floor keeps the publication generation ahead of the selected
+// credential even when migrating an old/missing marker.
+func bumpTokenMarkerGeneration(configDir string, manual bool, floor uint64) error {
+	generation, _, err := ReadTokenMarkerGeneration(configDir)
+	if err != nil {
+		return err
+	}
+	if floor > generation {
+		generation = floor
+	}
+	if generation == ^uint64(0) {
+		return fmt.Errorf("token generation overflow")
+	}
+	return writeTokenMarkerGeneration(configDir, manual, generation+1)
+}
+
 func manualTokenMarkerActive(configDir string) (bool, error) {
 	data, err := tokenReadFile(filepath.Join(configDir, tokenJSONFile))
 	if err != nil {
@@ -273,8 +293,14 @@ func manualTokenMarkerActive(configDir string) (bool, error) {
 
 // DeleteTokenMarker removes the token.json marker file.
 func DeleteTokenMarker(configDir string) error {
-	if err := tokenRemove(filepath.Join(configDir, tokenJSONFile)); err != nil && !os.IsNotExist(err) {
+	if err := tokenRemove(filepath.Join(configDir, tokenJSONFile)); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
+	}
+	if err := tokenSyncDirectory(configDir); err != nil {
+		return fmt.Errorf("sync token marker deletion: %w", err)
 	}
 	return nil
 }
@@ -283,8 +309,9 @@ func DeleteTokenMarker(configDir string) error {
 // registered, it delegates entirely to the hook; otherwise it falls back
 // to the default keychain-based storage.
 func SaveTokenData(configDir string, data *TokenData) error {
+	profile := RuntimeProfile()
 	return withProfilesLock(configDir, func() error {
-		return saveTokenDataLocked(configDir, data)
+		return saveTokenDataLockedForProfile(configDir, profile, data)
 	})
 }
 
@@ -294,12 +321,21 @@ func SaveTokenData(configDir string, data *TokenData) error {
 // migration in LoadTokenDataForProfile) must use this instead of SaveTokenData
 // to avoid deadlocking on the non-reentrant lock.
 func saveTokenDataLocked(configDir string, data *TokenData) (retErr error) {
+	return saveTokenDataLockedForProfile(configDir, RuntimeProfile(), data)
+}
+
+// saveTokenDataLockedForProfile is the selector-pinned transaction used by
+// long-running token providers. The selector must be captured before the
+// operation starts; consulting RuntimeProfile midway through a refresh can
+// write profile A's rotated credential into profile B's selected state.
+func saveTokenDataLockedForProfile(configDir, runtimeProfile string, data *TokenData) (retErr error) {
 	if data == nil {
 		return fmt.Errorf("token data is nil")
 	}
 	original := data
 	working := *data
 	data = &working
+	data.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	if err := assignNextTokenGeneration(configDir, data); err != nil {
 		return fmt.Errorf("prepare token generation: %w", err)
 	}
@@ -324,7 +360,7 @@ func saveTokenDataLocked(configDir string, data *TokenData) (retErr error) {
 		if err := ensureProfilesWritable(cfg); err != nil {
 			return err
 		}
-		runtimeSelector := strings.TrimSpace(RuntimeProfile())
+		runtimeSelector := strings.TrimSpace(runtimeProfile)
 		makeCurrent := runtimeSelector == ""
 		exactSelector := profileSelector(corpID, userID)
 		mirrorOrg := makeCurrent ||
@@ -456,6 +492,20 @@ func saveTokenViaHookTransaction(h *edition.Hooks, configDir string, data *Token
 		}
 	}
 	if err := saveTokenViaHook(h, configDir, data); err != nil {
+		var rollbackErr error
+		if previousExists {
+			if restoreErr := h.SaveToken(configDir, previous); restoreErr != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore hook token: %w", restoreErr))
+			}
+		} else if restoreErr := h.DeleteToken(configDir); restoreErr != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove partially-written hook token: %w", restoreErr))
+		}
+		if restoreErr := restoreTokenMarker(configDir, markerSnapshot); restoreErr != nil {
+			rollbackErr = errors.Join(rollbackErr, restoreErr)
+		}
+		if rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("rollback failed hook token save: %w", rollbackErr))
+		}
 		return err
 	}
 	if err := tokenWriteMarkerGeneration(configDir, false, data.Generation); err == nil {
@@ -603,7 +653,7 @@ func loadTokenDataForProfileLocked(configDir, profile string) (*TokenData, error
 	}
 	// One-time legacy secure-store -> keychain migration. This read path may run
 	// while the refresh lock is already held, so use the lock-free saver.
-	if err := saveTokenDataLocked(configDir, data); err == nil {
+	if err := saveTokenDataLockedForProfile(configDir, profile, data); err == nil {
 		_ = tokenDeleteSecure(configDir)
 	}
 	return data, nil
@@ -677,6 +727,18 @@ func deleteTokenViaHookTransaction(h *edition.Hooks, configDir string) error {
 		return fmt.Errorf("snapshot hook token for deletion: %w", loadErr)
 	}
 	if err := h.DeleteToken(configDir); err != nil {
+		var rollbackErr error
+		if previousExists {
+			if restoreErr := h.SaveToken(configDir, previous); restoreErr != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore hook token: %w", restoreErr))
+			}
+		}
+		if restoreErr := restoreTokenMarker(configDir, markerSnapshot); restoreErr != nil {
+			rollbackErr = errors.Join(rollbackErr, restoreErr)
+		}
+		if rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("rollback failed hook token deletion: %w", rollbackErr))
+		}
 		return err
 	}
 	if err := tokenDeleteMarker(configDir); err == nil {
@@ -797,9 +859,11 @@ func deleteTokenDataForProfileLocked(configDir, profile string) error {
 			markerSnapshot.exists &&
 			markerSnapshot.manual
 		if !preserveManualDefault {
-			if err := tokenSyncLegacyMirror(configDir); err != nil {
+			if err := tokenSyncSelectedMirror(configDir); err != nil {
 				return rollback(err)
 			}
+		} else if err := tokenBumpMarkerGeneration(configDir, true, markerSnapshot.generation); err != nil {
+			return rollback(err)
 		}
 		for _, snapshot := range identitySnapshots {
 			if err := tokenDeleteKeychainIdentity(snapshot.profile.CorpID, snapshot.profile.UserID); err != nil {

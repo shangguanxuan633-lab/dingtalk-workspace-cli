@@ -42,7 +42,7 @@ var (
 	profilesLoad              = LoadProfiles
 	profilesSave              = SaveProfiles
 	profilesEnsureMigration   = ensureProfilesMigrationLocked
-	profilesSyncLegacyMirror  = syncLegacyTokenMirrorLocked
+	profilesSyncLegacyMirror  = syncSelectedLegacyTokenMirrorLocked
 	profilesTokenExists       = TokenDataExistsKeychain
 	profilesLoadLegacy        = LoadTokenDataKeychain
 	profilesSaveCorp          = SaveTokenDataKeychainForCorpID
@@ -54,6 +54,8 @@ var (
 	profilesSaveLegacy        = SaveTokenDataKeychain
 	profilesWriteMarker       = WriteTokenMarker
 	profilesWriteManualMarker = WriteManualTokenMarker
+	profilesWriteMarkerGen    = writeTokenMarkerGeneration
+	profilesBumpMarker        = bumpTokenMarkerGeneration
 	profilesDeleteLegacy      = DeleteTokenDataKeychain
 	profilesDeleteMarker      = DeleteTokenMarker
 )
@@ -917,11 +919,11 @@ func rollbackProfileSelection(
 			rollbackErr = errors.Join(rollbackErr, err)
 		}
 	case mirrors.marker.manual:
-		if err := profilesWriteManualMarker(configDir); err != nil {
+		if err := profilesWriteMarkerGen(configDir, true, mirrors.marker.generation); err != nil {
 			rollbackErr = errors.Join(rollbackErr, err)
 		}
 	default:
-		if err := profilesWriteMarker(configDir); err != nil {
+		if err := profilesWriteMarkerGen(configDir, false, mirrors.marker.generation); err != nil {
 			rollbackErr = errors.Join(rollbackErr, err)
 		}
 	}
@@ -934,11 +936,23 @@ func rollbackProfileSelection(
 // SyncLegacyTokenMirror mirrors the current profile token into legacy auth-token.
 func SyncLegacyTokenMirror(configDir string) error {
 	return withProfilesLock(configDir, func() error {
-		return syncLegacyTokenMirrorLocked(configDir)
+		return syncSelectedLegacyTokenMirrorLocked(configDir)
 	})
 }
 
 func syncLegacyTokenMirrorLocked(configDir string) error {
+	return syncLegacyTokenMirrorWithPublisher(configDir, func(_ *TokenData) error {
+		return profilesWriteMarker(configDir)
+	})
+}
+
+func syncSelectedLegacyTokenMirrorLocked(configDir string) error {
+	return syncLegacyTokenMirrorWithPublisher(configDir, func(data *TokenData) error {
+		return profilesBumpMarker(configDir, false, data.Generation)
+	})
+}
+
+func syncLegacyTokenMirrorWithPublisher(configDir string, publish func(*TokenData) error) error {
 	cfg, err := profilesLoad(configDir)
 	if err != nil {
 		return err
@@ -964,7 +978,7 @@ func syncLegacyTokenMirrorLocked(configDir string) error {
 			if err := profilesSaveLegacy(data); err != nil {
 				return err
 			}
-			return profilesWriteMarker(configDir)
+			return publish(data)
 		}
 	}
 	// No current profile (or its token is confirmed absent): clear the mirror.

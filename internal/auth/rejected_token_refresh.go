@@ -42,7 +42,7 @@ func (p *OAuthProvider) ForceRefreshRejectedToken(ctx context.Context, rejectedA
 	}
 	defer lock.Release()
 
-	data, err := loadTokenDataUnderHeldLock(p.configDir, RuntimeProfile())
+	data, err := loadTokenDataUnderHeldLock(p.configDir, p.runtimeProfile())
 	if err != nil {
 		return "", fmt.Errorf("reload rejected token: %w", err)
 	}
@@ -71,6 +71,13 @@ func (p *OAuthProvider) ForceRefreshRejectedToken(ctx context.Context, rejectedA
 // DeleteTokenDataIfAccessTokenMatches removes only an explicitly terminal
 // credential, and only if token+optional generation still match under lock.
 func DeleteTokenDataIfAccessTokenMatches(ctx context.Context, configDir, expectedAccessToken string, generation ...uint64) (bool, error) {
+	return DeleteTokenDataIfAccessTokenMatchesForProfile(ctx, configDir, RuntimeProfile(), expectedAccessToken, generation...)
+}
+
+// DeleteTokenDataIfAccessTokenMatchesForProfile is the profile-pinned form of
+// DeleteTokenDataIfAccessTokenMatches. It keeps the CAS read and deletion bound
+// to the same selector even if RuntimeProfile changes concurrently.
+func DeleteTokenDataIfAccessTokenMatchesForProfile(ctx context.Context, configDir, profile, expectedAccessToken string, generation ...uint64) (bool, error) {
 	if strings.TrimSpace(configDir) == "" {
 		return false, fmt.Errorf("config directory is empty")
 	}
@@ -78,7 +85,7 @@ func DeleteTokenDataIfAccessTokenMatches(ctx context.Context, configDir, expecte
 	if expectedAccessToken == "" {
 		return false, fmt.Errorf("expected access token is empty")
 	}
-	profile := strings.TrimSpace(RuntimeProfile())
+	profile = strings.TrimSpace(profile)
 	lock, err := oauthAcquireLock(ctx, configDir)
 	if err != nil {
 		return false, fmt.Errorf("acquiring dual lock: %w", err)

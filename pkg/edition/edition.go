@@ -112,6 +112,10 @@ type Hooks struct {
 	SaveToken   func(configDir string, data []byte) error // persist token blob
 	LoadToken   func(configDir string) ([]byte, error)    // retrieve token blob
 	DeleteToken func(configDir string) error              // remove persisted token
+	// PreflightTokenStore performs a non-destructive host-key/directory
+	// availability check before an OAuth exchange can rotate one-time refresh
+	// credentials. nil keeps the complete Save/Load/Delete hook compatible.
+	PreflightTokenStore func(configDir string) error
 
 	// --- MCP result classification ---
 	// ClassifyToolResult inspects raw MCP tool-call content and returns a typed

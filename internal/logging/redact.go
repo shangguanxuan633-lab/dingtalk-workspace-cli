@@ -43,6 +43,32 @@ var sensitiveSubstrings = []string{
 	"password", "secret", "token", "credential",
 }
 
+// identityKeys are identifiers that must not be copied verbatim into local
+// diagnostic logs.  They are intentionally kept separate from credentials:
+// callers may still log that a field was present, but never its value.
+// compactLogKey makes this list cover snake_case, kebab-case, and camelCase.
+var identityKeys = map[string]bool{
+	"uid":                true,
+	"userid":             true,
+	"username":           true,
+	"staffid":            true,
+	"employeeid":         true,
+	"unionid":            true,
+	"openid":             true,
+	"opendingtalkid":     true,
+	"corpid":             true,
+	"corpname":           true,
+	"tenantid":           true,
+	"profile":            true,
+	"profilename":        true,
+	"profileselector":    true,
+	"runtimeprofile":     true,
+	"identityselector":   true,
+	"groupid":            true,
+	"conversationid":     true,
+	"openconversationid": true,
+}
+
 // IsSensitiveKey returns true if the key (case-insensitive) refers to a
 // credential or secret that must not appear in log files.
 func IsSensitiveKey(key string) bool {
@@ -58,14 +84,17 @@ func IsSensitiveKey(key string) bool {
 	return false
 }
 
-// RedactValue replaces a sensitive value with a safe placeholder.
-// It preserves the first 4 characters for identification if the value is
-// long enough, otherwise fully redacts.
+// IsIdentityKey reports whether a structured field carries a user,
+// organization, profile, or conversation identifier that must be redacted in
+// diagnostic output.
+func IsIdentityKey(key string) bool {
+	return identityKeys[compactLogKey(key)]
+}
+
+// RedactValue replaces a sensitive value with a safe placeholder. No prefix is
+// retained: even a partial access/refresh token is credential material.
 func RedactValue(value string) string {
-	if len(value) <= 8 {
-		return "***"
-	}
-	return value[:4] + "***"
+	return "***"
 }
 
 // TruncateBody returns the body truncated to maxBytes with a UTF-8 safe
@@ -103,14 +132,34 @@ func SanitizeArguments(args map[string]any, maxBytes int) string {
 // redactMapValues replaces values of sensitive keys with "***" in-place.
 func redactMapValues(m map[string]any) {
 	for k, v := range m {
-		if IsSensitiveKey(k) {
+		if IsSensitiveKey(k) || IsIdentityKey(k) {
 			m[k] = "***"
 			continue
 		}
-		if nested, ok := v.(map[string]any); ok {
+		switch nested := v.(type) {
+		case map[string]any:
 			redactMapValues(nested)
+		case []any:
+			redactSliceValues(nested)
 		}
 	}
+}
+
+func redactSliceValues(values []any) {
+	for _, value := range values {
+		switch nested := value.(type) {
+		case map[string]any:
+			redactMapValues(nested)
+		case []any:
+			redactSliceValues(nested)
+		}
+	}
+}
+
+func compactLogKey(key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	replacer := strings.NewReplacer("_", "", "-", "", ".", "", " ", "")
+	return replacer.Replace(key)
 }
 
 // RedactHeaders returns slog attributes for HTTP headers with sensitive
@@ -122,7 +171,7 @@ func RedactHeaders(headers http.Header) []slog.Attr {
 	attrs := make([]slog.Attr, 0, len(headers))
 	for key := range headers {
 		value := headers.Get(key)
-		if IsSensitiveKey(key) {
+		if IsSensitiveKey(key) || IsIdentityKey(key) {
 			value = RedactValue(value)
 		}
 		attrs = append(attrs, slog.String("header."+strings.ToLower(key), value))

@@ -148,6 +148,11 @@ func preflightTokenPersistence(configDir string) error {
 		if err := validateEditionTokenStore(h); err != nil {
 			return fmt.Errorf("unsafe edition token store: %w", err)
 		}
+		if h.PreflightTokenStore != nil {
+			if err := h.PreflightTokenStore(configDir); err != nil {
+				return fmt.Errorf("edition token store preflight: %w", err)
+			}
+		}
 		return nil
 	}
 
@@ -201,6 +206,11 @@ func preflightTokenRefreshPersistence(configDir string, data *TokenData) error {
 	if h := edition.Get(); editionTokenStoreConfigured(h) {
 		if err := validateEditionTokenStore(h); err != nil {
 			return fmt.Errorf("unsafe edition token store: %w", err)
+		}
+		if h.PreflightTokenStore != nil {
+			if err := h.PreflightTokenStore(configDir); err != nil {
+				return fmt.Errorf("edition token store preflight: %w", err)
+			}
 		}
 		return nil
 	}

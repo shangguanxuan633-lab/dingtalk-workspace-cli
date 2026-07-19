@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -33,7 +32,6 @@ import (
 
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cli"
-	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 	dwsevent "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/bus"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/busctl"
@@ -363,64 +361,9 @@ func runPersonalEventConsume(c *cobra.Command, opts personalConsumeOptions) erro
 }
 
 func logPersonalEventCleanupError(operation string, err error) {
-	attrs := []any{
-		"stage", "event_cleanup",
-		"operation", operation,
-		"error_type", classifyPersonalEventCleanupError(err),
-		"error_go_type", fmt.Sprintf("%T", err),
-	}
-	var structured *apperrors.Error
-	if errors.As(err, &structured) {
-		attrs = append(attrs,
-			"category", string(structured.Category),
-			"reason", structured.Reason,
-			"retryable", structured.Retryable,
-		)
-	}
-	var endpointErr *authpkg.OAuthEndpointError
-	if errors.As(err, &endpointErr) {
-		attrs = append(attrs,
-			"http_status", endpointErr.StatusCode,
-			"oauth_code", endpointErr.Code,
-		)
-	}
+	attrs := auxiliaryAuthDiagnosticAttrs("event_cleanup", err)
+	attrs = append(attrs, "operation", operation)
 	slog.Error("personal event cleanup failed", attrs...)
-}
-
-func classifyPersonalEventCleanupError(err error) string {
-	if err == nil {
-		return "none"
-	}
-	if errors.Is(err, authpkg.ErrTokenDataNotFound) || errors.Is(err, os.ErrNotExist) {
-		return "no_credentials"
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return "timeout"
-	}
-	if errors.Is(err, context.Canceled) {
-		return "canceled"
-	}
-	if errors.Is(err, os.ErrPermission) {
-		return "permission_denied"
-	}
-	var endpointErr *authpkg.OAuthEndpointError
-	if errors.As(err, &endpointErr) {
-		return "oauth_endpoint"
-	}
-	var structured *apperrors.Error
-	if errors.As(err, &structured) {
-		if reason := strings.TrimSpace(structured.Reason); reason != "" {
-			return reason
-		}
-		if structured.Category != "" {
-			return string(structured.Category)
-		}
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return "network"
-	}
-	return "unknown"
 }
 
 func personalEventProjector(debugRawEvents bool) consume.Projector {

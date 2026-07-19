@@ -1,8 +1,12 @@
 package app
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +14,7 @@ import (
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/audit"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/logging"
 )
 
 // TestAuditIdentityReresolvesOnProfileSwitch guards the reviewer's finding that a
@@ -73,6 +78,75 @@ func resetAuditIdentityCache() {
 	cachedAgentID = ""
 	cachedProfile = ""
 	identityLoaded = false
+}
+
+func TestAuditIdentityTransientLoadFailureIsSafeAndNotCached(t *testing.T) {
+	prevLoader := loadTokenForProfile
+	prevProfile := auth.RuntimeProfile()
+	configDir := t.TempDir()
+	t.Setenv("DWS_CONFIG_DIR", configDir)
+	logger := logging.Setup(configDir)
+
+	fileLoggerMu.Lock()
+	prevFileLogger := fileLogger
+	fileLogger = logger
+	fileLoggerMu.Unlock()
+	t.Cleanup(func() {
+		loadTokenForProfile = prevLoader
+		auth.SetRuntimeProfile(prevProfile)
+		resetAuditIdentityCache()
+		fileLoggerMu.Lock()
+		fileLogger = prevFileLogger
+		fileLoggerMu.Unlock()
+		_ = logger.Close()
+	})
+
+	rawProfile := "raw-profile-secret"
+	rawCause := "raw-access-token raw-uid raw-corp"
+	auth.SetRuntimeProfile(rawProfile)
+	resetAuditIdentityCache()
+	calls := 0
+	loadTokenForProfile = func(string, string) (*auth.TokenData, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New(rawCause)
+		}
+		return &auth.TokenData{UserID: "user-after-retry", CorpID: "corp-after-retry"}, nil
+	}
+
+	if actor, _ := auditIdentity(); actor.UserID != "" || actor.CorpID != "" {
+		t.Fatalf("failed load actor = %#v, want empty", actor)
+	}
+	if actor, _ := auditIdentity(); actor.UserID != "user-after-retry" || actor.CorpID != "corp-after-retry" {
+		t.Fatalf("retried actor = %#v", actor)
+	}
+	if calls != 2 {
+		t.Fatalf("credential metadata loads = %d, want 2", calls)
+	}
+
+	logBytes, err := os.ReadFile(filepath.Join(configDir, "logs", "dws.log"))
+	if err != nil {
+		t.Fatalf("read audit diagnostics: %v", err)
+	}
+	logText := string(logBytes)
+	for _, want := range []string{"audit_actor_load", "error_type", "cause_type", "profile_selected"} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("audit diagnostics missing %q: %s", want, logText)
+		}
+	}
+	for _, secret := range []string{rawProfile, rawCause, "raw-access-token", "raw-uid", "raw-corp"} {
+		if strings.Contains(logText, secret) {
+			t.Fatalf("audit diagnostics leaked %q: %s", secret, logText)
+		}
+	}
+}
+
+func TestClassifyAuditErrorDoesNotPersistRawUnknownCause(t *testing.T) {
+	raw := errors.New("raw-profile raw-uid raw-corp raw-access-token")
+	category, reason := classifyAuditError(raw)
+	if category != "unknown" || reason != "unknown" {
+		t.Fatalf("classifyAuditError() = %q, %q", category, reason)
+	}
 }
 
 // TestCloseAuditSinkDrainsOnErrorPath guards the reviewer's V5 finding: when a

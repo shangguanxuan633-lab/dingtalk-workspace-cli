@@ -519,7 +519,7 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 					errReason = typed.Reason
 				} else {
 					errCat = "unknown"
-					errReason = retErr.Error()
+					errReason = "unclassified_error"
 				}
 			}
 			logging.LogCommandEnd(fl, execID,
@@ -527,6 +527,49 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 				retErr == nil, time.Since(invokeStart), errCat, errReason)
 			emitAudit(auditSink, execID, invokeStart, invocation, endpoint, retErr, version)
 		}()
+	}
+
+	var timeoutSec int
+	if r.globalFlags != nil {
+		timeoutSec = r.globalFlags.Timeout
+	}
+	dryRun := invocation.DryRun || (r.globalFlags != nil && r.globalFlags.DryRun)
+	if dryRun {
+		if logicalAttempt {
+			logging.LogCommandStart(fl, execID,
+				invocation.CanonicalProduct, invocation.Tool, endpoint, version, false, timeoutSec)
+		}
+		if argsJSON, err := json.Marshal(invocation.Params); err == nil {
+			fmt.Fprintf(os.Stderr, "DRY-RUN Arguments: %s\n", argsJSON)
+		}
+		return executor.Result{
+			Invocation: invocation,
+			Response: map[string]any{
+				"dry_run":  true,
+				"endpoint": transport.RedactURL(endpoint),
+				"request":  executor.ToolCallRequest(invocation.Tool, invocation.Params),
+				"note":     "execution skipped by --dry-run",
+			},
+		}, nil
+	}
+	if r.globalFlags != nil && r.globalFlags.Mock {
+		if logicalAttempt {
+			logging.LogCommandStart(fl, execID,
+				invocation.CanonicalProduct, invocation.Tool, endpoint, version, false, timeoutSec)
+		}
+		invocation.Implemented = true
+		return executor.Result{
+			Invocation: invocation,
+			Response: map[string]any{
+				"endpoint": transport.RedactURL(endpoint),
+				"content": map[string]any{
+					"success": true,
+					"result":  []any{},
+					"_mock":   true,
+					"_tool":   invocation.Tool,
+				},
+			},
+		}, nil
 	}
 
 	// Check if this product has plugin-level auth credentials registered.
@@ -547,50 +590,9 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 		authToken = snapshot.AccessToken
 	}
 
-	var timeoutSec int
-	if r.globalFlags != nil {
-		timeoutSec = r.globalFlags.Timeout
-	}
 	if logicalAttempt {
 		logging.LogCommandStart(fl, execID,
 			invocation.CanonicalProduct, invocation.Tool, endpoint, version, authToken != "", timeoutSec)
-	}
-
-	if invocation.DryRun {
-		// Emit a wukong-aligned human-readable preview on stderr so the dry-run
-		// surface advertises the resolved MCP arguments without polluting the
-		// stdout payload (which stays valid JSON in --format json mode). Mirrors
-		// wukong's "Arguments: {...}" dry-run line; stderr keeps it out of the
-		// machine-readable channel.
-		if argsJSON, err := json.Marshal(invocation.Params); err == nil {
-			fmt.Fprintf(os.Stderr, "DRY-RUN Arguments: %s\n", argsJSON)
-		}
-		return executor.Result{
-			Invocation: invocation,
-			Response: map[string]any{
-				"dry_run":  true,
-				"endpoint": transport.RedactURL(endpoint),
-				"request":  executor.ToolCallRequest(invocation.Tool, invocation.Params),
-				"note":     "execution skipped by --dry-run",
-			},
-		}, nil
-	}
-
-	// Mock mode: return predefined mock response without network call.
-	if r.globalFlags != nil && r.globalFlags.Mock {
-		invocation.Implemented = true
-		return executor.Result{
-			Invocation: invocation,
-			Response: map[string]any{
-				"endpoint": transport.RedactURL(endpoint),
-				"content": map[string]any{
-					"success": true,
-					"result":  []any{},
-					"_mock":   true,
-					"_tool":   invocation.Tool,
-				},
-			},
-		}, nil
 	}
 
 	// Fail-fast: reject unauthenticated requests before making network calls.
@@ -611,7 +613,15 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 		tc.TrustedDomains = pluginAuth.TrustedDomains
 	} else {
 		// Default path: use DingTalk OAuth token with identity headers.
-		tc = r.transport.WithAuth(authToken, resolveIdentityHeaders())
+		headers := resolveIdentityHeaders()
+		// Every logical invocation gets a stable idempotency identifier even
+		// when the caller did not supply one. executeInvocation carries execID in
+		// the context, so transport retries and the one auth-refresh retry reuse
+		// the exact same value rather than duplicating a write/owner-ack.
+		if strings.TrimSpace(headers["x-dingtalk-message-id"]) == "" {
+			headers["x-dingtalk-message-id"] = execID
+		}
+		tc = r.transport.WithAuth(authToken, headers)
 	}
 
 	callCtx := ctx
@@ -1133,17 +1143,9 @@ func logBusinessError(logger *slog.Logger, reason string, inv executor.Invocatio
 	if diag.ServerErrorCode != "" {
 		attrs = append(attrs, "server_error_code", diag.ServerErrorCode)
 	}
-	if diag.TechnicalDetail != "" {
-		attrs = append(attrs, "technical_detail", diag.TechnicalDetail)
-	}
-	if msg, ok := content["error"].(string); ok {
-		attrs = append(attrs, "error", msg)
-	}
-	if msg, ok := content["errorMsg"].(string); ok {
-		attrs = append(attrs, "errorMsg", msg)
-	}
-	if msg, ok := content["message"].(string); ok {
-		attrs = append(attrs, "message", msg)
-	}
+	// Never log free-form upstream detail or the response envelope. Error
+	// messages frequently echo request arguments, identities, and credentials.
+	// Structured category/reason/code/trace are sufficient for correlation.
+	attrs = append(attrs, "response_fields", len(content))
 	logger.Warn("business_error", attrs...)
 }

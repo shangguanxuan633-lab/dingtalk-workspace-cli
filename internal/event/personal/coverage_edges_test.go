@@ -198,8 +198,14 @@ func TestCrossPlatformCoveragePersonalClientHelpersAndOperations(t *testing.T) {
 	if detailed.Details["http_status"] != 400 {
 		t.Fatalf("details = %#v", detailed.Details)
 	}
-	if sanitizeLogPayload(nil) != "" || sanitizeLogPayload([]byte(`not-json`)) != "not-json" {
+	if sanitizeLogPayload(nil) != "" || sanitizeLogPayload([]byte(`not-json`)) != "<non-json payload redacted; bytes=8>" {
 		t.Fatal("payload sanitization failed")
+	}
+	redactedIdentity := sanitizeLogPayload([]byte(`{"userId":"user-secret","corp_id":"corp-secret","message":"token-secret","ok":true}`))
+	for _, forbidden := range []string{"user-secret", "corp-secret", "token-secret"} {
+		if strings.Contains(redactedIdentity, forbidden) {
+			t.Fatalf("payload sanitization leaked %q: %s", forbidden, redactedIdentity)
+		}
 	}
 	if _, err := marshalLogJSON(make(chan int)); err == nil {
 		t.Fatal("marshalLogJSON accepted channel")

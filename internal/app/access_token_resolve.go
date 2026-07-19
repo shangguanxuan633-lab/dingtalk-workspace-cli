@@ -50,6 +50,11 @@ type AccessTokenSnapshot struct {
 	ObservedGeneration uint64
 	ProfileFingerprint string
 	UpdatedAt          string
+	// profile is the exact selector captured when this snapshot's cache key was
+	// chosen. It is intentionally unexported: callers receive only the
+	// non-reversible ProfileFingerprint, while auth recovery can keep its CAS
+	// refresh bound to the original request profile.
+	profile string
 }
 
 const accessTokenRefreshWindow = 5 * time.Minute
@@ -80,9 +85,9 @@ func NewTokenManager() *TokenManager {
 var runtimeTokenManager = NewTokenManager()
 
 var (
-	newAccessTokenProvider = func(configDir string) accessTokenGetter {
+	newAccessTokenProvider = func(configDir, profile string) accessTokenGetter {
 		disc := slog.New(slog.NewTextHandler(io.Discard, nil))
-		provider := authpkg.NewOAuthProvider(configDir, disc)
+		provider := authpkg.NewOAuthProviderForProfile(configDir, disc, profile)
 		configureOAuthProviderCompatibility(provider, configDir)
 		return provider
 	}
@@ -96,8 +101,9 @@ var (
 // resolveAccessTokenFromDir loads OAuth then legacy token from configDir, applying
 // the same host compatibility hooks as MCP. It mirrors the former body of
 // getCachedRuntimeToken (excluding process-level cache and timing).
-func resolveAccessTokenSnapshotFromDir(ctx context.Context, configDir string) (AccessTokenSnapshot, error) {
-	provider := newAccessTokenProvider(configDir)
+func resolveAccessTokenSnapshotFromDir(ctx context.Context, configDir, profile string) (AccessTokenSnapshot, error) {
+	profile = strings.TrimSpace(profile)
+	provider := newAccessTokenProvider(configDir, profile)
 	if snapshotProvider, ok := provider.(accessTokenSnapshotGetter); ok {
 		data, tokenErr := snapshotProvider.GetTokenSnapshot(ctx)
 		if tokenErr == nil && data != nil && strings.TrimSpace(data.AccessToken) != "" {
@@ -112,7 +118,7 @@ func resolveAccessTokenSnapshotFromDir(ctx context.Context, configDir string) (A
 		if tokenErr != nil && !errors.Is(tokenErr, authpkg.ErrTokenDataNotFound) {
 			return AccessTokenSnapshot{}, tokenErr
 		}
-		if strings.TrimSpace(authpkg.RuntimeProfile()) != "" {
+		if profile != "" {
 			if tokenErr != nil {
 				return AccessTokenSnapshot{}, tokenErr
 			}
@@ -128,7 +134,7 @@ func resolveAccessTokenSnapshotFromDir(ctx context.Context, configDir string) (A
 	if tokenErr != nil && !errors.Is(tokenErr, authpkg.ErrTokenDataNotFound) {
 		return AccessTokenSnapshot{}, tokenErr
 	}
-	if strings.TrimSpace(authpkg.RuntimeProfile()) != "" {
+	if profile != "" {
 		if tokenErr != nil {
 			return AccessTokenSnapshot{}, tokenErr
 		}
@@ -153,7 +159,7 @@ func resolveLegacyToken(configDir string, oauthErr error) (AccessTokenSnapshot, 
 }
 
 func resolveAccessTokenFromDir(ctx context.Context, configDir string) (string, error) {
-	snapshot, err := resolveAccessTokenSnapshotFromDir(ctx, configDir)
+	snapshot, err := resolveAccessTokenSnapshotFromDir(ctx, configDir, strings.TrimSpace(authpkg.RuntimeProfile()))
 	if err != nil {
 		return "", err
 	}
@@ -205,34 +211,53 @@ func (m *TokenManager) Get(ctx context.Context, configDir, explicitToken string)
 		}
 	}
 
-	snapshot, err := resolveTokenSnapshotWithEdition(ctx, configDir)
-	if err != nil {
-		slog.Warn("auth.token.resolve", "outcome", "failed", "error_type", fmt.Sprintf("%T", err), "profile_selected", key.profile != "")
-		return AccessTokenSnapshot{}, err
-	}
-	if strings.TrimSpace(snapshot.AccessToken) == "" {
-		return AccessTokenSnapshot{}, noCredentialsError()
-	}
-	snapshot.ProfileFingerprint = tokenProfileFingerprint(key)
-	if tokenSnapshotUsable(snapshot, now) {
-		markerGeneration, markerPresent, markerErr := authpkg.ReadTokenMarkerGeneration(configDir)
+	// A credential read and its publication marker form one optimistic
+	// snapshot. Reading the marker both before and after resolution prevents a
+	// writer from advancing the marker between blob load and cache publication
+	// (which would otherwise cache old token A under generation B).
+	for attempt := 0; attempt < 4; attempt++ {
+		beforeGeneration, beforePresent, markerErr := authpkg.ReadTokenMarkerGeneration(configDir)
+		if markerErr != nil {
+			return AccessTokenSnapshot{}, fmt.Errorf("read token publication marker: %w", markerErr)
+		}
+		snapshot, err := resolveTokenSnapshotWithEdition(ctx, configDir, key.profile)
+		if err != nil {
+			attrs := auxiliaryAuthDiagnosticAttrs("token_resolve", err)
+			attrs = append(attrs, "outcome", "failed", "profile_selected", key.profile != "")
+			slog.Warn("auth.token.resolve", attrs...)
+			return AccessTokenSnapshot{}, err
+		}
+		if strings.TrimSpace(snapshot.AccessToken) == "" {
+			return AccessTokenSnapshot{}, noCredentialsError()
+		}
+		snapshot.ProfileFingerprint = tokenProfileFingerprint(key)
+		snapshot.profile = key.profile
+		if !tokenSnapshotUsable(snapshot, now) {
+			entry.snapshot = AccessTokenSnapshot{}
+			slog.Debug("auth.token.resolve", "outcome", "resolved", "source", snapshot.Source, "cacheable", false, "profile_selected", key.profile != "")
+			return snapshot, nil
+		}
+
+		afterGeneration, afterPresent, markerErr := authpkg.ReadTokenMarkerGeneration(configDir)
 		if markerErr != nil {
 			return AccessTokenSnapshot{}, fmt.Errorf("verify token publication marker: %w", markerErr)
 		}
-		if !markerPresent {
+		if !afterPresent {
 			return AccessTokenSnapshot{}, fmt.Errorf("token publication marker is missing")
+		}
+		if beforePresent != afterPresent || beforeGeneration != afterGeneration {
+			continue
 		}
 		// Marker generation is store-global; a different profile may have
 		// advanced it since this token's own generation was written. Publishing
 		// the observed marker generation avoids permanent cache misses while the
 		// next fast path still detects every subsequent store commit.
-		snapshot.ObservedGeneration = markerGeneration
+		snapshot.ObservedGeneration = afterGeneration
 		entry.snapshot = snapshot
-	} else {
-		entry.snapshot = AccessTokenSnapshot{}
+		slog.Debug("auth.token.resolve", "outcome", "resolved", "source", snapshot.Source, "cacheable", true, "profile_selected", key.profile != "")
+		return snapshot, nil
 	}
-	slog.Debug("auth.token.resolve", "outcome", "resolved", "source", snapshot.Source, "cacheable", !snapshot.ExpiresAt.IsZero(), "profile_selected", key.profile != "")
-	return snapshot, nil
+	return AccessTokenSnapshot{}, fmt.Errorf("token publication changed repeatedly while resolving credentials")
 }
 
 func (m *TokenManager) entry(key tokenManagerKey) *tokenManagerEntry {
@@ -258,17 +283,17 @@ func (m *TokenManager) Invalidate() {
 	m.mu.Unlock()
 }
 
-func resolveTokenSnapshotWithEdition(ctx context.Context, configDir string) (AccessTokenSnapshot, error) {
+func resolveTokenSnapshotWithEdition(ctx context.Context, configDir, profile string) (AccessTokenSnapshot, error) {
 	provider := edition.Get().TokenProvider
 	if provider == nil {
-		return resolveAccessTokenSnapshotFromDir(ctx, configDir)
+		return resolveAccessTokenSnapshotFromDir(ctx, configDir, profile)
 	}
 	var fallbackSnapshot AccessTokenSnapshot
 	var fallbackCalled bool
 	token, err := provider(ctx, func() (string, error) {
 		fallbackCalled = true
 		var fallbackErr error
-		fallbackSnapshot, fallbackErr = resolveAccessTokenSnapshotFromDir(ctx, configDir)
+		fallbackSnapshot, fallbackErr = resolveAccessTokenSnapshotFromDir(ctx, configDir, profile)
 		if fallbackErr != nil {
 			return "", fallbackErr
 		}

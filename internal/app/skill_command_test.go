@@ -27,6 +27,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
+	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 )
 
 func TestResolveSkillTargetPath(t *testing.T) {
@@ -397,7 +400,7 @@ func TestSkillInstallRequiresAuth(t *testing.T) {
 	t.Cleanup(CloseFileLogger)
 	originalResolveToken := skillResolveToken
 	skillResolveToken = func(context.Context, string) (AccessTokenSnapshot, error) {
-		return AccessTokenSnapshot{}, errors.New("missing")
+		return AccessTokenSnapshot{}, authpkg.ErrTokenDataNotFound
 	}
 	t.Cleanup(func() { skillResolveToken = originalResolveToken })
 
@@ -417,10 +420,9 @@ func TestSkillInstallRequiresAuth(t *testing.T) {
 	if err == nil {
 		t.Error("Execute() should have failed without auth")
 	}
-	// Check for authentication-related error (English or Chinese)
-	errStr := err.Error()
-	if !strings.Contains(errStr, "not logged in") && !strings.Contains(errStr, "token") && !strings.Contains(errStr, "未登录") && !strings.Contains(errStr, "auth") {
-		t.Errorf("error should mention authentication, got: %v", err)
+	var typed *apperrors.Error
+	if !errors.As(err, &typed) || typed.Reason != "login_required" {
+		t.Errorf("auth error = %#v, want stable reason login_required", err)
 	}
 }
 

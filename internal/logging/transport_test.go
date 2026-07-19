@@ -138,6 +138,9 @@ func TestLogResponseBody(t *testing.T) {
 	if !strings.Contains(out, "jsonrpc_response_body") {
 		t.Error("missing message")
 	}
+	if strings.Contains(out, "fail") || !strings.Contains(out, "body_size") {
+		t.Errorf("response body was logged or size missing: %s", out)
+	}
 	if !strings.Contains(out, "trace-abc") {
 		t.Error("missing trace_id")
 	}
@@ -157,8 +160,8 @@ func TestLogRetryAttempt(t *testing.T) {
 	if !strings.Contains(out, "jsonrpc_retry") {
 		t.Error("missing message")
 	}
-	if !strings.Contains(out, "rate limited") {
-		t.Error("missing error")
+	if strings.Contains(out, "rate limited") || !strings.Contains(out, "error_type") {
+		t.Errorf("raw retry error was logged or type missing: %s", out)
 	}
 }
 

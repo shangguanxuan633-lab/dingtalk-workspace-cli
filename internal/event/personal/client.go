@@ -577,9 +577,6 @@ func logControlRequest(message, method, path string, q url.Values, status int, r
 		if apiErr.Code != "" {
 			attrs = append(attrs, "error_code", apiErr.Code)
 		}
-		if apiErr.Message != "" {
-			attrs = append(attrs, "error_msg", apiErr.Message)
-		}
 	}
 	slog.Debug(message, attrs...)
 }
@@ -595,7 +592,9 @@ func sanitizeLogPayload(data []byte) string {
 		s, _ := marshalLogJSON(redacted) // JSON-decoded values are always encodable.
 		return truncateLogPayload(s)
 	}
-	return truncateLogPayload(string(data))
+	// An unstructured body cannot be safely inspected for bearer tokens or
+	// user/corp identity. Keep only its bounded size for diagnostics.
+	return fmt.Sprintf("<non-json payload redacted; bytes=%d>", len(data))
 }
 
 func marshalLogJSON(v any) (string, error) {
@@ -633,10 +632,24 @@ func redactJSONValue(v any) any {
 
 func sensitiveLogKey(key string) bool {
 	key = strings.ToLower(strings.TrimSpace(key))
-	return strings.Contains(key, "token") ||
+	compact := strings.NewReplacer("_", "", "-", "", ".", "").Replace(key)
+	if strings.Contains(compact, "token") ||
 		strings.Contains(key, "secret") ||
 		strings.Contains(key, "ticket") ||
-		strings.Contains(key, "authorization")
+		strings.Contains(key, "authorization") {
+		return true
+	}
+	// Identity and free-form message fields are not needed to diagnose the
+	// control request. Redacting them prevents UID/corp data (or a token echoed
+	// in a server message) from entering debug logs.
+	switch compact {
+	case "uid", "userid", "username", "staffid", "unionid", "openid",
+		"corpid", "corpname", "tenantid", "employeeid", "localsubject",
+		"filterrule", "message", "errormsg", "errormessage":
+		return true
+	default:
+		return false
+	}
 }
 
 func redactedQueryString(q url.Values) string {

@@ -54,9 +54,11 @@ const (
 var openBrowserFunc = tryOpenBrowser
 
 var (
-	patAuthorizationTimeout       = PatAuthRetryTimeout
-	patAuthorizationPollInterval  = PatAuthPollInterval
-	patLoadTokenData              = authpkg.LoadTokenData
+	patAuthorizationTimeout      = PatAuthRetryTimeout
+	patAuthorizationPollInterval = PatAuthPollInterval
+	patResolveAccessToken        = func(ctx context.Context, configDir string) (string, error) {
+		return ResolveAuxiliaryAccessToken(ctx, configDir, "")
+	}
 	patWaitForAuthorization       = WaitForPatAuthorization
 	patPollDeviceFlowWithInterval = pollPatDeviceFlowWithInterval
 	patSaveAppConfig              = authpkg.SaveAppConfig
@@ -271,8 +273,10 @@ func patAuthorizationURIFromData(data map[string]any) string {
 }
 
 // WaitForPatAuthorization polls until the user completes authorization or timeout.
-// It returns true if authorization was completed, false if timed out or cancelled.
-func WaitForPatAuthorization(ctx context.Context, configDir string, output io.Writer) bool {
+// A missing credential is the expected waiting state. Store, refresh, keychain,
+// and provider failures are returned with their original cause instead of being
+// misreported as an authorization timeout.
+func WaitForPatAuthorization(ctx context.Context, configDir string, output io.Writer) (bool, error) {
 	timeout := patAuthorizationTimeout
 	deadline := time.Now().Add(timeout)
 	pollTicker := time.NewTicker(patAuthorizationPollInterval)
@@ -290,27 +294,31 @@ func WaitForPatAuthorization(ctx context.Context, configDir string, output io.Wr
 		select {
 		case <-ctx.Done():
 			fmt.Fprintf(output, "%s 操作已取消\n", tui.StateMark("error"))
-			return false
+			return false, nil
 
 		case <-time.After(time.Until(deadline)):
 			fmt.Fprintf(output, "%s 等待授权超时 (%s)\n", tui.StateMark("error"), timeout)
 			fmt.Fprintf(output, "  %s 请重新执行命令\n", tui.Dim("ℹ"))
-			return false
+			return false, nil
 
 		case <-pollTicker.C:
 			pollCount++
 			elapsed := time.Since(start).Truncate(time.Second)
 			remaining := time.Until(deadline).Truncate(time.Second)
 
-			// Check if token is now valid
-			tokenData, err := patLoadTokenData(configDir)
-			if err == nil && tokenData != nil {
-				if tokenData.IsAccessTokenValid() || tokenData.IsRefreshTokenValid() {
-					fmt.Fprintf(output, "\r%s %s (%s 已用, %s 剩余)          \n",
-						tui.StateMark("ok"), tui.Bold("授权成功!"), elapsed, remaining)
-					fmt.Fprintln(output)
-					return true
-				}
+			// Resolve through the same TokenManager used by MCP calls. A true
+			// not-found means the user is still completing login; every other
+			// error is an auth subsystem failure and must be surfaced.
+			accessToken, err := patResolveAccessToken(ctx, configDir)
+			if err != nil && !isTrueMissingCredential(err) {
+				logPATAuthFailure(slog.LevelWarn, "pat authorization credential check failed", "pat_authorization_wait", err)
+				return false, fmt.Errorf("PAT authorization credential check: %w", err)
+			}
+			if strings.TrimSpace(accessToken) != "" {
+				fmt.Fprintf(output, "\r%s %s (%s 已用, %s 剩余)          \n",
+					tui.StateMark("ok"), tui.Bold("授权成功!"), elapsed, remaining)
+				fmt.Fprintln(output)
+				return true, nil
 			}
 
 			// Show polling status
@@ -340,7 +348,10 @@ func retryWithPatAuthRetry(ctx context.Context, runner executor.Runner, invocati
 	PrintPatAuthError(output, scopeErr)
 
 	// Wait for user to complete authorization
-	authorized := patWaitForAuthorization(ctx, configDir, output)
+	authorized, waitErr := patWaitForAuthorization(ctx, configDir, output)
+	if waitErr != nil {
+		return executor.Result{}, authResolutionError(waitErr)
+	}
 	if !authorized {
 		return executor.Result{}, apperrors.NewAuth(
 			"等待用户授权超时",
@@ -528,9 +539,10 @@ func handlePatAuthCheck(
 	}
 
 	slog.Debug("PAT auth check",
-		"clientId", patData.Data.ClientID,
-		"flowId", patData.Data.FlowID,
-		"hasSecret", patData.Data.ClientSecret != "",
+		"stage", "pat_auth_check",
+		"client_id_present", strings.TrimSpace(patData.Data.ClientID) != "",
+		"flow_id_present", strings.TrimSpace(patData.Data.FlowID) != "",
+		"client_secret_present", patData.Data.ClientSecret != "",
 	)
 	hostOwnedPAT := authpkg.HostOwnsPATFlow()
 	openBrowser := currentPATOpenBrowser(ctx, configDir)
@@ -578,7 +590,9 @@ func handlePatAuthCheck(
 
 	if wantsStructuredPATOutput(r) {
 		if openBrowser && patData.Data.URI != "" {
-			_ = openPATAuthorizationURI(patData.Data.URI)
+			if err := openPATAuthorizationURI(patData.Data.URI); err != nil {
+				logPATAuthFailure(slog.LevelWarn, "PAT authorization browser open failed", "pat_browser_open", err)
+			}
 		}
 		return executor.Result{}, &apperrors.PATError{RawJSON: enrichPATErrorWithOpenBrowser(patErr.RawJSON, openBrowser)}
 	}
@@ -593,7 +607,9 @@ func handlePatAuthCheck(
 		fmt.Fprintf(output, "  %s 授权链接: %s\n", tui.Dim("🔗"), authURL)
 		fmt.Fprintln(output)
 		if openBrowser {
-			_ = openPATAuthorizationURI(authURL)
+			if err := openPATAuthorizationURI(authURL); err != nil {
+				logPATAuthFailure(slog.LevelWarn, "PAT authorization browser open failed", "pat_browser_open", err)
+			}
 		}
 	}
 
@@ -610,8 +626,9 @@ func handlePatAuthCheck(
 		resolvePATPollInterval(patData.Data.PollIntervalSecs),
 	)
 	if err != nil {
-		fmt.Fprintf(output, "%s 轮询授权状态失败: %v\n", tui.StateMark("error"), err)
-		return executor.Result{}, patErr
+		logPATAuthFailure(slog.LevelWarn, "PAT authorization polling failed", "pat_device_poll", err)
+		fmt.Fprintf(output, "%s 轮询授权状态失败，请查看认证诊断日志\n", tui.StateMark("error"))
+		return executor.Result{}, authResolutionError(err)
 	}
 
 	switch status {
@@ -621,26 +638,35 @@ func handlePatAuthCheck(
 
 		if appCfg != nil {
 			if err := patSaveAppConfig(configDir, appCfg); err != nil {
-				slog.Warn("failed to persist approved app config from PAT", "error", err)
-				fmt.Fprintf(output, "  \u26a0 保存应用配置失败: %v (下次启动可能需要重新授权)\n", err)
+				logPATAuthFailure(slog.LevelWarn, "PAT approved app config persistence failed", "pat_app_config_store", err)
+				return executor.Result{}, apperrors.NewAuth(
+					"PAT 授权已通过，但应用配置保存失败",
+					apperrors.WithOperation("pat/save_app_config"),
+					apperrors.WithReason("pat_app_config_store_failed"),
+					apperrors.WithHint("检查 DWS_CONFIG_DIR 与凭证存储权限后重试"),
+					apperrors.WithCause(err),
+				)
 			}
 		}
 
 		// Exchange authCode for a fresh access token (mirrors device_flow loginOnce).
 		if authCode != "" {
-			slog.Debug("PAT retry: exchanging authCode for token", "hasCode", true)
+			slog.Debug("PAT retry: exchanging authCode for token", "stage", "pat_token_exchange", "auth_code_present", true)
 			tokenData, exchErr := patExchangeCodeForToken(ctx, configDir, authCode)
 			if exchErr != nil {
-				slog.Warn("PAT retry: exchangeCode failed, retrying with existing token", "error", exchErr)
-				fmt.Fprintf(output, "  %s 换取新 token 失败: %v (将使用现有凭证重试)\n", tui.StateMark("warning"), exchErr)
-			} else {
-				if err := patSaveTokenData(configDir, tokenData); err != nil {
-					slog.Warn("PAT retry: failed to save new token", "error", err)
-					fmt.Fprintf(output, "  %s 保存新 token 失败: %v\n", tui.StateMark("warning"), err)
-				} else {
-					slog.Debug("PAT retry: token refreshed and saved")
-				}
+				logPATAuthFailure(slog.LevelWarn, "PAT token exchange failed", "pat_token_exchange", exchErr)
+				return executor.Result{}, authResolutionError(fmt.Errorf("PAT token exchange: %w", exchErr))
 			}
+			if tokenData == nil {
+				nilTokenErr := stderrors.New("PAT token exchange returned empty credentials")
+				logPATAuthFailure(slog.LevelWarn, "PAT token exchange returned no credentials", "pat_token_exchange", nilTokenErr)
+				return executor.Result{}, authResolutionError(nilTokenErr)
+			}
+			if err := patSaveTokenData(configDir, tokenData); err != nil {
+				logPATAuthFailure(slog.LevelWarn, "PAT token persistence failed", "pat_token_store", err)
+				return executor.Result{}, authResolutionError(fmt.Errorf("PAT token persistence: %w", err))
+			}
+			slog.Debug("PAT retry: token refreshed and saved", "stage", "pat_token_store")
 		}
 
 		// Clear token cache so the new credentials take effect.
@@ -665,7 +691,8 @@ func handlePatAuthCheck(
 		fmt.Fprintf(output, "%s %s\n", tui.StateMark("ok"), tui.Bold("授权完成，正在重试..."))
 		fmt.Fprintln(output)
 		slog.Debug("PAT retry: identity env check",
-			"DWS_CLIENT_ID", os.Getenv("DWS_CLIENT_ID"),
+			"stage", "pat_retry",
+			"client_id_env_set", strings.TrimSpace(os.Getenv("DWS_CLIENT_ID")) != "",
 		)
 		retryCtx := context.WithValue(ctx, patRetryingKey, true)
 		return r.Run(retryCtx, invocation)
@@ -794,12 +821,6 @@ func pollPatDeviceFlowWithInterval(ctx context.Context, flowID string, configDir
 	pollURL := fmt.Sprintf("%s%s?flowId=%s",
 		authpkg.GetMCPBaseURL(), authpkg.DevicePollPath, url.QueryEscape(flowID))
 
-	// Load user access token for the poll request header.
-	var accessToken string
-	if tokenData, err := authpkg.LoadTokenData(configDir); err == nil && tokenData != nil {
-		accessToken = tokenData.AccessToken
-	}
-
 	// Use a client that does NOT follow redirects, so we can detect SSO 302.
 	noRedirectClient := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -823,9 +844,22 @@ func pollPatDeviceFlowWithInterval(ctx context.Context, flowID string, configDir
 			pollCount++
 			fmt.Fprintf(output, "\r%s [%d] 等待授权中...          ", tui.Dim("⟳"), pollCount)
 
+			// Resolve once for this poll request. Missing credentials preserve
+			// the legacy header-optional flow; real provider/store/refresh
+			// failures stop before HTTP with their cause intact.
+			accessToken, tokenErr := patResolveAccessToken(ctx, configDir)
+			if tokenErr != nil {
+				if isTrueMissingCredential(tokenErr) {
+					accessToken = ""
+				} else {
+					logPATAuthFailure(slog.LevelWarn, "PAT poll access token resolution failed", "pat_device_poll_token", tokenErr)
+					return "", "", fmt.Errorf("PAT poll access token resolution: %w", tokenErr)
+				}
+			}
+
 			req, err := patPollNewRequest(ctx, http.MethodGet, pollURL, nil)
 			if err != nil {
-				slog.Debug("PAT poll: failed to create request", "error", err)
+				logPATAuthFailure(slog.LevelDebug, "PAT poll request creation failed", "pat_device_poll_request", err)
 				continue
 			}
 			if accessToken != "" {
@@ -833,12 +867,18 @@ func pollPatDeviceFlowWithInterval(ctx context.Context, flowID string, configDir
 			}
 			resp, err := patPollHTTPDo(noRedirectClient, req)
 			if err != nil {
-				slog.Debug("PAT poll: request failed", "error", err)
+				logPATAuthFailure(slog.LevelDebug, "PAT poll request failed", "pat_device_poll_http", err)
 				continue // transient network error, keep polling
 			}
 
-			bodyBytes, _ := io.ReadAll(resp.Body)
+			bodyBytes, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			if readErr != nil {
+				logPATAuthFailure(slog.LevelDebug, "PAT poll response read failed", "pat_device_poll_read", readErr,
+					"http_status", resp.StatusCode,
+				)
+				continue
+			}
 
 			// If we got a redirect (302/301), SSO gateway intercepted — skip JSON parse.
 			if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently {
@@ -847,7 +887,10 @@ func pollPatDeviceFlowWithInterval(ctx context.Context, flowID string, configDir
 
 			var pollResp authpkg.DevicePollResponse
 			if err := json.Unmarshal(bodyBytes, &pollResp); err != nil {
-				slog.Debug("PAT poll: failed to parse response", "error", err, "body", string(bodyBytes))
+				logPATAuthFailure(slog.LevelDebug, "PAT poll response parse failed", "pat_device_poll_parse", err,
+					"http_status", resp.StatusCode,
+					"response_bytes", len(bodyBytes),
+				)
 				printPATPollDebugResponse(output, resp.StatusCode, bodyBytes)
 				continue
 			}

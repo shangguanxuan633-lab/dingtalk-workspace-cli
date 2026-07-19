@@ -233,8 +233,7 @@ func TestClientDebugLogCreateSubscriptionRequestResponse(t *testing.T) {
 		"pre_open_source",
 		EventSingleChat,
 		"filterRule",
-		"targetUid",
-		"test-user-001",
+		"<redacted>",
 		"sub-1",
 		"req-ok",
 	} {
@@ -242,8 +241,10 @@ func TestClientDebugLogCreateSubscriptionRequestResponse(t *testing.T) {
 			t.Fatalf("debug log missing %q: %s", want, out)
 		}
 	}
-	if strings.Contains(out, "secret-token") {
-		t.Fatalf("debug log leaked access token: %s", out)
+	for _, forbidden := range []string{"secret-token", "test-user-001", "targetUid"} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("debug log leaked %q: %s", forbidden, out)
+		}
 	}
 }
 
@@ -277,10 +278,13 @@ func TestClientBusinessErrorHTTP200(t *testing.T) {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
 	out := logs.String()
-	for _, want := range []string{"/subscription/user", "INVALID_PARAM", "clientId is empty", "req-1", "request", "response"} {
+	for _, want := range []string{"/subscription/user", "INVALID_PARAM", "req-1", "request", "response"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("debug log missing %q: %s", want, out)
 		}
+	}
+	if strings.Contains(out, "clientId is empty") {
+		t.Fatalf("debug log leaked free-form server message: %s", out)
 	}
 }
 

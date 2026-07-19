@@ -15,6 +15,7 @@ package logging
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"time"
@@ -67,14 +68,16 @@ func LogResponse(logger *slog.Logger, method, endpoint, executionId string, stat
 		slog.String("duration", duration.Truncate(time.Millisecond).String()),
 	}
 	if err != nil {
-		attrs = append(attrs, slog.String("error", err.Error()))
+		attrs = append(attrs, slog.String("error_type", fmt.Sprintf("%T", err)))
 		logger.LogAttrs(context.TODO(), slog.LevelWarn, "jsonrpc_response", attrs...)
 		return
 	}
 	logger.LogAttrs(context.TODO(), slog.LevelDebug, "jsonrpc_response", attrs...)
 }
 
-// LogResponseBody logs a truncated response body on error paths.
+// LogResponseBody records response metadata on error paths. Response bodies
+// are deliberately never copied into logs: an upstream error envelope may
+// contain access tokens, refresh tokens, identities, or echoed request data.
 func LogResponseBody(logger *slog.Logger, method, executionId string, statusCode int, body []byte, traceID string) {
 	if logger == nil {
 		return
@@ -83,7 +86,7 @@ func LogResponseBody(logger *slog.Logger, method, executionId string, statusCode
 		slog.String("method", method),
 		slog.String("execution_id", executionId),
 		slog.Int("status", statusCode),
-		slog.String("body", TruncateBody(body, maxBodyLogSize)),
+		slog.Int("body_size", len(body)),
 	}
 	if traceID != "" {
 		attrs = append(attrs, slog.String("trace_id", traceID))
@@ -109,7 +112,7 @@ func LogRetryAttempt(logger *slog.Logger, method, executionId string, attempt, m
 		slog.String("delay", delay.String()),
 	}
 	if lastErr != nil {
-		attrs = append(attrs, slog.String("error", lastErr.Error()))
+		attrs = append(attrs, slog.String("error_type", fmt.Sprintf("%T", lastErr)))
 	}
 	logger.LogAttrs(context.TODO(), slog.LevelWarn, "jsonrpc_retry", attrs...)
 }

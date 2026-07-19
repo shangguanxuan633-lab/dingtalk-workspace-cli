@@ -69,13 +69,19 @@ var (
 
 // OAuthProvider handles the DingTalk OAuth 2.0 authorization code flow.
 type OAuthProvider struct {
-	configDir    string
-	clientID     string
-	logger       *slog.Logger
-	Output       io.Writer
-	httpClient   *http.Client
-	NoBrowser    bool
-	TargetCorpID string
+	configDir string
+	clientID  string
+	// profileSelector is pinned by NewOAuthProviderForProfile. Runtime token
+	// resolution must not consult the mutable process-wide RuntimeProfile after
+	// it has selected its cache key, otherwise a concurrent profile switch can
+	// load profile B and publish it into profile A's cache entry.
+	profileSelector string
+	profilePinned   bool
+	logger          *slog.Logger
+	Output          io.Writer
+	httpClient      *http.Client
+	NoBrowser       bool
+	TargetCorpID    string
 	// IdentityEnricher resolves userId/userName/corpName while the freshly
 	// exchanged access token is still only in memory.
 	IdentityEnricher func(context.Context, *TokenData) error
@@ -90,6 +96,24 @@ func NewOAuthProvider(configDir string, logger *slog.Logger) *OAuthProvider {
 		Output:     os.Stderr,
 		httpClient: oauthHTTPClient,
 	}
+}
+
+// NewOAuthProviderForProfile creates a provider whose complete read/refresh/
+// cleanup transaction is bound to profile. An empty profile is meaningful: it
+// pins the default-profile resolution chain instead of following later calls
+// to SetRuntimeProfile.
+func NewOAuthProviderForProfile(configDir string, logger *slog.Logger, profile string) *OAuthProvider {
+	provider := NewOAuthProvider(configDir, logger)
+	provider.profileSelector = strings.TrimSpace(profile)
+	provider.profilePinned = true
+	return provider
+}
+
+func (p *OAuthProvider) runtimeProfile() string {
+	if p != nil && p.profilePinned {
+		return p.profileSelector
+	}
+	return RuntimeProfile()
 }
 
 // resetCredentialState clears any stale credential state inherited from
@@ -645,7 +669,15 @@ continueLogin:
 // string-only path it preserves storage, lock, and refresh errors so callers
 // can distinguish "not logged in" from a broken credential store.
 func (p *OAuthProvider) GetTokenSnapshot(ctx context.Context) (*TokenData, error) {
-	data, err := oauthLoadToken(p.configDir)
+	var data *TokenData
+	var err error
+	if p.profilePinned {
+		data, err = LoadTokenDataForProfile(p.configDir, p.runtimeProfile())
+	} else {
+		// Preserve the compatibility seam used by host editions and existing
+		// callers that intentionally follow the process-wide profile.
+		data, err = oauthLoadToken(p.configDir)
+	}
 	if err != nil {
 		if errors.Is(err, ErrTokenDataNotFound) {
 			return nil, fmt.Errorf("%s: %w", i18n.T("未登录，请运行 dws auth login"), err)
@@ -668,7 +700,7 @@ func (p *OAuthProvider) GetTokenSnapshot(ctx context.Context) (*TokenData, error
 		deleted, cleanupFailed := false, false
 		if failureClass == RefreshFailureTerminal {
 			var deleteErr error
-			deleted, deleteErr = oauthDeleteRejected(ctx, p.configDir, data.AccessToken, data.Generation)
+			deleted, deleteErr = p.deleteRejectedToken(ctx, data.AccessToken, data.Generation)
 			cleanupFailed = deleteErr != nil
 			if deleteErr != nil {
 				rErr = errors.Join(rErr, fmt.Errorf("cleanup terminal credential: %w", deleteErr))
@@ -684,7 +716,7 @@ func (p *OAuthProvider) GetTokenSnapshot(ctx context.Context) (*TokenData, error
 		}
 		return nil, fmt.Errorf("%s: %w", i18n.T("refresh_token 刷新失败"), rErr)
 	} else {
-		_, deleteErr := oauthDeleteRejected(ctx, p.configDir, data.AccessToken, data.Generation)
+		_, deleteErr := p.deleteRejectedToken(ctx, data.AccessToken, data.Generation)
 		if deleteErr != nil {
 			return nil, fmt.Errorf("%s: %w", i18n.T("所有凭证已失效，请运行 dws auth login 重新登录"), errors.Join(ErrRefreshTokenExpired, deleteErr))
 		}
@@ -704,6 +736,20 @@ func (p *OAuthProvider) GetAccessToken(ctx context.Context) (string, error) {
 		return "", errors.New("OAuth token snapshot has an empty access token")
 	}
 	return strings.TrimSpace(data.AccessToken), nil
+}
+
+func (p *OAuthProvider) deleteRejectedToken(ctx context.Context, accessToken string, generation ...uint64) (bool, error) {
+	if p != nil && p.profilePinned {
+		return DeleteTokenDataIfAccessTokenMatchesForProfile(ctx, p.configDir, p.runtimeProfile(), accessToken, generation...)
+	}
+	return oauthDeleteRejected(ctx, p.configDir, accessToken, generation...)
+}
+
+func (p *OAuthProvider) saveRefreshedTokenLocked(data *TokenData) error {
+	if p != nil && p.profilePinned {
+		return saveTokenDataLockedForProfile(p.configDir, p.runtimeProfile(), data)
+	}
+	return oauthSaveTokenLocked(p.configDir, data)
 }
 
 // lockedRefresh attempts to refresh the token while holding dual-layer locks.
@@ -735,7 +781,7 @@ func (p *OAuthProvider) lockedRefresh(ctx context.Context) (*TokenData, error) {
 
 	// Double-check: re-load from disk — another goroutine/process may have refreshed
 	// while we were waiting for the lock.
-	data, err := oauthLoadTokenLocked(p.configDir, RuntimeProfile())
+	data, err := oauthLoadTokenLocked(p.configDir, p.runtimeProfile())
 	if err != nil {
 		return nil, err
 	}

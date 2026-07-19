@@ -54,6 +54,14 @@ func redactAuthDebugArgs(args []any) []any {
 }
 
 func redactAuthDebugAttr(attr slog.Attr) slog.Attr {
+	if attr.Value.Kind() == slog.KindGroup {
+		group := attr.Value.Group()
+		args := make([]any, 0, len(group))
+		for _, child := range group {
+			args = append(args, redactAuthDebugAttr(child))
+		}
+		return slog.Group(attr.Key, args...)
+	}
 	key, value := redactAuthDebugPair(attr.Key, attr.Value.Any())
 	return slog.Any(key, value)
 }
@@ -81,16 +89,24 @@ func redactAuthDebugPair(key string, value any) (string, any) {
 }
 
 func authDebugSecretKey(key string) bool {
-	return strings.Contains(key, "access_token") || strings.Contains(key, "refresh_token") ||
-		strings.Contains(key, "client_secret") || strings.Contains(key, "authorization") ||
-		strings.Contains(key, "persistent_code")
+	compact := compactAuthDebugKey(key)
+	return strings.Contains(compact, "token") || strings.Contains(compact, "authcode") ||
+		strings.Contains(compact, "authorization") || strings.Contains(compact, "clientsecret") ||
+		strings.Contains(compact, "persistentcode")
 }
 
 func authDebugIdentityKey(key string) bool {
-	switch key {
-	case "corp_id", "corp_name", "user_id", "user_name", "identity_selector", "runtime_profile", "target_corp_id", "profile":
+	switch compactAuthDebugKey(key) {
+	case "uid", "userid", "username", "corpid", "corpname", "staffid", "unionid", "openid", "tenantid", "localsubject",
+		"identityselector", "runtimeprofile", "targetcorpid", "profile":
 		return true
 	default:
 		return false
 	}
+}
+
+func compactAuthDebugKey(key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	replacer := strings.NewReplacer("_", "", "-", "", ".", "", " ", "")
+	return replacer.Replace(key)
 }

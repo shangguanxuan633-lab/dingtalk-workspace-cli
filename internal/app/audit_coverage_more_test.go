@@ -258,7 +258,7 @@ func TestCrossPlatformCoverageAuditRuntimeCoverage(t *testing.T) {
 	if category, reason := classifyAuditError(fmt.Errorf("wrapped: %w", typed)); category != string(apperrors.CategoryAuth) || reason != "expired" {
 		t.Fatalf("classifyAuditError(typed) = %q, %q", category, reason)
 	}
-	if category, reason := classifyAuditError(errors.New("plain")); category != "unknown" || reason != "plain" {
+	if category, reason := classifyAuditError(errors.New("plain")); category != "unknown" || reason != "unknown" {
 		t.Fatalf("classifyAuditError(plain) = %q, %q", category, reason)
 	}
 }

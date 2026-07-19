@@ -60,8 +60,8 @@ func TestRedactValue(t *testing.T) {
 	}{
 		{"short", "***"},
 		{"12345678", "***"},
-		{"123456789", "1234***"},
-		{"a-very-long-token-value", "a-ve***"},
+		{"123456789", "***"},
+		{"a-very-long-token-value", "***"},
 	}
 
 	for _, tt := range tests {
@@ -102,9 +102,13 @@ func TestSanitizeArguments(t *testing.T) {
 	args := map[string]any{
 		"name":     "test",
 		"password": "secret123",
+		"userId":   "user-4496576595",
 		"nested": map[string]any{
 			"api_key": "key-value",
 			"safe":    "ok",
+			"items": []any{
+				map[string]any{"corpId": "corp-secret"},
+			},
 		},
 	}
 	got := SanitizeArguments(args, 4096)
@@ -113,6 +117,11 @@ func TestSanitizeArguments(t *testing.T) {
 	}
 	if strings.Contains(got, "key-value") {
 		t.Fatalf("api_key should be redacted: %s", got)
+	}
+	for _, identity := range []string{"user-4496576595", "corp-secret"} {
+		if strings.Contains(got, identity) {
+			t.Fatalf("identity %q should be redacted: %s", identity, got)
+		}
 	}
 	if !strings.Contains(got, "test") {
 		t.Fatalf("non-sensitive value should remain: %s", got)

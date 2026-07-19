@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,15 +91,16 @@ func auditIdentity() (audit.Actor, string) {
 
 	configDir := defaultConfigDir()
 	var actor audit.Actor
-	if td, err := loadTokenForProfile(configDir, profile); err == nil && td != nil {
+	td, loadErr := loadTokenForProfile(configDir, profile)
+	if loadErr == nil && td != nil {
 		actor = audit.Actor{
 			UserID:   td.UserID,
 			Name:     td.UserName,
 			CorpID:   td.CorpID,
 			CorpName: td.CorpName,
 		}
-	} else if err != nil {
-		auditReport("resolve actor for profile %q failed: %v", profile, err)
+	} else if loadErr != nil && !isTrueMissingCredential(loadErr) {
+		auditAuthReport("audit_actor_load", loadErr, strings.TrimSpace(profile) != "")
 	}
 
 	agentID := ""
@@ -106,8 +108,25 @@ func auditIdentity() (audit.Actor, string) {
 		agentID = id.AgentID
 	}
 
-	cachedActor, cachedAgentID, cachedProfile, identityLoaded = actor, agentID, profile, true
+	// A transient credential-store failure must not poison the profile cache
+	// with an empty actor for the lifetime of a long-running process. Missing
+	// credentials are also retried so a later login becomes visible.
+	if loadErr == nil {
+		cachedActor, cachedAgentID, cachedProfile, identityLoaded = actor, agentID, profile, true
+	}
 	return actor, agentID
+}
+
+func auditAuthReport(stage string, err error, profileSelected bool) {
+	attrs := auxiliaryAuthDiagnosticAttrs(stage, err)
+	attrs = append(attrs, "profile_selected", profileSelected)
+	if l := FileLoggerInstance(); l != nil {
+		l.Warn("audit auth identity resolution failed", attrs...)
+	}
+	if audit.DebugEnabled() {
+		fmt.Fprintf(os.Stderr, "[dws] audit auth failure: stage=%s error_type=%s cause_type=%T profile_selected=%t\n",
+			stage, classifyAuxiliaryAuthError(err), err, profileSelected)
+	}
 }
 
 func emitAudit(sink audit.Sink, execID string, invokeStart time.Time, invocation executor.Invocation, endpoint string, retErr error, cliVersion string) {
@@ -160,5 +179,5 @@ func classifyAuditError(err error) (category, reason string) {
 	if errors.As(err, &typed) {
 		return string(typed.Category), typed.Reason
 	}
-	return "unknown", err.Error()
+	return "unknown", classifyAuxiliaryAuthError(err)
 }

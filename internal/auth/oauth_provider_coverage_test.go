@@ -644,6 +644,7 @@ func TestCrossPlatformCoverageOAuthProviderHighLevelEdges(t *testing.T) {
 	oldLoadLocked := oauthLoadTokenLocked
 	oldAcquire := oauthAcquireLock
 	oldMark := oauthMarkProfile
+	oldDeleteRejected := oauthDeleteRejected
 	oldFetch := oauthFetchClientID
 	oldExchange := oauthExchange
 	oldSave := oauthSaveToken
@@ -655,6 +656,7 @@ func TestCrossPlatformCoverageOAuthProviderHighLevelEdges(t *testing.T) {
 		oauthLoadTokenLocked = oldLoadLocked
 		oauthAcquireLock = oldAcquire
 		oauthMarkProfile = oldMark
+		oauthDeleteRejected = oldDeleteRejected
 		oauthFetchClientID = oldFetch
 		oauthExchange = oldExchange
 		oauthSaveToken = oldSave
@@ -704,17 +706,26 @@ func TestCrossPlatformCoverageOAuthProviderHighLevelEdges(t *testing.T) {
 	if got, err := p.GetAccessToken(context.Background()); err != nil || got != "new" {
 		t.Fatalf("refreshed access token = %q %v", got, err)
 	}
-	marked := false
-	oauthRefreshToken = func(*OAuthProvider, context.Context, *TokenData) (*TokenData, error) { return nil, fail }
-	oauthMarkProfile = func(string, string, string) error { marked = true; return fail }
-	if _, err := p.GetAccessToken(context.Background()); err == nil || !marked {
-		t.Fatalf("failed refresh = %v marked=%v", err, marked)
+	deleted := false
+	oauthDeleteRejected = func(context.Context, string, string, ...uint64) (bool, error) {
+		deleted = true
+		return true, nil
 	}
-	marked = false
+	oauthRefreshToken = func(*OAuthProvider, context.Context, *TokenData) (*TokenData, error) { return nil, fail }
+	if _, err := p.GetAccessToken(context.Background()); err == nil || deleted {
+		t.Fatalf("unknown refresh failure = %v deleted=%v", err, deleted)
+	}
+	oauthRefreshToken = func(*OAuthProvider, context.Context, *TokenData) (*TokenData, error) {
+		return nil, &OAuthEndpointError{StatusCode: 400, Code: "invalid_grant"}
+	}
+	if _, err := p.GetAccessToken(context.Background()); err == nil || !deleted {
+		t.Fatalf("terminal refresh failure = %v deleted=%v", err, deleted)
+	}
+	deleted = false
 	noRefresh := &TokenData{AccessToken: "old", ExpiresAt: time.Now().Add(-time.Hour), CorpID: "corp"}
 	oauthLoadToken = func(string) (*TokenData, error) { return noRefresh, nil }
-	if _, err := p.GetAccessToken(context.Background()); err == nil || !marked {
-		t.Fatalf("expired access token = %v marked=%v", err, marked)
+	if _, err := p.GetAccessToken(context.Background()); err == nil || !deleted {
+		t.Fatalf("expired access token = %v deleted=%v", err, deleted)
 	}
 
 	oauthAcquireLock = func(context.Context, string) (*DualLock, error) { return nil, fail }

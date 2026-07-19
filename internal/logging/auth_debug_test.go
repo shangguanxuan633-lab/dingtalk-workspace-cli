@@ -15,6 +15,7 @@ package logging
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -30,6 +31,37 @@ func TestAuthDebugDisabledByDefault(t *testing.T) {
 	AuthDebug("auth.test", "user_id", "user")
 	if output.Len() != 0 {
 		t.Fatalf("AuthDebug() logged without %s=1: %s", AuthDebugEnv, output.String())
+	}
+}
+
+func TestAuthDebugRedactsKeyVariantsAndRawErrors(t *testing.T) {
+	t.Setenv(AuthDebugEnv, "1")
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	AuthDebug("auth.variants",
+		"accessToken", "access-secret",
+		"refresh-token", "refresh-secret",
+		"authCode", "code-secret",
+		"clientSecret", "client-secret",
+		"persistentCode", "persistent-secret",
+		"uid", "uid-4496576595",
+		"corpId", "corp-secret",
+		"staff_id", "staff-secret",
+		"error", errors.New("server echoed access-secret"),
+		slog.Group("identity", slog.String("unionId", "union-secret"), slog.String("open_id", "open-secret")),
+		"stage", "refresh",
+	)
+	got := output.String()
+	for _, secret := range []string{"access-secret", "refresh-secret", "code-secret", "client-secret", "persistent-secret", "uid-4496576595", "corp-secret", "staff-secret", "union-secret", "open-secret", "server echoed"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("AuthDebug leaked %q: %s", secret, got)
+		}
+	}
+	if !strings.Contains(got, `"stage":"refresh"`) || !strings.Contains(got, `"uid_hash":`) || !strings.Contains(got, `"error_type":`) {
+		t.Fatalf("AuthDebug omitted safe diagnostics: %s", got)
 	}
 }
 

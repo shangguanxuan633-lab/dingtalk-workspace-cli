@@ -282,7 +282,6 @@ func (r *runtimeRunner) recoverAuthError(
 
 	marker, marked := authretry.As(sourceErr)
 	coreMarker, coreRejected := coreAuthRejectionFromError(sourceErr)
-	trustedAuthError := isAuthError(sourceErr)
 	if marked {
 		// ClassifyToolResult/preflight already supplied the explicit contract.
 		// Do not feed it through OnAuthError a second time.
@@ -296,7 +295,7 @@ func (r *runtimeRunner) recoverAuthError(
 		result, err := r.maybeAuthRefreshRetry(ctx, endpoint, invocation, rejected, cause)
 		return true, result, err
 	}
-	if !coreRejected && !trustedAuthError {
+	if !coreRejected {
 		// Timeouts, 5xx responses, and arbitrary transport/business failures
 		// are not proof that the access token was rejected. In particular, do
 		// not let a broad edition OnAuthError hook upgrade them into a refresh.
@@ -305,13 +304,7 @@ func (r *runtimeRunner) recoverAuthError(
 	marker = coreMarker
 	resolved, hookErr := invokeEditionOnAuthError(defaultConfigDir(), sourceErr, marker)
 	if hookErr != nil {
-		// Preserve the pre-V2 hook contract for errors already categorized as
-		// authentication failures. A hook cannot replace an unrelated transport
-		// error unless it returns the explicit AuthRefreshRequired marker.
-		if coreRejected || isAuthError(sourceErr) {
-			return true, executor.Result{}, hookErr
-		}
-		return false, executor.Result{}, nil
+		return true, executor.Result{}, hookErr
 	}
 	if resolved == nil {
 		return false, executor.Result{}, nil

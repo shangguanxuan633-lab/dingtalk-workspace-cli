@@ -195,8 +195,8 @@ func TestCrossPlatformCoverageRunnerRemainingExecutionCoverage(t *testing.T) {
 	}
 	overrideErr := errors.New("auth override")
 	edition.Override(&edition.Hooks{OnAuthError: func(string, error) error { return overrideErr }})
-	if _, err := r.executeInvocation(context.Background(), "https://example.test", inv); !errors.Is(err, overrideErr) {
-		t.Fatalf("auth override = %v", err)
+	if _, err := r.executeInvocation(context.Background(), "https://example.test", inv); !errors.Is(err, authErr) {
+		t.Fatalf("ordinary auth error should bypass refresh hook = %v", err)
 	}
 	edition.Override(&edition.Hooks{OnAuthError: func(string, error) error { return nil }})
 	if _, err := r.executeInvocation(context.Background(), "https://example.test", inv); !errors.Is(err, authErr) {
@@ -250,16 +250,16 @@ func TestCrossPlatformCoverageRunnerRemainingExecutionCoverage(t *testing.T) {
 	callCount := 0
 	edition.Override(&edition.Hooks{ClassifyToolResult: func(map[string]any) error {
 		callCount++
-		if callCount%2 == 0 {
-			return wantErr
-		}
-		return nil
+		return wantErr
 	}})
 	runnerCallTool = func(*transport.Client, context.Context, string, string, map[string]any) (transport.ToolCallResult, error) {
 		return transport.ToolCallResult{IsError: true, Content: map[string]any{"message": "business"}}, nil
 	}
 	if _, err := r.executeInvocation(context.Background(), "https://example.test", inv); !errors.Is(err, wantErr) {
 		t.Fatalf("business hook = %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("business hook calls = %d, want 1", callCount)
 	}
 
 	edition.Override(&edition.Hooks{})

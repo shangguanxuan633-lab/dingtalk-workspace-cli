@@ -30,6 +30,15 @@ type fakeAccessTokenGetter struct {
 	err   error
 }
 
+type fakeRejectedTokenRefresher struct {
+	token string
+	err   error
+}
+
+func (g fakeRejectedTokenRefresher) ForceRefreshRejectedToken(context.Context, string, ...uint64) (string, error) {
+	return g.token, g.err
+}
+
 func (g fakeAccessTokenGetter) GetAccessToken(context.Context) (string, error) {
 	return g.token, g.err
 }
@@ -246,10 +255,10 @@ func TestCrossPlatformCoverageConfigAndTokenSeamsCoverage(t *testing.T) {
 }
 
 func TestCrossPlatformCoverageForceRefreshAndStdioFailureCoverage(t *testing.T) {
-	oldMark, oldFactory := markAccessTokenStale, newRefreshProvider
+	oldFactory := newRejectedTokenRefresher
 	oldStop := stopStdio
 	t.Cleanup(func() {
-		markAccessTokenStale, newRefreshProvider = oldMark, oldFactory
+		newRejectedTokenRefresher = oldFactory
 		stopStdio = oldStop
 		stdioMu.Lock()
 		stdioClients = make(map[string]*transport.StdioClient)
@@ -257,21 +266,16 @@ func TestCrossPlatformCoverageForceRefreshAndStdioFailureCoverage(t *testing.T) 
 	})
 	fail := errors.New("failure")
 	_ = oldFactory(t.TempDir())
-	markAccessTokenStale = func(string) error { return fail }
-	if _, err := ForceRefreshAccessToken(context.Background(), "config"); !errors.Is(err, fail) {
-		t.Fatalf("mark stale error = %v", err)
-	}
-	markAccessTokenStale = func(string) error { return nil }
 	for _, tc := range []struct {
-		getter fakeAccessTokenGetter
+		getter fakeRejectedTokenRefresher
 		want   string
 	}{
-		{getter: fakeAccessTokenGetter{err: fail}, want: "failure"},
-		{getter: fakeAccessTokenGetter{token: "  "}, want: "empty"},
-		{getter: fakeAccessTokenGetter{token: " refreshed "}},
+		{getter: fakeRejectedTokenRefresher{err: fail}, want: "failure"},
+		{getter: fakeRejectedTokenRefresher{token: "  "}, want: "empty"},
+		{getter: fakeRejectedTokenRefresher{token: " refreshed "}},
 	} {
-		newRefreshProvider = func(string) accessTokenGetter { return tc.getter }
-		got, err := ForceRefreshAccessToken(context.Background(), "config")
+		newRejectedTokenRefresher = func(string) rejectedTokenRefresher { return tc.getter }
+		got, err := ForceRefreshRejectedToken(context.Background(), "config", "rejected", 7)
 		if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
 			t.Fatalf("refresh error = %v, want %q", err, tc.want)
 		}
