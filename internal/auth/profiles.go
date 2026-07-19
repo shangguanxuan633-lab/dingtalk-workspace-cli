@@ -28,6 +28,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/config"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 )
 
 var (
@@ -120,9 +121,16 @@ var (
 
 // SetRuntimeProfile sets a process-local one-shot profile override.
 func SetRuntimeProfile(profile string) {
+	profile = strings.TrimSpace(profile)
 	runtimeProfileMu.Lock()
-	defer runtimeProfileMu.Unlock()
-	runtimeProfile = strings.TrimSpace(profile)
+	changed := runtimeProfile != profile
+	runtimeProfile = profile
+	runtimeProfileMu.Unlock()
+	if changed {
+		if invalidate := edition.Get().InvalidateAuthCaches; invalidate != nil {
+			invalidate()
+		}
+	}
 }
 
 // RuntimeProfile returns the process-local one-shot profile override.

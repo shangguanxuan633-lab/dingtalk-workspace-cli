@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -40,6 +41,8 @@ var (
 	tokenReadFile                = os.ReadFile
 	tokenWriteFile               = os.WriteFile
 	tokenRename                  = os.Rename
+	tokenSyncFile                = syncTokenFile
+	tokenSyncDirectory           = syncTokenDirectory
 	tokenRemove                  = os.Remove
 	tokenGlob                    = filepath.Glob
 	tokenSaveKeychainForCorpID   = SaveTokenDataKeychainForCorpID
@@ -168,10 +171,65 @@ func writeTokenMarker(configDir string, manual bool, generation uint64) error {
 		return err
 	}
 	tmp := filepath.Join(configDir, tokenJSONFile+"."+uuid.New().String()+".tmp")
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = tokenRemove(tmp)
+		}
+	}()
 	if err := tokenWriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return tokenRename(tmp, filepath.Join(configDir, tokenJSONFile))
+	if err := tokenSyncFile(tmp); err != nil {
+		return fmt.Errorf("sync token publication marker: %w", err)
+	}
+	if err := tokenRename(tmp, filepath.Join(configDir, tokenJSONFile)); err != nil {
+		return err
+	}
+	renamed = true
+	if err := tokenSyncDirectory(configDir); err != nil {
+		return fmt.Errorf("sync token publication directory: %w", err)
+	}
+	return nil
+}
+
+func syncTokenFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
+func syncTokenDirectory(path string) error {
+	// Windows has no portable directory fsync equivalent. Rename is already
+	// atomic there; durable directory publication is enforced on Unix hosts.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
+func editionTokenStoreConfigured(h *edition.Hooks) bool {
+	return h != nil && (h.SaveToken != nil || h.LoadToken != nil || h.DeleteToken != nil)
+}
+
+func validateEditionTokenStore(h *edition.Hooks) error {
+	if !editionTokenStoreConfigured(h) {
+		return nil
+	}
+	if h.SaveToken == nil || h.LoadToken == nil || h.DeleteToken == nil {
+		return fmt.Errorf("edition token store must provide SaveToken, LoadToken, and DeleteToken")
+	}
+	return nil
 }
 
 // ReadTokenMarkerGeneration reads the lightweight publication marker without
@@ -250,7 +308,10 @@ func saveTokenDataLocked(configDir string, data *TokenData) (retErr error) {
 			*original = *data
 		}
 	}()
-	if h := edition.Get(); h.SaveToken != nil {
+	if h := edition.Get(); editionTokenStoreConfigured(h) {
+		if err := validateEditionTokenStore(h); err != nil {
+			return err
+		}
 		return saveTokenViaHookTransaction(h, configDir, data)
 	}
 	if data != nil && strings.TrimSpace(data.CorpID) != "" {
@@ -377,6 +438,9 @@ func saveTokenDataLocked(configDir string, data *TokenData) (retErr error) {
 }
 
 func saveTokenViaHookTransaction(h *edition.Hooks, configDir string, data *TokenData) error {
+	if h == nil || h.SaveToken == nil || h.LoadToken == nil || h.DeleteToken == nil {
+		return fmt.Errorf("edition token store must provide SaveToken, LoadToken, and DeleteToken for transactional publication")
+	}
 	markerSnapshot, err := snapshotTokenMarker(configDir)
 	if err != nil {
 		return err
@@ -397,7 +461,10 @@ func saveTokenViaHookTransaction(h *edition.Hooks, configDir string, data *Token
 	if err := tokenWriteMarkerGeneration(configDir, false, data.Generation); err == nil {
 		return nil
 	} else {
-		rollbackErr := restoreTokenMarker(configDir, markerSnapshot)
+		// Restore the unpublished credential first and publish its marker last.
+		// A concurrent reader must never observe the previous marker pointing at
+		// the newly-written (but uncommitted) blob.
+		var rollbackErr error
 		if previousExists {
 			if restoreErr := h.SaveToken(configDir, previous); restoreErr != nil {
 				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore hook token: %w", restoreErr))
@@ -406,6 +473,9 @@ func saveTokenViaHookTransaction(h *edition.Hooks, configDir string, data *Token
 			if restoreErr := h.DeleteToken(configDir); restoreErr != nil {
 				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove unpublished hook token: %w", restoreErr))
 			}
+		}
+		if restoreErr := restoreTokenMarker(configDir, markerSnapshot); restoreErr != nil {
+			rollbackErr = errors.Join(rollbackErr, restoreErr)
 		}
 		if rollbackErr != nil {
 			return errors.Join(err, fmt.Errorf("rollback unpublished hook token: %w", rollbackErr))
@@ -448,24 +518,27 @@ func LoadTokenData(configDir string) (*TokenData, error) {
 // LoadTokenDataForProfile reads TokenData for a profile selector without mutating
 // currentProfile. Empty selector follows the default resolution chain.
 func LoadTokenDataForProfile(configDir, profile string) (*TokenData, error) {
-	if h := edition.Get(); h.LoadToken != nil {
-		if strings.TrimSpace(profile) != "" {
-			return nil, fmt.Errorf("profile selection is not supported by the current auth backend")
-		}
-		jsonData, err := h.LoadToken(configDir)
-		if err != nil {
-			return nil, err
-		}
-		var td TokenData
-		if err := json.Unmarshal(jsonData, &td); err != nil {
-			return nil, fmt.Errorf("parsing token data from hook: %w", err)
-		}
-		return &td, nil
-	}
-
 	var result *TokenData
 	err := withProfilesLock(configDir, func() error {
 		var loadErr error
+		if h := edition.Get(); editionTokenStoreConfigured(h) {
+			if hookErr := validateEditionTokenStore(h); hookErr != nil {
+				return hookErr
+			}
+			if strings.TrimSpace(profile) != "" {
+				return fmt.Errorf("profile selection is not supported by the current auth backend")
+			}
+			jsonData, hookErr := h.LoadToken(configDir)
+			if hookErr != nil {
+				return hookErr
+			}
+			var td TokenData
+			if hookErr := json.Unmarshal(jsonData, &td); hookErr != nil {
+				return fmt.Errorf("parsing token data from hook: %w", hookErr)
+			}
+			result = &td
+			return nil
+		}
 		result, loadErr = loadTokenDataForProfileLocked(configDir, profile)
 		return loadErr
 	})
@@ -576,15 +649,53 @@ func DeleteTokenData(configDir string) error {
 // DeleteTokenDataForProfile removes one profile's token data. Empty selector
 // removes the current/default profile, falling back to legacy single-slot auth.
 func DeleteTokenDataForProfile(configDir, profile string) error {
-	if h := edition.Get(); h.DeleteToken != nil {
-		if strings.TrimSpace(profile) != "" {
-			return fmt.Errorf("profile selection is not supported by the current auth backend")
-		}
-		return h.DeleteToken(configDir)
-	}
 	return withProfilesLock(configDir, func() error {
+		if h := edition.Get(); editionTokenStoreConfigured(h) {
+			if err := validateEditionTokenStore(h); err != nil {
+				return err
+			}
+			if strings.TrimSpace(profile) != "" {
+				return fmt.Errorf("profile selection is not supported by the current auth backend")
+			}
+			return deleteTokenViaHookTransaction(h, configDir)
+		}
 		return deleteTokenDataForProfileLocked(configDir, profile)
 	})
+}
+
+func deleteTokenViaHookTransaction(h *edition.Hooks, configDir string) error {
+	if h == nil || h.SaveToken == nil || h.LoadToken == nil || h.DeleteToken == nil {
+		return fmt.Errorf("edition token store must provide SaveToken, LoadToken, and DeleteToken for transactional deletion")
+	}
+	markerSnapshot, err := snapshotTokenMarker(configDir)
+	if err != nil {
+		return err
+	}
+	previous, loadErr := h.LoadToken(configDir)
+	previousExists := loadErr == nil
+	if loadErr != nil && !errors.Is(loadErr, ErrTokenDataNotFound) && !errors.Is(loadErr, os.ErrNotExist) {
+		return fmt.Errorf("snapshot hook token for deletion: %w", loadErr)
+	}
+	if err := h.DeleteToken(configDir); err != nil {
+		return err
+	}
+	if err := tokenDeleteMarker(configDir); err == nil {
+		return nil
+	} else {
+		var rollbackErr error
+		if previousExists {
+			if restoreErr := h.SaveToken(configDir, previous); restoreErr != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore hook token: %w", restoreErr))
+			}
+		}
+		if restoreErr := restoreTokenMarker(configDir, markerSnapshot); restoreErr != nil {
+			rollbackErr = errors.Join(rollbackErr, restoreErr)
+		}
+		if rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("rollback hook token deletion: %w", rollbackErr))
+		}
+		return err
+	}
 }
 
 func deleteTokenDataForProfileLocked(configDir, profile string) error {
@@ -1015,10 +1126,13 @@ func restoreTokenMarker(configDir string, marker tokenMarkerSnapshot) error {
 
 // DeleteAllTokenData removes all profile-scoped and legacy token data.
 func DeleteAllTokenData(configDir string) error {
-	if h := edition.Get(); h.DeleteToken != nil {
-		return h.DeleteToken(configDir)
-	}
 	return withProfilesLock(configDir, func() error {
+		if h := edition.Get(); editionTokenStoreConfigured(h) {
+			if err := validateEditionTokenStore(h); err != nil {
+				return err
+			}
+			return deleteTokenViaHookTransaction(h, configDir)
+		}
 		var firstErr error
 		// Sweep the complete auth-token namespace so orphan identity slots that
 		// are not present in profiles.json cannot survive reset/logout --all.

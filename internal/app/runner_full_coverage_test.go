@@ -28,11 +28,9 @@ func (f runnerCoverageFallback) Run(context.Context, executor.Invocation) (execu
 func TestCrossPlatformCoverageRunnerRemainingRoutingCoverage(t *testing.T) {
 	oldResolveMulti := runnerResolveMultiProfileSelections
 	oldResolveProfile := runnerResolveProfile
-	oldCachedToken := runnerGetCachedRuntimeToken
 	t.Cleanup(func() {
 		runnerResolveMultiProfileSelections = oldResolveMulti
 		runnerResolveProfile = oldResolveProfile
-		runnerGetCachedRuntimeToken = oldCachedToken
 	})
 
 	created := newCommandRunnerWithFlags(cli.StaticLoader{}, &GlobalFlags{Timeout: 2})
@@ -49,11 +47,6 @@ func TestCrossPlatformCoverageRunnerRemainingRoutingCoverage(t *testing.T) {
 	}
 
 	inv := executor.Invocation{CanonicalProduct: "product", Tool: "tool"}
-	prefetched := make(chan struct{}, 1)
-	runnerGetCachedRuntimeToken = func(context.Context) string {
-		prefetched <- struct{}{}
-		return ""
-	}
 	r := &runtimeRunner{
 		loader:    cli.CatalogLoaderFrom(cli.Catalog{}, wantErr),
 		transport: transport.NewClient(nil),
@@ -71,7 +64,6 @@ func TestCrossPlatformCoverageRunnerRemainingRoutingCoverage(t *testing.T) {
 	if _, err := r.runSingle(context.Background(), inv, true); !errors.Is(err, wantErr) {
 		t.Fatalf("runSingle error = %v", err)
 	}
-	<-prefetched
 
 	runnerResolveProfile = func(_ string, selector string) (*authpkg.Profile, error) {
 		if selector == "a,b" {
@@ -329,19 +321,19 @@ func TestCrossPlatformCoverageRunnerRemainingStdioAuthAndHeadersCoverage(t *test
 	}
 
 	r.globalFlags.Token = " explicit "
-	if got := r.resolveAuthToken(context.Background()); got != "explicit" {
-		t.Fatalf("explicit auth token = %q", got)
+	if got, err := r.resolveAuthToken(context.Background()); err != nil || got.AccessToken != "explicit" {
+		t.Fatalf("explicit auth token = %#v, %v", got, err)
 	}
 	edition.Override(&edition.Hooks{TokenProvider: func(_ context.Context, fallback func() (string, error)) (string, error) {
 		_, _ = fallback()
 		return "provided", nil
 	}})
 	r.globalFlags.Token = ""
-	if got := r.resolveAuthToken(context.Background()); got != "provided" {
-		t.Fatalf("provided auth token = %q", got)
+	if got, err := r.resolveAuthToken(context.Background()); err != nil || got.AccessToken != "provided" {
+		t.Fatalf("provided auth token = %#v, %v", got, err)
 	}
-	if got := resolveRuntimeAuthToken(context.Background(), " runtime "); got != "runtime" {
-		t.Fatalf("runtime explicit token = %q", got)
+	if got, err := resolveRuntimeAuthToken(context.Background(), " runtime "); err != nil || got != "runtime" {
+		t.Fatalf("runtime explicit token = %q, %v", got, err)
 	}
 
 	t.Setenv(envDWSChannel, "channel")

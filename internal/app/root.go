@@ -821,7 +821,19 @@ func loadPlugins(engine *pipeline.Engine, _ executor.Runner) []*cobra.Command {
 	rootPluginInjectConfigEnv(pluginLoader)
 
 	// Load TokenData once; reused for stdio injection below.
-	tokenData, _ := rootAuthLoadTokenData(defaultConfigDir())
+	tokenData, tokenLoadErr := rootAuthLoadTokenData(defaultConfigDir())
+	if tokenLoadErr != nil {
+		level := slog.LevelWarn
+		reason := "auth_store_load_failed"
+		if stderrors.Is(tokenLoadErr, authpkg.ErrTokenDataNotFound) || stderrors.Is(tokenLoadErr, os.ErrNotExist) {
+			level = slog.LevelDebug
+			reason = "no_credentials"
+		}
+		slog.Log(context.Background(), level, "auth.plugin_context.load_failed",
+			"reason", reason,
+			"error_type", fmt.Sprintf("%T", tokenLoadErr),
+		)
+	}
 	var userCtx *plugin.UserContext
 	if tokenData != nil {
 		// Inject user context if either UserID or CorpID is present.

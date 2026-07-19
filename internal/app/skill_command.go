@@ -28,7 +28,6 @@ import (
 	"strings"
 	"time"
 
-	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/configmeta"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
@@ -36,11 +35,13 @@ import (
 )
 
 var (
-	skillLoadAccessToken   = loadSkillAccessToken
-	skillDownloadToTmp     = downloadSkillToTmpDir
-	skillHTTPDo            = func(client *http.Client, req *http.Request) (*http.Response, error) { return client.Do(req) }
-	skillNewRequest        = http.NewRequestWithContext
-	skillLoadTokenData     = authpkg.LoadTokenData
+	skillLoadAccessToken = loadSkillAccessToken
+	skillDownloadToTmp   = downloadSkillToTmpDir
+	skillHTTPDo          = func(client *http.Client, req *http.Request) (*http.Response, error) { return client.Do(req) }
+	skillNewRequest      = http.NewRequestWithContext
+	skillResolveToken    = func(ctx context.Context, configDir string) (AccessTokenSnapshot, error) {
+		return ResolveAuxiliaryAccessTokenSnapshot(ctx, configDir, "")
+	}
 	skillResolveTargetPath = resolveSkillTargetPath
 	skillFetchDownloadInfo = fetchSkillDownloadInfo
 	skillDownloadFile      = downloadSkillFile
@@ -442,12 +443,14 @@ func runSkillAdd(cmd *cobra.Command, args []string) error {
 }
 
 func loadSkillAccessToken() (string, error) {
-	configDir := defaultConfigDir()
-	tokenData, err := skillLoadTokenData(configDir)
-	if err != nil || tokenData == nil || !tokenData.IsAccessTokenValid() {
+	snapshot, err := skillResolveToken(context.Background(), defaultConfigDir())
+	if err != nil {
+		return "", authResolutionError(err)
+	}
+	if strings.TrimSpace(snapshot.AccessToken) == "" {
 		return "", skillAuthError()
 	}
-	return tokenData.AccessToken, nil
+	return snapshot.AccessToken, nil
 }
 
 func skillAuthError() error {

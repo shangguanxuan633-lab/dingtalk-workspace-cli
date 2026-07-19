@@ -421,14 +421,6 @@ func newEventSource(ctx context.Context, configDir, clientID, clientSecret strin
 		})
 	}
 
-	token, err := eventResolveAccessToken(ctx, configDir, "")
-	if err != nil {
-		return nil, fmt.Errorf("event stream ticket: resolve user token: %w", err)
-	}
-	if strings.TrimSpace(token) == "" {
-		return nil, errors.New("event stream ticket: empty user token")
-	}
-
 	portalClientID := clientID
 	portalClientSecret := clientSecret
 	if streamOpts.usesPortalNormalMode() {
@@ -440,8 +432,10 @@ func newEventSource(ctx context.Context, configDir, clientID, clientSecret strin
 		ClientID:     portalClientID,
 		ClientSecret: portalClientSecret,
 		PortalTicket: &source.PortalTicketConfig{
-			TicketURL:    eventStreamTicketURL(streamOpts.TicketURL),
-			AccessToken:  token,
+			TicketURL: eventStreamTicketURL(streamOpts.TicketURL),
+			AccessTokenProvider: func(ctx context.Context) (string, error) {
+				return eventResolveAccessToken(ctx, configDir, "")
+			},
 			SourceID:     eventStreamSourceID(streamOpts.SourceID),
 			Mode:         streamOpts.Mode,
 			ClientID:     portalClientID,

@@ -333,7 +333,11 @@ func (r *recoveryRuntime) CallToolDirect(ctx context.Context, serverID, toolName
 	if err != nil {
 		return nil, err
 	}
-	tc := r.transport.WithAuth(resolveRuntimeAuthToken(ctx, recoveryRuntimeToken(r.flags)), resolveIdentityHeaders())
+	token, err := resolveRuntimeAuthToken(ctx, recoveryRuntimeToken(r.flags))
+	if err != nil {
+		return nil, authResolutionError(err)
+	}
+	tc := r.transport.WithAuth(token, resolveIdentityHeaders())
 	result, err := tc.CallTool(ctx, endpoint, toolName, args)
 	if err != nil {
 		return nil, err

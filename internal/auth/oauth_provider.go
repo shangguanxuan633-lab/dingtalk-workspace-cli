@@ -48,6 +48,7 @@ var (
 	oauthLoadTokenLocked = loadTokenDataForProfileLocked
 	oauthAcquireLock     = AcquireDualLock
 	oauthMarkProfile     = MarkProfileStatus
+	oauthDeleteRejected  = DeleteTokenDataIfAccessTokenMatches
 	oauthFetchClientID   = FetchClientIDFromMCP
 	oauthExchange        = func(p *OAuthProvider, ctx context.Context, code string) (*TokenData, error) {
 		return p.exchangeCode(ctx, code)
@@ -138,7 +139,10 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 					return refreshed, nil
 				}
 				if p.logger != nil {
-					p.logger.Warn(i18n.T("refresh_token 刷新失败，将尝试扫码登录"), "error", rErr)
+					p.logger.Warn(i18n.T("refresh_token 刷新失败，将尝试扫码登录"),
+						"failure_class", string(ClassifyRefreshFailure(rErr)),
+						"error_type", fmt.Sprintf("%T", rErr),
+					)
 				}
 			}
 		}
@@ -661,18 +665,29 @@ func (p *OAuthProvider) GetTokenSnapshot(ctx context.Context) (*TokenData, error
 			return refreshed, nil
 		}
 		failureClass := ClassifyRefreshFailure(rErr)
+		deleted, cleanupFailed := false, false
 		if failureClass == RefreshFailureTerminal {
-			_ = oauthMarkProfile(p.configDir, TokenProfileSelector(data), ProfileStatusExpired)
+			var deleteErr error
+			deleted, deleteErr = oauthDeleteRejected(ctx, p.configDir, data.AccessToken, data.Generation)
+			cleanupFailed = deleteErr != nil
+			if deleteErr != nil {
+				rErr = errors.Join(rErr, fmt.Errorf("cleanup terminal credential: %w", deleteErr))
+			}
 		}
 		if p.logger != nil {
 			p.logger.Warn("auth.token.refresh_failed",
 				"failure_class", string(failureClass),
 				"error_type", fmt.Sprintf("%T", rErr),
+				"credential_deleted", deleted,
+				"credential_cleanup_failed", cleanupFailed,
 			)
 		}
 		return nil, fmt.Errorf("%s: %w", i18n.T("refresh_token 刷新失败"), rErr)
 	} else {
-		_ = oauthMarkProfile(p.configDir, TokenProfileSelector(data), ProfileStatusExpired)
+		_, deleteErr := oauthDeleteRejected(ctx, p.configDir, data.AccessToken, data.Generation)
+		if deleteErr != nil {
+			return nil, fmt.Errorf("%s: %w", i18n.T("所有凭证已失效，请运行 dws auth login 重新登录"), errors.Join(ErrRefreshTokenExpired, deleteErr))
+		}
 	}
 
 	return nil, fmt.Errorf("%s: %w", i18n.T("所有凭证已失效，请运行 dws auth login 重新登录"), ErrRefreshTokenExpired)

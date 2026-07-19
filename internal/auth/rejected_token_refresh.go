@@ -16,7 +16,9 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
@@ -85,17 +87,23 @@ func DeleteTokenDataIfAccessTokenMatches(ctx context.Context, configDir, expecte
 
 	data, err := loadTokenDataUnderHeldLock(configDir, profile)
 	if err != nil {
+		if errors.Is(err, ErrTokenDataNotFound) || errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
 		return false, err
 	}
 	if data == nil || data.AccessToken != expectedAccessToken || !generationMatches(data.Generation, generation) {
 		return false, nil
 	}
 	hooks := edition.Get()
-	if hooks.DeleteToken != nil {
+	if editionTokenStoreConfigured(hooks) {
+		if err := validateEditionTokenStore(hooks); err != nil {
+			return false, err
+		}
 		if profile != "" {
 			return false, fmt.Errorf("profile selection is not supported by the current auth backend")
 		}
-		if err := hooks.DeleteToken(configDir); err != nil {
+		if err := deleteTokenViaHookTransaction(hooks, configDir); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -106,9 +114,51 @@ func DeleteTokenDataIfAccessTokenMatches(ctx context.Context, configDir, expecte
 	return true, nil
 }
 
+// MarkProfileExpiredIfAccessTokenMatches updates profile metadata only when
+// the rejected token+generation are still current under the auth dual lock.
+// It is the non-destructive counterpart of DeleteTokenDataIfAccessTokenMatches
+// for editions that retain expired profiles for diagnostics.
+func MarkProfileExpiredIfAccessTokenMatches(ctx context.Context, configDir, expectedAccessToken string, generation ...uint64) (bool, error) {
+	if strings.TrimSpace(configDir) == "" {
+		return false, fmt.Errorf("config directory is empty")
+	}
+	expectedAccessToken = strings.TrimSpace(expectedAccessToken)
+	if expectedAccessToken == "" {
+		return false, fmt.Errorf("expected access token is empty")
+	}
+	profile := strings.TrimSpace(RuntimeProfile())
+	lock, err := oauthAcquireLock(ctx, configDir)
+	if err != nil {
+		return false, fmt.Errorf("acquiring dual lock: %w", err)
+	}
+	defer lock.Release()
+
+	data, err := loadTokenDataUnderHeldLock(configDir, profile)
+	if err != nil {
+		if errors.Is(err, ErrTokenDataNotFound) || errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if data == nil || data.AccessToken != expectedAccessToken || !generationMatches(data.Generation, generation) {
+		return false, nil
+	}
+	selector := strings.TrimSpace(TokenProfileSelector(data))
+	if selector == "" || edition.Get().LoadToken != nil {
+		return false, nil
+	}
+	if err := markProfileStatusLocked(configDir, selector, ProfileStatusExpired); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func loadTokenDataUnderHeldLock(configDir, profile string) (*TokenData, error) {
 	hooks := edition.Get()
-	if hooks.LoadToken != nil {
+	if editionTokenStoreConfigured(hooks) {
+		if err := validateEditionTokenStore(hooks); err != nil {
+			return nil, err
+		}
 		if strings.TrimSpace(profile) != "" {
 			return nil, fmt.Errorf("profile selection is not supported by the current auth backend")
 		}

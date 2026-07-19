@@ -18,8 +18,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -315,7 +317,8 @@ var (
 	authLoadProfiles            = authpkg.LoadProfiles
 	authDeleteAllTokenData      = authpkg.DeleteAllTokenData
 	authDeleteTokenData         = authpkg.DeleteTokenData
-	authMarkProfileStatus       = authpkg.MarkProfileStatus
+	authDeleteRejectedToken     = authpkg.DeleteTokenDataIfAccessTokenMatches
+	authMarkRejectedProfile     = authpkg.MarkProfileExpiredIfAccessTokenMatches
 	authPortableExportSupported = authpkg.PortableExportSupported
 	authPortableSourceReady     = authpkg.PortableAuthSourceReady
 	authPortableTargetPopulated = authpkg.PortableAuthTargetPopulated
@@ -517,12 +520,47 @@ func newAuthStatusCommand() *cobra.Command {
 							tokenData = updatedData
 							refreshed = true
 						}
-					} else if edition.Get().AutoPurgeToken {
+					} else {
 						refreshFailure = refreshErr
-						_ = authDeleteTokenData(configDir)
-					} else if tokenData != nil {
-						refreshFailure = refreshErr
-						_ = authMarkProfileStatus(configDir, authpkg.TokenProfileSelector(tokenData), authpkg.ProfileStatusExpired)
+						failureClass := authpkg.ClassifyRefreshFailure(refreshErr)
+						cleanupOutcome := "preserved"
+						cleanupFailed := false
+						if failureClass == authpkg.RefreshFailureTerminal && tokenData != nil {
+							changed := false
+							var cleanupErr error
+							if edition.Get().AutoPurgeToken {
+								changed, cleanupErr = authDeleteRejectedToken(cmd.Context(), configDir, tokenData.AccessToken, tokenData.Generation)
+								if changed {
+									cleanupOutcome = "compare_deleted"
+								} else {
+									cleanupOutcome = "compare_skipped"
+								}
+							} else {
+								changed, cleanupErr = authMarkRejectedProfile(cmd.Context(), configDir, tokenData.AccessToken, tokenData.Generation)
+								if changed {
+									cleanupOutcome = "compare_marked_expired"
+								} else {
+									cleanupOutcome = "compare_skipped"
+								}
+							}
+							if cleanupErr != nil {
+								cleanupFailed = true
+								refreshFailure = errors.Join(refreshErr, cleanupErr)
+							}
+						}
+						oauthCode := ""
+						var endpointErr *authpkg.OAuthEndpointError
+						if errors.As(refreshErr, &endpointErr) {
+							oauthCode = strings.TrimSpace(endpointErr.Code)
+						}
+						slog.Warn("auth.status.refresh_failed",
+							"stage", "auth_status",
+							"failure_class", string(failureClass),
+							"oauth_code", oauthCode,
+							"error_type", fmt.Sprintf("%T", refreshErr),
+							"credential_outcome", cleanupOutcome,
+							"credential_cleanup_failed", cleanupFailed,
+						)
 					}
 				}
 				if refreshFailure == nil && authStatusAuthenticated(tokenData) {
@@ -1491,11 +1529,26 @@ func authStatusRefreshDiagnostic(err error) *authStatusDiagnostic {
 	if err == nil {
 		return nil
 	}
-	return &authStatusDiagnostic{
+	diagnostic := &authStatusDiagnostic{
 		Reason:  "token_refresh_failed",
-		Message: fmt.Sprintf("Token 刷新失败: %v", err),
-		Hint:    "请重新运行 dws auth login 完成授权。",
+		Message: "Token 刷新失败",
+		Hint:    "使用 --verbose 查看认证阶段日志；修复本地凭证或认证服务问题后重试。",
 	}
+	switch authpkg.ClassifyRefreshFailure(err) {
+	case authpkg.RefreshFailureTransient:
+		diagnostic.Reason = "token_refresh_transient"
+		diagnostic.Message = "Token 刷新暂时失败"
+		diagnostic.Hint = "网络、限流或认证服务暂时不可用；原登录态已保留，请稍后重试。"
+	case authpkg.RefreshFailureTerminal:
+		diagnostic.Reason = "login_required"
+		diagnostic.Message = "登录态已失效"
+		diagnostic.Hint = "请重新运行 dws auth login 完成授权。"
+	}
+	var endpointErr *authpkg.OAuthEndpointError
+	if errors.As(err, &endpointErr) && strings.TrimSpace(endpointErr.Code) != "" {
+		diagnostic.Message += "（OAuth code: " + strings.TrimSpace(endpointErr.Code) + "）"
+	}
+	return diagnostic
 }
 
 func writeAuthStatusJSON(w io.Writer, authenticated, refreshed bool, data *authpkg.TokenData, diagnostic *authStatusDiagnostic) error {

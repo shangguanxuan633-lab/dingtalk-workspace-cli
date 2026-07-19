@@ -64,7 +64,7 @@ func (r *runtimeRunner) maybeAuthRefreshRetry(
 	originalErr error,
 ) (executor.Result, error) {
 	if IsAuthRetrying(ctx) {
-		logAuthRefreshRecovery("retry_exhausted", invocation, authpkg.RefreshFailureUnknown, false, false)
+		logAuthRefreshRecovery("retry_exhausted", invocation, authpkg.RefreshFailureUnknown, originalErr, false, false)
 		return executor.Result{}, apperrors.NewAuth(
 			"access token was rejected after one refresh retry",
 			apperrors.WithOperation("tools/call"),
@@ -83,14 +83,11 @@ func (r *runtimeRunner) maybeAuthRefreshRetry(
 			cleanupFailed = deleteErr != nil
 		}
 		ResetRuntimeTokenCache()
-		logAuthRefreshRecovery("refresh_failed", invocation, failureClass, deleted, cleanupFailed)
-		return executor.Result{}, errors.Join(
-			originalErr,
-			fmt.Errorf("access token refresh failed (%s): %w", failureClass, refreshErr),
-		)
+		logAuthRefreshRecovery("refresh_failed", invocation, failureClass, refreshErr, deleted, cleanupFailed)
+		return executor.Result{}, authRefreshFailureError(originalErr, refreshErr, failureClass)
 	}
 	ResetRuntimeTokenCache()
-	logAuthRefreshRecovery("refresh_succeeded", invocation, authpkg.RefreshFailureUnknown, false, false)
+	logAuthRefreshRecovery("refresh_succeeded", invocation, authpkg.RefreshFailureUnknown, nil, false, false)
 	return r.executeInvocation(withAuthRetrying(ctx), endpoint, invocation)
 }
 
@@ -193,8 +190,12 @@ func authRefreshAllowed(sourceErr, originalErr error) bool {
 	if errors.As(sourceErr, &patScope) || errors.As(originalErr, &patScope) || isPatScopeError(sourceErr) || isPatScopeError(originalErr) {
 		return false
 	}
+	return authRefreshErrorAllowed(sourceErr) && authRefreshErrorAllowed(originalErr)
+}
+
+func authRefreshErrorAllowed(err error) bool {
 	var typed *apperrors.Error
-	if errors.As(originalErr, &typed) {
+	if errors.As(err, &typed) {
 		if typed.Reason == "http_403" || typed.RPCCode == http.StatusForbidden {
 			return false
 		}
@@ -206,16 +207,124 @@ func authRefreshAllowed(sourceErr, originalErr error) bool {
 	return true
 }
 
-func logAuthRefreshRecovery(outcome string, invocation executor.Invocation, class authpkg.RefreshFailureClass, credentialDeleted, cleanupFailed bool) {
+func authRefreshFailureError(originalErr, refreshErr error, class authpkg.RefreshFailureClass) error {
+	reason := "auth_refresh_failed"
+	message := "登录态刷新失败"
+	hint := "使用 --verbose 查看认证阶段日志后重试；原始凭证未被破坏性清理"
+	actions := []string{"dws auth status --verbose", "dws doctor --verbose"}
+	switch class {
+	case authpkg.RefreshFailureTransient:
+		reason = "auth_refresh_transient"
+		message = "登录态刷新暂时失败"
+		hint = "网络、限流或认证服务暂时不可用；稍后重试，原登录态已保留"
+	case authpkg.RefreshFailureTerminal:
+		reason = "login_required"
+		message = "登录态已失效"
+		hint = "运行 'dws auth login' 完成登录后重试"
+		actions = []string{"dws auth login"}
+	}
+	return apperrors.NewAuth(
+		message,
+		apperrors.WithOperation("tools/call.auth_refresh"),
+		apperrors.WithReason(reason),
+		apperrors.WithHint(hint),
+		apperrors.WithActions(actions...),
+		apperrors.WithCause(errors.Join(originalErr, refreshErr)),
+	)
+}
+
+func logAuthRefreshRecovery(outcome string, invocation executor.Invocation, class authpkg.RefreshFailureClass, cause error, credentialDeleted, cleanupFailed bool) {
+	reason, oauthCode, causeCategory := "", "", ""
+	var typed *apperrors.Error
+	if errors.As(cause, &typed) {
+		reason = typed.Reason
+		causeCategory = string(typed.Category)
+	}
+	var endpointErr *authpkg.OAuthEndpointError
+	if errors.As(cause, &endpointErr) {
+		oauthCode = strings.TrimSpace(endpointErr.Code)
+		causeCategory = "oauth_endpoint"
+	}
 	slog.Warn("runtime.auth_refresh_recovery",
+		"stage", "runtime_retry",
 		"outcome", outcome,
 		"failure_class", string(class),
+		"cause_category", causeCategory,
+		"reason", reason,
+		"oauth_code", oauthCode,
+		"error_type", fmtType(cause),
 		"product", invocation.CanonicalProduct,
 		"tool", invocation.Tool,
 		"profile_selected", strings.TrimSpace(authpkg.RuntimeProfile()) != "",
 		"credential_deleted", credentialDeleted,
 		"credential_cleanup_failed", cleanupFailed,
 	)
+}
+
+func fmtType(err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf("%T", err)
+}
+
+func (r *runtimeRunner) recoverAuthError(
+	ctx context.Context,
+	endpoint string,
+	invocation executor.Invocation,
+	rejected AccessTokenSnapshot,
+	hasPluginAuth bool,
+	sourceErr error,
+) (bool, executor.Result, error) {
+	if sourceErr == nil || !r.canAutoRefreshAuth(hasPluginAuth) || !authRefreshAllowed(sourceErr, sourceErr) {
+		return false, executor.Result{}, nil
+	}
+
+	marker, marked := authretry.As(sourceErr)
+	coreMarker, coreRejected := coreAuthRejectionFromError(sourceErr)
+	trustedAuthError := isAuthError(sourceErr)
+	if marked {
+		// ClassifyToolResult/preflight already supplied the explicit contract.
+		// Do not feed it through OnAuthError a second time.
+		cause := marker.Cause
+		if cause == nil {
+			cause = sourceErr
+		}
+		if !authRefreshAllowed(sourceErr, cause) {
+			return false, executor.Result{}, nil
+		}
+		result, err := r.maybeAuthRefreshRetry(ctx, endpoint, invocation, rejected, cause)
+		return true, result, err
+	}
+	if !coreRejected && !trustedAuthError {
+		// Timeouts, 5xx responses, and arbitrary transport/business failures
+		// are not proof that the access token was rejected. In particular, do
+		// not let a broad edition OnAuthError hook upgrade them into a refresh.
+		return false, executor.Result{}, nil
+	}
+	marker = coreMarker
+	resolved, hookErr := invokeEditionOnAuthError(defaultConfigDir(), sourceErr, marker)
+	if hookErr != nil {
+		// Preserve the pre-V2 hook contract for errors already categorized as
+		// authentication failures. A hook cannot replace an unrelated transport
+		// error unless it returns the explicit AuthRefreshRequired marker.
+		if coreRejected || isAuthError(sourceErr) {
+			return true, executor.Result{}, hookErr
+		}
+		return false, executor.Result{}, nil
+	}
+	if resolved == nil {
+		return false, executor.Result{}, nil
+	}
+	cause := resolved.Cause
+	if cause == nil {
+		cause = sourceErr
+	}
+	if !authRefreshAllowed(sourceErr, cause) {
+		return false, executor.Result{}, nil
+	}
+	result, err := r.maybeAuthRefreshRetry(ctx, endpoint, invocation, rejected, cause)
+	return true, result, err
 }
 
 func (r *runtimeRunner) canAutoRefreshAuth(hasPluginAuth bool) bool {

@@ -484,9 +484,13 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 	// reaches the execution boundary so read-only command inspection does not
 	// leave an audit lock handle behind (which prevents TempDir cleanup on
 	// Windows). Keep an injected sink when tests or editions provide one.
-	auditSink := r.auditSink
-	if auditSink == nil {
-		auditSink = setupAuditSink()
+	logicalAttempt := !IsAuthRetrying(ctx)
+	var auditSink audit.Sink
+	if logicalAttempt {
+		auditSink = r.auditSink
+		if auditSink == nil {
+			auditSink = setupAuditSink()
+		}
 	}
 
 	invokeStart := time.Now()
@@ -505,23 +509,25 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 
 	fl := r.transport.FileLogger
 
-	defer func() {
-		var errCat, errReason string
-		if retErr != nil {
-			var typed *apperrors.Error
-			if errors.As(retErr, &typed) {
-				errCat = string(typed.Category)
-				errReason = typed.Reason
-			} else {
-				errCat = "unknown"
-				errReason = retErr.Error()
+	if logicalAttempt {
+		defer func() {
+			var errCat, errReason string
+			if retErr != nil {
+				var typed *apperrors.Error
+				if errors.As(retErr, &typed) {
+					errCat = string(typed.Category)
+					errReason = typed.Reason
+				} else {
+					errCat = "unknown"
+					errReason = retErr.Error()
+				}
 			}
-		}
-		logging.LogCommandEnd(fl, execID,
-			invocation.CanonicalProduct, invocation.Tool,
-			retErr == nil, time.Since(invokeStart), errCat, errReason)
-		emitAudit(auditSink, execID, invokeStart, invocation, endpoint, retErr, version)
-	}()
+			logging.LogCommandEnd(fl, execID,
+				invocation.CanonicalProduct, invocation.Tool,
+				retErr == nil, time.Since(invokeStart), errCat, errReason)
+			emitAudit(auditSink, execID, invokeStart, invocation, endpoint, retErr, version)
+		}()
+	}
 
 	// Check if this product has plugin-level auth credentials registered.
 	// If so, use the plugin's token instead of the default DingTalk OAuth token.
@@ -545,8 +551,10 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 	if r.globalFlags != nil {
 		timeoutSec = r.globalFlags.Timeout
 	}
-	logging.LogCommandStart(fl, execID,
-		invocation.CanonicalProduct, invocation.Tool, endpoint, version, authToken != "", timeoutSec)
+	if logicalAttempt {
+		logging.LogCommandStart(fl, execID,
+			invocation.CanonicalProduct, invocation.Tool, endpoint, version, authToken != "", timeoutSec)
+	}
 
 	if invocation.DryRun {
 		// Emit a wukong-aligned human-readable preview on stderr so the dry-run
@@ -620,6 +628,12 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 			}
 			return runnerHandlePatAuthCheck(ctx, r, invocation, patCheck, defaultConfigDir(), os.Stderr)
 		}
+		if attempted, result, retryErr := r.recoverAuthError(ctx, endpoint, invocation, authSnapshot, hasPluginAuth, err); attempted {
+			if retryErr != nil {
+				runnerCaptureRuntimeFailure(invocation, err, retryErr)
+			}
+			return result, retryErr
+		}
 		runnerCaptureRuntimeFailure(invocation, err, err)
 		return executor.Result{}, err
 	}
@@ -628,19 +642,11 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 	callResult, err := runnerCallTool(tc, callCtx, endpoint, invocation.Tool, invocation.Params)
 	RecordTiming(ctx, "mcp_call", time.Since(callStart))
 	if err != nil {
-		if refresh, rejected := coreAuthRejectionFromError(err); rejected && r.canAutoRefreshAuth(hasPluginAuth) && authRefreshAllowed(err, refresh.Cause) {
-			resolvedRefresh, hookErr := invokeEditionOnAuthError(defaultConfigDir(), err, refresh)
-			if hookErr != nil {
-				runnerCaptureRuntimeFailure(invocation, err, hookErr)
-				return executor.Result{}, hookErr
+		if attempted, result, retryErr := r.recoverAuthError(ctx, endpoint, invocation, authSnapshot, hasPluginAuth, err); attempted {
+			if retryErr != nil {
+				runnerCaptureRuntimeFailure(invocation, err, retryErr)
 			}
-			if resolvedRefresh != nil {
-				result, retryErr := r.maybeAuthRefreshRetry(ctx, endpoint, invocation, authSnapshot, resolvedRefresh.Cause)
-				if retryErr != nil {
-					runnerCaptureRuntimeFailure(invocation, err, retryErr)
-				}
-				return result, retryErr
-			}
+			return result, retryErr
 		}
 		// PAT scope error: offer human-readable output and retry after authorization
 		if isPatScopeError(err) {
@@ -668,7 +674,7 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 				if cause == nil {
 					cause = editionErr
 				}
-				if coreRejected && r.canAutoRefreshAuth(hasPluginAuth) && authRefreshAllowed(editionErr, cause) {
+				if r.canAutoRefreshAuth(hasPluginAuth) && authRefreshAllowed(editionErr, cause) {
 					result, retryErr := r.maybeAuthRefreshRetry(ctx, endpoint, invocation, authSnapshot, cause)
 					if retryErr != nil {
 						runnerCaptureRuntimeFailure(invocation, editionErr, retryErr)
@@ -880,20 +886,41 @@ func authResolutionError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, authpkg.ErrTokenDataNotFound) || errors.Is(err, os.ErrNotExist) {
-		return apperrors.NewAuth(
-			"未登录，请先执行 dws auth login",
-			apperrors.WithReason("not_authenticated"),
-			apperrors.WithHint("运行 'dws auth login' 完成登录后重试"),
-			apperrors.WithActions("dws auth login"),
-			apperrors.WithCause(err),
-		)
+	reason := "auth_load_failed"
+	message := "无法读取登录态"
+	hint := "使用 --verbose 查看认证阶段日志；修复本地凭证读取错误后重试"
+	actions := []string{"dws auth status --verbose", "dws doctor --verbose"}
+	if errors.Is(err, authpkg.ErrTokenDataNotFound) || errors.Is(err, os.ErrNotExist) || errors.Is(err, authpkg.ErrRefreshTokenExpired) {
+		reason = "login_required"
+		message = "登录态不存在或已失效"
+		hint = "运行 'dws auth login' 完成登录后重试"
+		actions = []string{"dws auth login"}
+	} else if authpkg.ClassifyRefreshFailure(err) == authpkg.RefreshFailureTransient {
+		reason = "auth_refresh_transient"
+		message = "登录态刷新暂时失败"
+		hint = "网络、限流或认证服务暂时不可用；稍后重试，原登录态已保留"
+	} else if authpkg.ClassifyRefreshFailure(err) == authpkg.RefreshFailureTerminal {
+		reason = "login_required"
+		message = "登录态已失效"
+		hint = "运行 'dws auth login' 完成登录后重试"
+		actions = []string{"dws auth login"}
+	} else {
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) || errors.Is(err, authpkg.ErrTokenDecryption) {
+			reason = "auth_store_failed"
+			message = "本地登录态存储不可用"
+			hint = "检查 DWS_CONFIG_DIR、文件锁和凭证加密存储权限后重试"
+		}
+	}
+	var endpointErr *authpkg.OAuthEndpointError
+	if errors.As(err, &endpointErr) && strings.TrimSpace(endpointErr.Code) != "" {
+		message += "（OAuth code: " + strings.TrimSpace(endpointErr.Code) + "）"
 	}
 	return apperrors.NewAuth(
-		fmt.Sprintf("读取或刷新登录态失败: %v", err),
-		apperrors.WithReason("credential_resolution_failed"),
-		apperrors.WithHint("使用 --verbose 查看认证阶段日志；修复本地凭证存储、文件锁或刷新错误后重试"),
-		apperrors.WithActions("dws auth status --verbose", "dws doctor --verbose"),
+		message,
+		apperrors.WithReason(reason),
+		apperrors.WithHint(hint),
+		apperrors.WithActions(actions...),
 		apperrors.WithCause(err),
 	)
 }

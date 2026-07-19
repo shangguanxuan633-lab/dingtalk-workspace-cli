@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	"github.com/spf13/cobra"
 )
 
@@ -152,25 +151,25 @@ func TestCrossPlatformCoverageSkillCommandHighLevelRemainingCoverage(t *testing.
 
 func TestCrossPlatformCoverageSkillCommandLowLevelRemainingCoverage(t *testing.T) {
 	oldHTTP := skillHTTPDo
-	oldNewRequest, oldLoadToken := skillNewRequest, skillLoadTokenData
+	oldNewRequest, oldResolveToken := skillNewRequest, skillResolveToken
 	oldHome := skillUserHomeDir
 	oldMkdirTemp, oldCreate, oldCreateTemp := skillMkdirTemp, skillCreate, skillCreateTemp
 	oldRemoveAll, oldRemove, oldMkdir := skillRemoveAll, skillRemove, skillMkdirAll
 	oldOpen, oldCopy, oldZipOpen := skillOpenFile, skillCopy, skillOpenZipFile
 	t.Cleanup(func() {
 		skillHTTPDo = oldHTTP
-		skillNewRequest, skillLoadTokenData = oldNewRequest, oldLoadToken
+		skillNewRequest, skillResolveToken = oldNewRequest, oldResolveToken
 		skillUserHomeDir = oldHome
 		skillMkdirTemp, skillCreate, skillCreateTemp = oldMkdirTemp, oldCreate, oldCreateTemp
 		skillRemoveAll, skillRemove, skillMkdirAll = oldRemoveAll, oldRemove, oldMkdir
 		skillOpenFile, skillCopy, skillOpenZipFile = oldOpen, oldCopy, oldZipOpen
 	})
 	fail := errors.New("failure")
-	skillLoadTokenData = func(string) (*authpkg.TokenData, error) { return nil, nil }
+	skillResolveToken = func(context.Context, string) (AccessTokenSnapshot, error) { return AccessTokenSnapshot{}, nil }
 	if _, err := loadSkillAccessToken(); err == nil {
 		t.Fatal("invalid skill access token succeeded")
 	}
-	skillLoadTokenData = oldLoadToken
+	skillResolveToken = oldResolveToken
 	skillNewRequest = func(context.Context, string, string, io.Reader) (*http.Request, error) { return nil, fail }
 	if _, err := fetchSkillDownloadInfo(context.Background(), "token", "id"); err == nil {
 		t.Fatal("download-info request failure should propagate")

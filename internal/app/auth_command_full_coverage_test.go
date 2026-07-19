@@ -419,7 +419,8 @@ func TestCrossPlatformCoverageAuthCoverageStatusAndLogout(t *testing.T) {
 	oldStatus := authOAuthStatus
 	oldAccess := authOAuthAccessToken
 	oldDelete := authDeleteTokenData
-	oldMark := authMarkProfileStatus
+	oldDeleteRejected := authDeleteRejectedToken
+	oldMarkRejected := authMarkRejectedProfile
 	oldResolve := authResolveProfile
 	oldResolveDeletion := authResolveProfileDeletion
 	oldRevoke := authRevokeToken
@@ -434,7 +435,8 @@ func TestCrossPlatformCoverageAuthCoverageStatusAndLogout(t *testing.T) {
 		authOAuthStatus = oldStatus
 		authOAuthAccessToken = oldAccess
 		authDeleteTokenData = oldDelete
-		authMarkProfileStatus = oldMark
+		authDeleteRejectedToken = oldDeleteRejected
+		authMarkRejectedProfile = oldMarkRejected
 		authResolveProfile = oldResolve
 		authResolveProfileDeletion = oldResolveDeletion
 		authRevokeToken = oldRevoke
@@ -517,15 +519,27 @@ func TestCrossPlatformCoverageAuthCoverageStatusAndLogout(t *testing.T) {
 	authOAuthAccessToken = func(*authpkg.OAuthProvider, context.Context) (string, error) { return "", errors.New("refresh") }
 	deleted := false
 	marked := false
-	authDeleteTokenData = func(string) error { deleted = true; return errors.New("ignored") }
-	authMarkProfileStatus = func(string, string, string) error { marked = true; return errors.New("ignored") }
+	authDeleteRejectedToken = func(context.Context, string, string, ...uint64) (bool, error) {
+		deleted = true
+		return true, errors.New("cleanup")
+	}
+	authMarkRejectedProfile = func(context.Context, string, string, ...uint64) (bool, error) {
+		marked = true
+		return true, errors.New("cleanup")
+	}
 	edition.Override(&edition.Hooks{AutoPurgeToken: true})
+	if _, err := runStatus("table"); err != nil || deleted {
+		t.Fatalf("unknown refresh failure must be preserved: %v, deleted=%v", err, deleted)
+	}
+	authOAuthAccessToken = func(*authpkg.OAuthProvider, context.Context) (string, error) {
+		return "", &authpkg.OAuthEndpointError{StatusCode: 400, Code: "invalid_grant"}
+	}
 	if _, err := runStatus("table"); err != nil || !deleted {
-		t.Fatalf("auto-purge = %v, deleted=%v", err, deleted)
+		t.Fatalf("terminal auto-purge = %v, deleted=%v", err, deleted)
 	}
 	edition.Override(&edition.Hooks{})
 	if _, err := runStatus("table"); err != nil || !marked {
-		t.Fatalf("mark-expired = %v, marked=%v", err, marked)
+		t.Fatalf("terminal mark-expired = %v, marked=%v", err, marked)
 	}
 
 	authResolveProfileDeletion = func(string, string) (*authpkg.Profile, bool, error) { return nil, false, errors.New("missing") }

@@ -27,8 +27,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 )
 
 func TestResolveSkillTargetPath(t *testing.T) {
@@ -397,9 +395,11 @@ func TestSkillInstallRequiresAuth(t *testing.T) {
 	configDir := filepath.Join(tempDir, "config")
 	t.Setenv("DWS_CONFIG_DIR", configDir)
 	t.Cleanup(CloseFileLogger)
-	originalLoadToken := skillLoadTokenData
-	skillLoadTokenData = func(string) (*authpkg.TokenData, error) { return nil, errors.New("missing") }
-	t.Cleanup(func() { skillLoadTokenData = originalLoadToken })
+	originalResolveToken := skillResolveToken
+	skillResolveToken = func(context.Context, string) (AccessTokenSnapshot, error) {
+		return AccessTokenSnapshot{}, errors.New("missing")
+	}
+	t.Cleanup(func() { skillResolveToken = originalResolveToken })
 
 	// Ensure the config directory exists but has no token
 	if err := os.MkdirAll(configDir, 0755); err != nil {
@@ -679,16 +679,11 @@ func TestSkillSearchUsesSourceQueryAndKeepsScopesCompat(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "config")
 	t.Setenv("DWS_CONFIG_DIR", configDir)
 	t.Cleanup(CloseFileLogger)
-	originalLoadToken := skillLoadTokenData
-	skillLoadTokenData = func(string) (*authpkg.TokenData, error) {
-		return &authpkg.TokenData{
-			AccessToken:  "test-token",
-			RefreshToken: "refresh-token",
-			ExpiresAt:    time.Now().Add(time.Hour),
-			RefreshExpAt: time.Now().Add(24 * time.Hour),
-		}, nil
+	originalResolveToken := skillResolveToken
+	skillResolveToken = func(context.Context, string) (AccessTokenSnapshot, error) {
+		return AccessTokenSnapshot{AccessToken: "test-token", ExpiresAt: time.Now().Add(time.Hour)}, nil
 	}
-	t.Cleanup(func() { skillLoadTokenData = originalLoadToken })
+	t.Cleanup(func() { skillResolveToken = originalResolveToken })
 
 	var gotSources []string
 	var gotScopes []string

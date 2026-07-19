@@ -167,14 +167,17 @@ func TestPersonalSourceFetchTicketConnectsAndACKs(t *testing.T) {
 func TestPersonalSourceReconnectsWithFreshTicket(t *testing.T) {
 	var wsEndpoint string
 	var ticketCalls atomic.Int32
+	var tokenProviderCalls atomic.Int32
 	ackCh := make(chan int, 2)
+	ticketTokenCh := make(chan string, 2)
 	holdSecond := make(chan struct{})
 	var releaseSecondOnce sync.Once
 	releaseSecond := func() { releaseSecondOnce.Do(func() { close(holdSecond) }) }
 	upgrader := websocket.Upgrader{}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ticket", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/ticket", func(w http.ResponseWriter, r *http.Request) {
 		attempt := int(ticketCalls.Add(1))
+		ticketTokenCh <- r.Header.Get("x-user-access-token")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success": true,
 			"result": map[string]any{
@@ -212,7 +215,10 @@ func TestPersonalSourceReconnectsWithFreshTicket(t *testing.T) {
 	wsEndpoint = "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
 
 	src, err := NewPersonal(PersonalConfig{
-		AccessToken:  "token",
+		AccessTokenProvider: func(context.Context) (string, error) {
+			attempt := tokenProviderCalls.Add(1)
+			return fmt.Sprintf("token-%d", attempt), nil
+		},
 		ClientID:     "client",
 		SourceID:     "open",
 		TicketURL:    srv.URL + "/ticket",
@@ -249,6 +255,19 @@ func TestPersonalSourceReconnectsWithFreshTicket(t *testing.T) {
 	}
 	if got := ticketCalls.Load(); got != 2 {
 		t.Fatalf("ticket calls = %d, want 2", got)
+	}
+	if got := tokenProviderCalls.Load(); got != 2 {
+		t.Fatalf("token provider calls = %d, want 2", got)
+	}
+	for i := 1; i <= 2; i++ {
+		select {
+		case token := <-ticketTokenCh:
+			if want := fmt.Sprintf("token-%d", i); token != want {
+				t.Fatalf("ticket token %d = %q, want %q", i, token, want)
+			}
+		default:
+			t.Fatalf("missing ticket token %d", i)
+		}
 	}
 	if got := src.State().ReconnectCount; got != 1 {
 		t.Fatalf("reconnect count = %d, want 1", got)

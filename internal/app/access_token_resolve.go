@@ -309,7 +309,7 @@ func tokenProfileFingerprint(key tokenManagerKey) string {
 
 func noCredentialsError() error {
 	if edition.Get().IsEmbedded {
-		return fmt.Errorf("认证信息已失效，请重新认证")
+		return fmt.Errorf("认证信息已失效，请重新认证: %w", authpkg.ErrTokenDataNotFound)
 	}
-	return fmt.Errorf("no credentials found, run: dws auth login")
+	return fmt.Errorf("no credentials found, run: dws auth login: %w", authpkg.ErrTokenDataNotFound)
 }

@@ -144,7 +144,10 @@ func loadTokenDataKeychainAccount(account string) (*TokenData, error) {
 // stops the remote operation when existing ciphertext is already known to be
 // unreadable and therefore unsafe to update.
 func preflightTokenPersistence(configDir string) error {
-	if h := edition.Get(); h.SaveToken != nil {
+	if h := edition.Get(); editionTokenStoreConfigured(h) {
+		if err := validateEditionTokenStore(h); err != nil {
+			return fmt.Errorf("unsafe edition token store: %w", err)
+		}
 		return nil
 	}
 
@@ -195,7 +198,10 @@ func preflightTokenPersistence(configDir string) error {
 // An unrelated broken profile must not prevent the current profile from using
 // its still-valid credentials.
 func preflightTokenRefreshPersistence(configDir string, data *TokenData) error {
-	if h := edition.Get(); h.SaveToken != nil {
+	if h := edition.Get(); editionTokenStoreConfigured(h) {
+		if err := validateEditionTokenStore(h); err != nil {
+			return fmt.Errorf("unsafe edition token store: %w", err)
+		}
 		return nil
 	}
 	cfg, err := LoadProfiles(configDir)
