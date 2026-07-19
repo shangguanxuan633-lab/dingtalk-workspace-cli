@@ -298,23 +298,26 @@ func TestCrossPlatformCoveragePersonalEventRemainingStatusStopAndInterruptCovera
 
 func TestCrossPlatformCoveragePersonalEventRemainingIdentityAndSourceCoverage(t *testing.T) {
 	oldAux := personalResolveAuxiliaryAccessToken
+	oldAuxProfile := personalResolveAuxiliaryForProfile
 	oldLoad := personalLoadTokenData
 	oldClientID := personalClientID
 	oldCredentials := personalResolveAppCredentialsStrict
 	oldEdition := edition.Get()
 	t.Cleanup(func() {
 		personalResolveAuxiliaryAccessToken = oldAux
+		personalResolveAuxiliaryForProfile = oldAuxProfile
 		personalLoadTokenData = oldLoad
 		personalClientID = oldClientID
 		personalResolveAppCredentialsStrict = oldCredentials
 		edition.Override(oldEdition)
 	})
 	wantErr := errors.New("identity")
-	personalResolveAuxiliaryAccessToken = func(context.Context, string, string) (string, error) { return "", wantErr }
-	if _, err := resolvePersonalEventIdentity(context.Background(), "", ""); !errors.Is(err, wantErr) {
+	configDir := t.TempDir()
+	personalResolveAuxiliaryForProfile = func(context.Context, string, string, string) (string, error) { return "", wantErr }
+	if _, err := resolvePersonalEventIdentity(context.Background(), configDir, ""); !errors.Is(err, wantErr) {
 		t.Fatalf("aux token error = %v", err)
 	}
-	personalResolveAuxiliaryAccessToken = func(context.Context, string, string) (string, error) { return "access", nil }
+	personalResolveAuxiliaryForProfile = func(context.Context, string, string, string) (string, error) { return "access", nil }
 	personalLoadTokenData = func(string) (*authpkg.TokenData, error) { return nil, nil }
 	personalClientID = func() string { return "" }
 	personalResolveAppCredentialsStrict = func(string) (string, string, authpkg.CredentialSource, authpkg.CredentialSource, error) {
@@ -326,14 +329,14 @@ func TestCrossPlatformCoveragePersonalEventRemainingIdentityAndSourceCoverage(t 
 			"$currentUserId": func(context.Context) (string, bool) { return " user ", true },
 		}
 	}})
-	if got, err := resolvePersonalEventIdentity(context.Background(), "", "source"); err != nil || got.ClientID != "resolved" || got.CorpID != "corp" {
+	if got, err := resolvePersonalEventIdentity(context.Background(), configDir, "source"); err != nil || got.ClientID != "resolved" || got.CorpID != "corp" {
 		t.Fatalf("resolved identity = %#v, %v", got, err)
 	}
 	personalResolveAppCredentialsStrict = func(string) (string, string, authpkg.CredentialSource, authpkg.CredentialSource, error) {
 		return "", "", "", "", wantErr
 	}
 	edition.Override(&edition.Hooks{})
-	if _, err := resolvePersonalEventIdentity(context.Background(), "", ""); err == nil {
+	if _, err := resolvePersonalEventIdentity(context.Background(), configDir, ""); err == nil {
 		t.Fatal("missing client ID succeeded")
 	}
 	if got := resolveRuntimeDefault(context.Background(), "missing"); got != "" {

@@ -33,18 +33,15 @@ import (
 )
 
 func TestPersonalControlProductionProviderResolvesPerRequest(t *testing.T) {
-	oldResolve := personalResolveAuxiliaryAccessToken
-	t.Cleanup(func() { personalResolveAuxiliaryAccessToken = oldResolve })
+	oldResolve := personalResolveTokenLease
+	t.Cleanup(func() { personalResolveTokenLease = oldResolve })
 
 	var gotConfigDirs []string
 	var providerCalls atomic.Int32
-	personalResolveAuxiliaryAccessToken = func(_ context.Context, configDir, explicit string) (string, error) {
-		if explicit != "" {
-			t.Fatalf("explicit token = %q, want empty", explicit)
-		}
+	personalResolveTokenLease = func(_ context.Context, configDir, _ string) (personal.AccessTokenLease, error) {
 		gotConfigDirs = append(gotConfigDirs, configDir)
 		call := providerCalls.Add(1)
-		return "fresh-token-" + string(rune('0'+call)), nil
+		return personal.AccessTokenLease{AccessToken: "fresh-token-" + string(rune('0'+call))}, nil
 	}
 
 	var gotTokens []string
@@ -77,20 +74,20 @@ func TestPersonalControlProductionProviderResolvesPerRequest(t *testing.T) {
 
 func TestPortalSourceProductionProviderIsLazyAndPreservesCause(t *testing.T) {
 	oldNew := eventNewDingtalkSource
-	oldResolve := eventResolveAccessToken
+	oldResolve := eventResolveTokenLease
 	t.Cleanup(func() {
 		eventNewDingtalkSource = oldNew
-		eventResolveAccessToken = oldResolve
+		eventResolveTokenLease = oldResolve
 	})
 
 	wantErr := errors.New("keychain denied")
 	var providerCalls atomic.Int32
-	eventResolveAccessToken = func(_ context.Context, configDir, explicit string) (string, error) {
+	eventResolveTokenLease = func(_ context.Context, configDir, profile string) (source.AccessTokenLease, error) {
 		providerCalls.Add(1)
-		if configDir != "/config/profile-a" || explicit != "" {
-			t.Fatalf("resolve args = (%q, %q)", configDir, explicit)
+		if configDir != "/config/profile-a" || profile != "" {
+			t.Fatalf("resolve args = (%q, %q)", configDir, profile)
 		}
-		return "", wantErr
+		return source.AccessTokenLease{}, wantErr
 	}
 	var captured source.Config
 	eventNewDingtalkSource = func(cfg source.Config, _ ...source.SourceOption) (*source.DingtalkSource, error) {
@@ -105,13 +102,13 @@ func TestPortalSourceProductionProviderIsLazyAndPreservesCause(t *testing.T) {
 	if got := providerCalls.Load(); got != 0 {
 		t.Fatalf("provider called during construction = %d, want 0", got)
 	}
-	if captured.PortalTicket == nil || captured.PortalTicket.AccessTokenProvider == nil {
+	if captured.PortalTicket == nil || captured.PortalTicket.AccessTokenSnapshotProvider == nil {
 		t.Fatal("portal source did not receive a dynamic provider")
 	}
 	if captured.PortalTicket.AccessToken != "" {
 		t.Fatalf("portal source retained startup token %q", captured.PortalTicket.AccessToken)
 	}
-	_, err = captured.PortalTicket.AccessTokenProvider(t.Context())
+	_, err = captured.PortalTicket.AccessTokenSnapshotProvider(t.Context())
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("provider error = %v, want cause %v", err, wantErr)
 	}
@@ -122,10 +119,10 @@ func TestPortalSourceProductionProviderIsLazyAndPreservesCause(t *testing.T) {
 
 func TestPortalSourceProviderAndSpawnArgsKeepExactProfileLease(t *testing.T) {
 	oldNew := eventNewDingtalkSource
-	oldResolve := eventResolveTokenForProfile
+	oldResolve := eventResolveTokenLease
 	t.Cleanup(func() {
 		eventNewDingtalkSource = oldNew
-		eventResolveTokenForProfile = oldResolve
+		eventResolveTokenLease = oldResolve
 	})
 	var captured source.Config
 	eventNewDingtalkSource = func(cfg source.Config, _ ...source.SourceOption) (*source.DingtalkSource, error) {
@@ -133,18 +130,18 @@ func TestPortalSourceProviderAndSpawnArgsKeepExactProfileLease(t *testing.T) {
 		return &source.DingtalkSource{}, nil
 	}
 	var gotProfile string
-	eventResolveTokenForProfile = func(_ context.Context, configDir, explicit, profile string) (string, error) {
-		if configDir != "/config" || explicit != "" {
-			t.Fatalf("resolve args = (%q,%q)", configDir, explicit)
+	eventResolveTokenLease = func(_ context.Context, configDir, profile string) (source.AccessTokenLease, error) {
+		if configDir != "/config" {
+			t.Fatalf("resolve config dir = %q", configDir)
 		}
 		gotProfile = profile
-		return "token-b", nil
+		return source.AccessTokenLease{AccessToken: "token-b"}, nil
 	}
 	opts := eventStreamTicketOptions{Mode: "normal", SourceID: "open", Profile: "corp-b:user-b"}
 	if _, err := newEventSource(t.Context(), "/config", "portal", "", opts); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := captured.PortalTicket.AccessTokenProvider(t.Context()); err != nil {
+	if _, err := captured.PortalTicket.AccessTokenSnapshotProvider(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if gotProfile != "corp-b:user-b" {
@@ -164,15 +161,15 @@ func TestPortalSourceProviderAndSpawnArgsKeepExactProfileLease(t *testing.T) {
 }
 
 func TestPersonalSourceProductionProviderFailureStopsBeforeTicketHTTP(t *testing.T) {
-	oldResolve := personalResolveAuxiliaryAccessToken
-	t.Cleanup(func() { personalResolveAuxiliaryAccessToken = oldResolve })
+	oldResolve := personalResolveTokenLease
+	t.Cleanup(func() { personalResolveTokenLease = oldResolve })
 
 	wantErr := errors.New("refresh DNS failure")
-	personalResolveAuxiliaryAccessToken = func(_ context.Context, configDir, explicit string) (string, error) {
-		if configDir != "/config/profile-a" || explicit != "" {
-			t.Fatalf("resolve args = (%q, %q)", configDir, explicit)
+	personalResolveTokenLease = func(_ context.Context, configDir, profile string) (personal.AccessTokenLease, error) {
+		if configDir != "/config/profile-a" || profile != "" {
+			t.Fatalf("resolve args = (%q, %q)", configDir, profile)
 		}
-		return "", wantErr
+		return personal.AccessTokenLease{}, wantErr
 	}
 	var httpCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -231,7 +228,7 @@ func TestPersonalConsumeCleanupLogsDynamicTokenFailure(t *testing.T) {
 	oldDelete := personalDeleteSubscription
 	oldRemove := personalRemoveRunStates
 	oldConsume := personalConsumeRun
-	oldResolve := personalResolveAuxiliaryAccessToken
+	oldResolve := personalResolveTokenLease
 	oldLogger := slog.Default()
 	t.Cleanup(func() {
 		personalResolveEventIdentity = oldIdentity
@@ -240,7 +237,7 @@ func TestPersonalConsumeCleanupLogsDynamicTokenFailure(t *testing.T) {
 		personalDeleteSubscription = oldDelete
 		personalRemoveRunStates = oldRemove
 		personalConsumeRun = oldConsume
-		personalResolveAuxiliaryAccessToken = oldResolve
+		personalResolveTokenLease = oldResolve
 		slog.SetDefault(oldLogger)
 	})
 
@@ -259,9 +256,9 @@ func TestPersonalConsumeCleanupLogsDynamicTokenFailure(t *testing.T) {
 	personalConsumeRun = func(context.Context, consume.Config) error { return runErr }
 	authErr := errors.New("keychain unavailable")
 	var providerCalls atomic.Int32
-	personalResolveAuxiliaryAccessToken = func(context.Context, string, string) (string, error) {
+	personalResolveTokenLease = func(context.Context, string, string) (personal.AccessTokenLease, error) {
 		providerCalls.Add(1)
-		return "", authErr
+		return personal.AccessTokenLease{}, authErr
 	}
 
 	err := runPersonalEventConsume(newPersonalCoverageCommand(), personalConsumeOptions{EventKey: personal.EventMention})

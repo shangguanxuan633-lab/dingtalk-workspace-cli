@@ -28,6 +28,7 @@ import (
 	"time"
 
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/authlease"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 )
 
@@ -230,6 +231,24 @@ func ResolveAuxiliaryAccessTokenSnapshot(ctx context.Context, configDir, explici
 // facade used by long-running event, PAT, A2A, and skill clients.
 func ResolveAuxiliaryAccessTokenSnapshotForProfile(ctx context.Context, configDir, explicitToken, profile string) (AccessTokenSnapshot, error) {
 	return runtimeTokenManager.GetForProfile(ctx, configDir, explicitToken, profile)
+}
+
+func resolveEventAccessTokenLease(ctx context.Context, configDir, profile string) (authlease.Lease, error) {
+	snapshot, err := ResolveAuxiliaryAccessTokenSnapshotForProfile(ctx, configDir, "", profile)
+	if err != nil {
+		return authlease.Lease{}, err
+	}
+	lease := authlease.Lease{AccessToken: snapshot.AccessToken}
+	if snapshot.profilePinned && snapshot.Source == "oauth" && strings.TrimSpace(snapshot.AccessToken) != "" {
+		lease.RefreshRejected = func(refreshCtx context.Context) (string, error) {
+			refreshed, refreshErr := RefreshRejectedAccessTokenSnapshot(refreshCtx, configDir, snapshot)
+			if refreshErr != nil {
+				return "", refreshErr
+			}
+			return refreshed.AccessToken, nil
+		}
+	}
+	return lease, nil
 }
 
 func (m *TokenManager) Get(ctx context.Context, configDir, explicitToken string) (AccessTokenSnapshot, error) {

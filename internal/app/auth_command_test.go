@@ -1086,7 +1086,7 @@ func TestResolveAuthLoginConfigReadsInheritedYes(t *testing.T) {
 	}
 	if got := logs.String(); !strings.Contains(got, `"msg":"auth.login.request"`) ||
 		!strings.Contains(got, `"profile_selector":""`) ||
-		!strings.Contains(got, `"target_corp_id":""`) {
+		!strings.Contains(got, `"target_corp_id_present":false`) {
 		t.Fatalf("login request diagnostic log missing selector resolution:\n%s", got)
 	}
 }

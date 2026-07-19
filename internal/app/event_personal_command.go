@@ -139,6 +139,7 @@ var (
 		}
 		return ResolveAuxiliaryAccessTokenForProfile(ctx, configDir, explicitToken, profile)
 	}
+	personalResolveTokenLease           = resolveEventAccessTokenLease
 	personalLoadTokenData               = authpkg.LoadTokenData
 	personalClientID                    = authpkg.ClientID
 	personalResolveAppCredentialsStrict = authpkg.ResolveAppCredentialsStrict
@@ -798,6 +799,9 @@ func newPersonalEventControlClient(configDir, baseURL string, identity personal.
 	client.AccessTokenProvider = func(ctx context.Context) (string, error) {
 		return personalResolveAuxiliaryForProfile(ctx, configDir, "", profileLease)
 	}
+	client.AccessTokenSnapshotProvider = func(ctx context.Context) (personal.AccessTokenLease, error) {
+		return personalResolveTokenLease(ctx, configDir, profileLease)
+	}
 	return client
 }
 
@@ -855,6 +859,9 @@ func newPersonalStreamSource(ctx context.Context, opts personalStreamSourceOptio
 	return source.NewPersonal(source.PersonalConfig{
 		AccessTokenProvider: func(ctx context.Context) (string, error) {
 			return personalResolveAuxiliaryForProfile(ctx, opts.ConfigDir, "", profileLease)
+		},
+		AccessTokenSnapshotProvider: func(ctx context.Context) (source.AccessTokenLease, error) {
+			return personalResolveTokenLease(ctx, opts.ConfigDir, profileLease)
 		},
 		ClientID:     clientID,
 		ClientSecret: clientSecret,

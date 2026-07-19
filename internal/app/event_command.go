@@ -62,6 +62,7 @@ var (
 		}
 		return ResolveAuxiliaryAccessTokenForProfile(ctx, configDir, explicitToken, profile)
 	}
+	eventResolveTokenLease     = resolveEventAccessTokenLease
 	eventBusRun                = bus.Run
 	eventReadyFDFromEnv        = busctl.ReadyFDFromEnv
 	eventResolvePersonal       = resolvePersonalEventIdentity
@@ -491,6 +492,9 @@ func newEventSource(ctx context.Context, configDir, clientID, clientSecret strin
 			TicketURL: eventStreamTicketURL(streamOpts.TicketURL),
 			AccessTokenProvider: func(ctx context.Context) (string, error) {
 				return eventResolveTokenForProfile(ctx, configDir, "", streamOpts.Profile)
+			},
+			AccessTokenSnapshotProvider: func(ctx context.Context) (source.AccessTokenLease, error) {
+				return eventResolveTokenLease(ctx, configDir, streamOpts.Profile)
 			},
 			SourceID:     eventStreamSourceID(streamOpts.SourceID),
 			Mode:         streamOpts.Mode,

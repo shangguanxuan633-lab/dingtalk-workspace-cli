@@ -17,6 +17,7 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -29,33 +30,35 @@ import (
 	"time"
 
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/authlease"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/configmeta"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 	"github.com/spf13/cobra"
 )
 
 var (
-	skillLoadAccessToken = loadSkillAccessToken
-	skillDownloadToTmp   = downloadSkillToTmpDir
-	skillHTTPDo          = func(client *http.Client, req *http.Request) (*http.Response, error) { return client.Do(req) }
-	skillNewRequest      = http.NewRequestWithContext
-	skillResolveToken    = func(ctx context.Context, configDir string) (AccessTokenSnapshot, error) {
+	skillLoadTokenSnapshot = loadSkillAccessTokenSnapshot
+	skillDownloadToTmp     = downloadSkillToTmpDir
+	skillHTTPDo            = func(client *http.Client, req *http.Request) (*http.Response, error) { return client.Do(req) }
+	skillNewRequest        = http.NewRequestWithContext
+	skillResolveToken      = func(ctx context.Context, configDir string) (AccessTokenSnapshot, error) {
 		return ResolveAuxiliaryAccessTokenSnapshot(ctx, configDir, "")
 	}
-	skillResolveTargetPath = resolveSkillTargetPath
-	skillFetchDownloadInfo = fetchSkillDownloadInfo
-	skillDownloadFile      = downloadSkillFile
-	skillExtractZip        = extractSkillZip
-	skillUserHomeDir       = os.UserHomeDir
-	skillMkdirTemp         = os.MkdirTemp
-	skillCreate            = os.Create
-	skillCreateTemp        = os.CreateTemp
-	skillRemoveAll         = os.RemoveAll
-	skillRemove            = os.Remove
-	skillMkdirAll          = os.MkdirAll
-	skillOpenFile          = os.OpenFile
-	skillCopy              = io.Copy
-	skillOpenZipFile       = func(file *zip.File) (io.ReadCloser, error) { return file.Open() }
+	skillRefreshRejectedSnapshot = RefreshRejectedAccessTokenSnapshot
+	skillResolveTargetPath       = resolveSkillTargetPath
+	skillFetchDownloadInfo       = fetchSkillDownloadInfo
+	skillDownloadFile            = downloadSkillFile
+	skillExtractZip              = extractSkillZip
+	skillUserHomeDir             = os.UserHomeDir
+	skillMkdirTemp               = os.MkdirTemp
+	skillCreate                  = os.Create
+	skillCreateTemp              = os.CreateTemp
+	skillRemoveAll               = os.RemoveAll
+	skillRemove                  = os.Remove
+	skillMkdirAll                = os.MkdirAll
+	skillOpenFile                = os.OpenFile
+	skillCopy                    = io.Copy
+	skillOpenZipFile             = func(file *zip.File) (io.ReadCloser, error) { return file.Open() }
 )
 
 func init() {
@@ -297,7 +300,7 @@ func newSkillAddHintCommand() *cobra.Command {
 
 func runSkillGet(cmd *cobra.Command, args []string) error {
 	skillID, _ := cmd.Flags().GetString("skill-id")
-	accessToken, err := skillLoadAccessToken()
+	snapshot, err := skillLoadTokenSnapshot(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -305,7 +308,7 @@ func runSkillGet(cmd *cobra.Command, args []string) error {
 	apiURL := fmt.Sprintf("%s/cli/install?skillId=%s", skillAPIHost(), url.QueryEscape(strings.TrimSpace(skillID)))
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "⬇️  下载技能包...")
 
-	tmpDir, err := skillDownloadToTmp(cmd.Context(), apiURL, accessToken)
+	tmpDir, err := downloadSkillToTmpWithSnapshot(cmd.Context(), apiURL, snapshot)
 	if err != nil {
 		return err
 	}
@@ -320,7 +323,7 @@ func runSkillFind(cmd *cobra.Command, args []string) error {
 	if source == "" {
 		source, _ = cmd.Flags().GetString("scopes")
 	}
-	accessToken, err := skillLoadAccessToken()
+	snapshot, err := skillLoadTokenSnapshot(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -329,36 +332,55 @@ func runSkillFind(cmd *cobra.Command, args []string) error {
 	if source != "" {
 		apiURL += "&source=" + url.QueryEscape(source)
 	}
-	req, err := skillNewRequest(cmd.Context(), http.MethodGet, apiURL, nil)
-	if err != nil {
-		return apperrors.NewInternal(fmt.Sprintf("failed to create request: %v", err))
-	}
-	req.Header.Set("x-user-access-token", accessToken)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := skillHTTPDo(client, req)
-	if err != nil {
-		return apperrors.NewAPI(fmt.Sprintf("failed to search skills: %v", err), apperrors.WithRetryable(true))
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return parseLegacySkillAPIError(resp)
-	}
-
 	var result findSkillsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return apperrors.NewAPI(fmt.Sprintf("failed to parse search response: %v", err))
+	for attempt := 0; attempt < 2; attempt++ {
+		result = findSkillsResponse{}
+		req, reqErr := skillNewRequest(cmd.Context(), http.MethodGet, apiURL, nil)
+		if reqErr != nil {
+			return apperrors.NewInternal("failed to create skill search request")
+		}
+		req.Header.Set("x-user-access-token", snapshot.AccessToken)
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, doErr := skillHTTPDo(client, req)
+		if doErr != nil {
+			return apperrors.NewAPI("failed to search skills", apperrors.WithRetryable(true))
+		}
+		if resp.StatusCode != http.StatusOK {
+			statusErr := parseLegacySkillAPIError(resp)
+			_ = resp.Body.Close()
+			if attempt == 0 && isSkillAuthRejection(statusErr) && managedSkillSnapshot(snapshot) {
+				snapshot, err = refreshSkillSnapshot(cmd.Context(), snapshot)
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			return statusErr
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return apperrors.NewAPI("failed to parse skill search response")
+		}
+		if attempt == 0 && !result.Success && managedSkillSnapshot(snapshot) {
+			raw, _ := json.Marshal(map[string]any{"errorCode": result.ErrorCode})
+			if authlease.IsStrictRejection(http.StatusOK, raw) {
+				snapshot, err = refreshSkillSnapshot(cmd.Context(), snapshot)
+				if err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		break
 	}
 	if !result.Success {
-		errMsg := strings.TrimSpace(result.ErrorMsg)
-		if errMsg == "" {
-			errMsg = strings.TrimSpace(result.ErrorCode)
+		code := authlease.SafeDiagnosticCode(result.ErrorCode)
+		message := "failed to search skills"
+		if code != "" {
+			message += " (code " + code + ")"
 		}
-		if errMsg == "" {
-			errMsg = "unknown error"
-		}
-		return apperrors.NewAPI(fmt.Sprintf("failed to search skills: %s", errMsg))
+		return apperrors.NewAPI(message, apperrors.WithReason(code))
 	}
 
 	if len(result.Result) == 0 {
@@ -389,7 +411,7 @@ func runSkillAdd(cmd *cobra.Command, args []string) error {
 		return apperrors.NewValidation(fmt.Sprintf("invalid target '%s': %v. Supported targets: %s", target, err, supportedTargets()))
 	}
 
-	accessToken, err := skillLoadAccessToken()
+	snapshot, err := skillLoadTokenSnapshot(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -401,21 +423,18 @@ func runSkillAdd(cmd *cobra.Command, args []string) error {
 
 	// Step 1: Get download URL from API
 	fmt.Fprintf(w, "正在获取技能信息...\n")
-	downloadResp, err := skillFetchDownloadInfo(ctx, accessToken, skillID)
+	downloadResp, err := fetchSkillDownloadInfoWithSnapshot(ctx, snapshot, skillID)
 	if err != nil {
 		return err
 	}
 
 	if !downloadResp.Success {
-		errMsg := downloadResp.ErrorMsg
-		if errMsg == "" {
-			errMsg = downloadResp.ErrorCode
+		code := authlease.SafeDiagnosticCode(downloadResp.ErrorCode)
+		message := "failed to get skill download info"
+		if code != "" {
+			message += " (code " + code + ")"
 		}
-		if errMsg == "" {
-			errMsg = "unknown error"
-		}
-		return apperrors.NewAPI(fmt.Sprintf("failed to get skill download info: %s", errMsg),
-			apperrors.WithReason(downloadResp.ErrorCode))
+		return apperrors.NewAPI(message, apperrors.WithReason(code))
 	}
 
 	if downloadResp.Result == nil || downloadResp.Result.DownloadURL == "" {
@@ -443,7 +462,7 @@ func runSkillAdd(cmd *cobra.Command, args []string) error {
 }
 
 func loadSkillAccessToken() (string, error) {
-	snapshot, err := skillResolveToken(context.Background(), defaultConfigDir())
+	snapshot, err := loadSkillAccessTokenSnapshot(context.Background())
 	if err != nil {
 		return "", authResolutionError(err)
 	}
@@ -453,6 +472,17 @@ func loadSkillAccessToken() (string, error) {
 	return snapshot.AccessToken, nil
 }
 
+func loadSkillAccessTokenSnapshot(ctx context.Context) (AccessTokenSnapshot, error) {
+	snapshot, err := skillResolveToken(ctx, defaultConfigDir())
+	if err != nil {
+		return AccessTokenSnapshot{}, authResolutionError(err)
+	}
+	if strings.TrimSpace(snapshot.AccessToken) == "" {
+		return AccessTokenSnapshot{}, skillAuthError()
+	}
+	return snapshot, nil
+}
+
 func skillAuthError() error {
 	if edition.Get().IsEmbedded {
 		return apperrors.NewAuth("认证信息已失效",
@@ -460,8 +490,55 @@ func skillAuthError() error {
 			apperrors.WithHint("请先完成钉钉账号登录后重试"))
 	}
 	return apperrors.NewAuth("not logged in or token expired. Please run 'dws auth login' first",
+		apperrors.WithReason("not_authenticated"),
 		apperrors.WithHint("请先执行 'dws auth login' 登录"),
 		apperrors.WithActions("dws auth login"))
+}
+
+func managedSkillSnapshot(snapshot AccessTokenSnapshot) bool {
+	return snapshot.profilePinned && snapshot.Source == "oauth" && strings.TrimSpace(snapshot.AccessToken) != ""
+}
+
+func refreshSkillSnapshot(ctx context.Context, rejected AccessTokenSnapshot) (AccessTokenSnapshot, error) {
+	refreshed, err := skillRefreshRejectedSnapshot(ctx, defaultConfigDir(), rejected)
+	if err != nil {
+		return AccessTokenSnapshot{}, authResolutionError(err)
+	}
+	return refreshed, nil
+}
+
+func isSkillAuthRejection(err error) bool {
+	var typed *apperrors.Error
+	return errors.As(err, &typed) && typed != nil && typed.Category == apperrors.CategoryAuth && typed.Reason == "not_authenticated"
+}
+
+func fetchSkillDownloadInfoWithSnapshot(ctx context.Context, snapshot AccessTokenSnapshot, skillID string) (*downloadSkillResponse, error) {
+	result, err := skillFetchDownloadInfo(ctx, snapshot.AccessToken, skillID)
+	logicalRejection := false
+	if err == nil && result != nil && !result.Success {
+		raw, _ := json.Marshal(map[string]any{"errorCode": result.ErrorCode})
+		logicalRejection = authlease.IsStrictRejection(http.StatusOK, raw)
+	}
+	if (err == nil && !logicalRejection) || (err != nil && !isSkillAuthRejection(err)) || !managedSkillSnapshot(snapshot) {
+		return result, err
+	}
+	refreshed, refreshErr := refreshSkillSnapshot(ctx, snapshot)
+	if refreshErr != nil {
+		return nil, refreshErr
+	}
+	return skillFetchDownloadInfo(ctx, refreshed.AccessToken, skillID)
+}
+
+func downloadSkillToTmpWithSnapshot(ctx context.Context, apiURL string, snapshot AccessTokenSnapshot) (string, error) {
+	dir, err := skillDownloadToTmp(ctx, apiURL, snapshot.AccessToken)
+	if err == nil || !isSkillAuthRejection(err) || !managedSkillSnapshot(snapshot) {
+		return dir, err
+	}
+	refreshed, refreshErr := refreshSkillSnapshot(ctx, snapshot)
+	if refreshErr != nil {
+		return "", refreshErr
+	}
+	return skillDownloadToTmp(ctx, apiURL, refreshed.AccessToken)
 }
 
 func skillAPIHost() string {

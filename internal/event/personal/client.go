@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/authlease"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/config"
 )
 
@@ -54,6 +55,9 @@ type Identity struct {
 // that have not adopted dynamic token resolution yet.
 type AccessTokenProvider func(context.Context) (string, error)
 
+type AccessTokenLease = authlease.Lease
+type AccessTokenSnapshotProvider = authlease.Provider
+
 func (i Identity) Key() string {
 	corpID := strings.TrimSpace(i.CorpID)
 	userID := strings.TrimSpace(i.UserID)
@@ -69,10 +73,11 @@ func (i Identity) Key() string {
 }
 
 type Client struct {
-	BaseURL             string
-	HTTPClient          *http.Client
-	Identity            Identity
-	AccessTokenProvider AccessTokenProvider
+	BaseURL                     string
+	HTTPClient                  *http.Client
+	Identity                    Identity
+	AccessTokenProvider         AccessTokenProvider
+	AccessTokenSnapshotProvider AccessTokenSnapshotProvider
 }
 
 type CreateSubscriptionRequest struct {
@@ -378,7 +383,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 	if c == nil {
 		return errors.New("personal event: nil client")
 	}
-	accessToken, err := c.resolveAccessToken(ctx)
+	lease, err := c.resolveAccessTokenLease(ctx)
 	if err != nil {
 		return err
 	}
@@ -386,7 +391,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
-	var r io.Reader
+	var requestBody []byte
 	requestLog := ""
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -394,28 +399,50 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 			return fmt.Errorf("personal event: encode request: %w", err)
 		}
 		requestLog = sanitizeLogPayload(b)
-		r = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, u, r)
-	if err != nil {
-		return fmt.Errorf("personal event: create request: %w", err)
-	}
-	c.decorate(req, accessToken)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		requestBody = b
 	}
 	hc := c.HTTPClient
 	if hc == nil {
 		hc = http.DefaultClient
 	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return fmt.Errorf("personal event: send request: %w", err)
+	var resp *http.Response
+	var data []byte
+	for attempt := 0; attempt < 2; attempt++ {
+		var reader io.Reader
+		if requestBody != nil {
+			reader = bytes.NewReader(requestBody)
+		}
+		req, reqErr := http.NewRequestWithContext(ctx, method, u, reader)
+		if reqErr != nil {
+			return fmt.Errorf("personal event: create request: %w", reqErr)
+		}
+		c.decorate(req, lease.AccessToken)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		currentResp, doErr := hc.Do(req)
+		if doErr != nil {
+			return fmt.Errorf("personal event: send request: %w", doErr)
+		}
+		currentData, readErr := io.ReadAll(io.LimitReader(currentResp.Body, config.MaxResponseBodySize))
+		_ = currentResp.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("personal event: read response: %w", readErr)
+		}
+		if attempt == 0 && lease.RefreshRejected != nil &&
+			authlease.IsStrictRejection(currentResp.StatusCode, currentData) &&
+			personalControlRequestReplayable(method, path, requestBody) {
+			lease, err = authlease.RefreshRejected(ctx, lease, "personal_control_rejected_refresh")
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		resp, data = currentResp, currentData
+		break
 	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
-	if err != nil {
-		return fmt.Errorf("personal event: read response: %w", err)
+	if resp == nil {
+		return errors.New("personal event: request retry exhausted")
 	}
 	responseLog := sanitizeLogPayload(data)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -466,21 +493,37 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 	return json.Unmarshal(data, out)
 }
 
+func personalControlRequestReplayable(method, path string, body []byte) bool {
+	if method == http.MethodGet || method == http.MethodDelete {
+		return true
+	}
+	switch path {
+	case "/subscription/cancel":
+		return true
+	case "/subscription/user":
+		var request struct {
+			Ext map[string]any `json:"ext"`
+		}
+		if json.Unmarshal(body, &request) != nil || request.Ext == nil {
+			return false
+		}
+		key, _ := request.Ext["idempotencyKey"].(string)
+		return strings.TrimSpace(key) != ""
+	default:
+		return false
+	}
+}
+
+func (c *Client) resolveAccessTokenLease(ctx context.Context) (AccessTokenLease, error) {
+	return authlease.Resolve(ctx, c.AccessTokenSnapshotProvider, c.AccessTokenProvider, c.Identity.AccessToken, "personal_control_token_resolve")
+}
+
 func (c *Client) resolveAccessToken(ctx context.Context) (string, error) {
-	if c.AccessTokenProvider != nil {
-		token, err := c.AccessTokenProvider(ctx)
-		if err != nil {
-			return "", fmt.Errorf("personal event: resolve access token: %w", err)
-		}
-		if token = strings.TrimSpace(token); token != "" {
-			return token, nil
-		}
-		return "", errors.New("personal event: access token provider returned an empty token")
+	lease, err := c.resolveAccessTokenLease(ctx)
+	if err != nil {
+		return "", err
 	}
-	if token := strings.TrimSpace(c.Identity.AccessToken); token != "" {
-		return token, nil
-	}
-	return "", errors.New("personal event: access token is required")
+	return lease.AccessToken, nil
 }
 
 func (c *Client) decorate(req *http.Request, accessToken string) {

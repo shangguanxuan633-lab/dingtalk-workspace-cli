@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	dwsevent "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/dedup"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/transport"
@@ -239,7 +240,7 @@ func Run(ctx context.Context, cfg Config) error {
 	case <-ctx.Done():
 		log.Info("bus: shutdown requested by ctx", "reason", ctx.Err())
 	case err := <-srcErr:
-		log.Error("bus: source exited", "err", err)
+		log.Error("bus: source exited", safeSourceExitAttrs(err)...)
 		exitErr = err
 	case <-d.idleStop:
 		log.Info("bus: idle timeout reached, shutting down")
@@ -255,6 +256,25 @@ func Run(ctx context.Context, cfg Config) error {
 	<-dropWarnDone
 
 	return exitErr
+}
+
+func safeSourceExitAttrs(err error) []any {
+	attrs := []any{
+		"error_type", fmt.Sprintf("%T", err),
+		"failure_class", string(authpkg.ClassifyRefreshFailure(err)),
+		"http_status", authpkg.DiagnosticStatus(err),
+		"oauth_code", "",
+	}
+	var stageErr *authpkg.DiagnosticStageError
+	if errors.As(err, &stageErr) && stageErr != nil {
+		attrs = append(attrs, "stage", stageErr.Stage)
+		attrs[7] = authpkg.SafeOAuthDiagnosticCode(stageErr.OAuthCode)
+	}
+	var endpointErr *authpkg.OAuthEndpointError
+	if errors.As(err, &endpointErr) && endpointErr != nil {
+		attrs[7] = authpkg.SafeOAuthDiagnosticCode(endpointErr.Code)
+	}
+	return attrs
 }
 
 // daemon is the in-memory state of one bus run. Lifetime equals one Run() call.

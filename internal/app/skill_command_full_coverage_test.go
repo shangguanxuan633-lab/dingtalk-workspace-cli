@@ -36,7 +36,7 @@ func skillCoverageCommand() *cobra.Command {
 }
 
 func TestCrossPlatformCoverageSkillCommandHighLevelRemainingCoverage(t *testing.T) {
-	oldToken := skillLoadAccessToken
+	oldToken := skillLoadTokenSnapshot
 	oldTmp := skillDownloadToTmp
 	oldHTTP := skillHTTPDo
 	oldNewRequest := skillNewRequest
@@ -45,7 +45,7 @@ func TestCrossPlatformCoverageSkillCommandHighLevelRemainingCoverage(t *testing.
 	oldDownload := skillDownloadFile
 	oldExtract := skillExtractZip
 	t.Cleanup(func() {
-		skillLoadAccessToken = oldToken
+		skillLoadTokenSnapshot = oldToken
 		skillDownloadToTmp = oldTmp
 		skillHTTPDo = oldHTTP
 		skillNewRequest = oldNewRequest
@@ -56,11 +56,13 @@ func TestCrossPlatformCoverageSkillCommandHighLevelRemainingCoverage(t *testing.
 	})
 	fail := errors.New("failure")
 	cmd := skillCoverageCommand()
-	skillLoadAccessToken = func() (string, error) { return "", fail }
+	skillLoadTokenSnapshot = func(context.Context) (AccessTokenSnapshot, error) { return AccessTokenSnapshot{}, fail }
 	if err := runSkillGet(cmd, nil); !errors.Is(err, fail) {
 		t.Fatalf("skill get auth error = %v", err)
 	}
-	skillLoadAccessToken = func() (string, error) { return "token", nil }
+	skillLoadTokenSnapshot = func(context.Context) (AccessTokenSnapshot, error) {
+		return AccessTokenSnapshot{AccessToken: "token", Source: "explicit"}, nil
+	}
 	skillNewRequest = func(context.Context, string, string, io.Reader) (*http.Request, error) { return nil, fail }
 	if err := runSkillFind(cmd, nil); err == nil {
 		t.Fatal("skill find request failure should propagate")
@@ -71,11 +73,13 @@ func TestCrossPlatformCoverageSkillCommandHighLevelRemainingCoverage(t *testing.
 		t.Fatalf("skill get download error = %v", err)
 	}
 
-	skillLoadAccessToken = func() (string, error) { return "", fail }
+	skillLoadTokenSnapshot = func(context.Context) (AccessTokenSnapshot, error) { return AccessTokenSnapshot{}, fail }
 	if err := runSkillFind(cmd, nil); !errors.Is(err, fail) {
 		t.Fatalf("skill find auth error = %v", err)
 	}
-	skillLoadAccessToken = func() (string, error) { return "token", nil }
+	skillLoadTokenSnapshot = func(context.Context) (AccessTokenSnapshot, error) {
+		return AccessTokenSnapshot{AccessToken: "token", Source: "explicit"}, nil
+	}
 	skillHTTPDo = func(*http.Client, *http.Request) (*http.Response, error) { return nil, fail }
 	if err := runSkillFind(cmd, nil); err == nil {
 		t.Fatal("skill find network failure should propagate")
@@ -110,11 +114,13 @@ func TestCrossPlatformCoverageSkillCommandHighLevelRemainingCoverage(t *testing.
 		t.Fatal("invalid skill target should fail")
 	}
 	skillResolveTargetPath = func(string) (string, error) { return "dest", nil }
-	skillLoadAccessToken = func() (string, error) { return "", fail }
+	skillLoadTokenSnapshot = func(context.Context) (AccessTokenSnapshot, error) { return AccessTokenSnapshot{}, fail }
 	if err := runSkillAdd(cmd, []string{"id", "target"}); !errors.Is(err, fail) {
 		t.Fatalf("skill add auth error = %v", err)
 	}
-	skillLoadAccessToken = func() (string, error) { return "token", nil }
+	skillLoadTokenSnapshot = func(context.Context) (AccessTokenSnapshot, error) {
+		return AccessTokenSnapshot{AccessToken: "token", Source: "explicit"}, nil
+	}
 	skillFetchDownloadInfo = func(context.Context, string, string) (*downloadSkillResponse, error) { return nil, fail }
 	if err := runSkillAdd(cmd, []string{"id", "target"}); !errors.Is(err, fail) {
 		t.Fatalf("skill info error = %v", err)

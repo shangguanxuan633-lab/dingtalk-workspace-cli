@@ -28,7 +28,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	dwsevent "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/authlease"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/config"
 	"github.com/gorilla/websocket"
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/event"
@@ -42,24 +44,28 @@ const (
 )
 
 type PersonalConfig struct {
-	AccessToken         string
-	AccessTokenProvider AccessTokenProvider
-	ClientID            string
-	ClientSecret        string
-	SourceID            string
-	TicketURL           string
-	TicketMode          string
-	HTTPClient          *http.Client
-	WebSocketDialer     *websocket.Dialer
-	Now                 func() time.Time
-	ReconnectMin        time.Duration
-	ReconnectMax        time.Duration
+	AccessToken                 string
+	AccessTokenProvider         AccessTokenProvider
+	AccessTokenSnapshotProvider AccessTokenSnapshotProvider
+	ClientID                    string
+	ClientSecret                string
+	SourceID                    string
+	TicketURL                   string
+	TicketMode                  string
+	HTTPClient                  *http.Client
+	WebSocketDialer             *websocket.Dialer
+	Now                         func() time.Time
+	ReconnectMin                time.Duration
+	ReconnectMax                time.Duration
 }
 
 // AccessTokenProvider resolves the current user access token for one logical
 // ticket request. A configured provider takes precedence over the static token;
 // the static field remains only for backwards-compatible callers.
 type AccessTokenProvider func(context.Context) (string, error)
+
+type AccessTokenLease = authlease.Lease
+type AccessTokenSnapshotProvider = authlease.Provider
 
 type PersonalSource struct {
 	cfg     PersonalConfig
@@ -80,7 +86,7 @@ type ticketResponse struct {
 }
 
 func NewPersonal(cfg PersonalConfig) (*PersonalSource, error) {
-	if cfg.AccessTokenProvider == nil && strings.TrimSpace(cfg.AccessToken) == "" {
+	if cfg.AccessTokenSnapshotProvider == nil && cfg.AccessTokenProvider == nil && strings.TrimSpace(cfg.AccessToken) == "" {
 		return nil, errors.New("personal source: AccessToken or AccessTokenProvider is required")
 	}
 	if strings.TrimSpace(cfg.ClientID) == "" {
@@ -199,7 +205,7 @@ func (s *PersonalSource) runAttempt(ctx context.Context, emit dwsevent.EmitFn) (
 }
 
 func (s *PersonalSource) fetchTicket(ctx context.Context) (*ticketResponse, error) {
-	accessToken, err := resolveSourceAccessToken(ctx, s.cfg.AccessTokenProvider, s.cfg.AccessToken, "personal source")
+	lease, err := resolveSourceAccessTokenLease(ctx, s.cfg.AccessTokenSnapshotProvider, s.cfg.AccessTokenProvider, s.cfg.AccessToken, "personal_ticket_token_resolve")
 	if err != nil {
 		return nil, err
 	}
@@ -212,58 +218,63 @@ func (s *PersonalSource) fetchTicket(ctx context.Context) (*ticketResponse, erro
 		body["clientSecret"] = s.cfg.ClientSecret
 	}
 	b, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.TicketURL, bytes.NewReader(b))
-	if err != nil {
-		return nil, fmt.Errorf("personal source: create ticket request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("x-user-access-token", accessToken)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("X-DWS-Client-Id", s.cfg.ClientID)
-	req.Header.Set("X-DWS-Source-Id", s.cfg.SourceID)
-
-	resp, err := s.cfg.HTTPClient.Do(req)
-	if err != nil {
-		return nil, retryPersonal(fmt.Errorf("personal source: fetch ticket: %w", err))
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
-	if err != nil {
-		return nil, retryPersonal(fmt.Errorf("personal source: read ticket response: %w", err))
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err := fmt.Errorf("personal source: ticket HTTP %d", resp.StatusCode)
-		if retryableTicketStatus(resp.StatusCode) {
-			return nil, retryPersonal(err)
+	for attempt := 0; attempt < 2; attempt++ {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.TicketURL, bytes.NewReader(b))
+		if reqErr != nil {
+			return nil, authpkg.NewDiagnosticStageError("personal_ticket_request_build", reqErr)
 		}
-		return nil, err
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("x-user-access-token", lease.AccessToken)
+		req.Header.Set("Authorization", "Bearer "+lease.AccessToken)
+		req.Header.Set("X-DWS-Client-Id", s.cfg.ClientID)
+		req.Header.Set("X-DWS-Source-Id", s.cfg.SourceID)
+
+		resp, doErr := s.cfg.HTTPClient.Do(req)
+		if doErr != nil {
+			return nil, retryPersonal(fmt.Errorf("personal source: fetch ticket: %w", doErr))
+		}
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, retryPersonal(fmt.Errorf("personal source: read ticket response: %w", readErr))
+		}
+		if attempt == 0 && lease.RefreshRejected != nil && authlease.IsStrictRejection(resp.StatusCode, data) {
+			lease, err = authlease.RefreshRejected(ctx, lease, "personal_ticket_rejected_refresh")
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			httpErr := fmt.Errorf("personal source: ticket HTTP %d", resp.StatusCode)
+			if retryableTicketStatus(resp.StatusCode) {
+				return nil, retryPersonal(httpErr)
+			}
+			return nil, httpErr
+		}
+		ticket, decodeErr := decodeTicket(data)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if ticket.Endpoint == "" || ticket.Ticket == "" {
+			return nil, errors.New("personal source: ticket response missing endpoint or ticket")
+		}
+		return ticket, nil
 	}
-	ticket, err := decodeTicket(data)
-	if err != nil {
-		return nil, err
-	}
-	if ticket.Endpoint == "" || ticket.Ticket == "" {
-		return nil, errors.New("personal source: ticket response missing endpoint or ticket")
-	}
-	return ticket, nil
+	return nil, errors.New("personal source: ticket retry exhausted")
+}
+
+func resolveSourceAccessTokenLease(ctx context.Context, snapshotProvider AccessTokenSnapshotProvider, provider AccessTokenProvider, fallback, stage string) (AccessTokenLease, error) {
+	return authlease.Resolve(ctx, snapshotProvider, provider, fallback, stage)
 }
 
 func resolveSourceAccessToken(ctx context.Context, provider AccessTokenProvider, fallback, component string) (string, error) {
-	if provider != nil {
-		token, err := provider(ctx)
-		if err != nil {
-			return "", fmt.Errorf("%s: resolve access token: %w", component, err)
-		}
-		if token = strings.TrimSpace(token); token != "" {
-			return token, nil
-		}
-		return "", fmt.Errorf("%s: access token provider returned an empty token", component)
+	lease, err := resolveSourceAccessTokenLease(ctx, nil, provider, fallback, "event_token_resolve")
+	if err != nil {
+		return "", err
 	}
-	if token := strings.TrimSpace(fallback); token != "" {
-		return token, nil
-	}
-	return "", fmt.Errorf("%s: access token is required", component)
+	return lease.AccessToken, nil
 }
 
 func (s *PersonalSource) handleFrame(conn *websocket.Conn, data []byte, emit dwsevent.EmitFn) error {
@@ -357,7 +368,7 @@ func decodeTicket(data []byte) (*ticketResponse, error) {
 func endpointWithTicket(endpoint, ticket string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(endpoint))
 	if err != nil {
-		return "", fmt.Errorf("personal source: parse endpoint: %w", err)
+		return "", authpkg.NewDiagnosticStageError("personal_ticket_endpoint_parse", err)
 	}
 	if (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
 		return "", errors.New("personal source: ticket response contains invalid websocket endpoint")

@@ -143,7 +143,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 					logging.AuthDebug("auth.login.command.error", "stage", "manual_token_persist", "error", err)
 					logAuthLoginCommandFailure("manual_token_persist", err)
 					return apperrors.NewInternal("failed to persist auth token",
-						apperrors.WithReason("auth_token_persist_failed"), apperrors.WithCause(err))
+						apperrors.WithReason("auth_token_persist_failed"), apperrors.WithCause(authpkg.NewDiagnosticStageError("manual_token_persist", err)))
 				}
 			case cfg.Device:
 				loginCtx, cancel := context.WithTimeout(cmd.Context(), config.DeviceFlowTimeout)
@@ -160,7 +160,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 					logging.AuthDebug("auth.login.command.error", "stage", "device_login", "error", err)
 					logAuthLoginCommandFailure("device_login", err)
 					return apperrors.NewAuth("device authorization failed",
-						apperrors.WithReason("device_login_failed"), apperrors.WithCause(err))
+						apperrors.WithReason("device_login_failed"), apperrors.WithCause(authpkg.NewDiagnosticStageError("device_login", err)))
 				}
 			default:
 				loginCtx, cancel := context.WithTimeout(cmd.Context(), config.OAuthFlowTimeout)
@@ -179,7 +179,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 					logging.AuthDebug("auth.login.command.error", "stage", "oauth_login", "error", err)
 					logAuthLoginCommandFailure("oauth_login", err)
 					return apperrors.NewAuth("dingtalk login failed",
-						apperrors.WithReason("oauth_login_failed"), apperrors.WithCause(err))
+						apperrors.WithReason("oauth_login_failed"), apperrors.WithCause(authpkg.NewDiagnosticStageError("oauth_login", err)))
 				}
 			}
 
@@ -380,7 +380,7 @@ func applyAuthLoginGuideAction(cmd *cobra.Command, configDir string, action auth
 			logging.AuthDebug("auth.login.command.error", "stage", "app_credentials_persist", "error", err)
 			logAuthLoginCommandFailure("app_credentials_persist", err)
 			return apperrors.NewInternal("failed to persist app credentials",
-				apperrors.WithReason("app_credentials_persist_failed"), apperrors.WithCause(err))
+				apperrors.WithReason("app_credentials_persist_failed"), apperrors.WithCause(authpkg.NewDiagnosticStageError("app_credentials_persist", err)))
 		}
 		return nil
 	default:
@@ -591,6 +591,8 @@ func newAuthStatusCommand() *cobra.Command {
 			diagnostic := authStatusDiagnosticFromError(statusErr)
 			if refreshFailure != nil {
 				diagnostic = authStatusRefreshDiagnostic(refreshFailure)
+			} else if diagnostic == nil && tokenData != nil && !authStatusAuthenticated(tokenData) {
+				diagnostic = authStatusExpiredDiagnostic()
 			}
 
 			// Check if JSON output is requested
@@ -674,7 +676,8 @@ func newAuthMigrateKeychainCommand() *cobra.Command {
 			}
 			count, err := migrateKeychainToFileDEK(defaultConfigDir(), dryRun)
 			if err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("keychain migration failed: %v", err))
+				return apperrors.NewInternal("keychain migration failed",
+					apperrors.WithCause(authpkg.NewDiagnosticStageError("keychain_migration", err)))
 			}
 
 			result := struct {
@@ -727,18 +730,21 @@ func logoutOneProfile(_ *cobra.Command, ctx context.Context, configDir, selector
 		if strings.Contains(err.Error(), "not found") {
 			return apperrors.NewValidation(err.Error())
 		}
-		return apperrors.NewInternal(fmt.Sprintf("failed to clear token data: %v", err))
+		return apperrors.NewInternal("failed to clear token data",
+			apperrors.WithCause(authpkg.NewDiagnosticStageError("auth_logout", err)))
 	}
 	return nil
 }
 
 func logoutAllProfiles(_ *cobra.Command, ctx context.Context, configDir string) error {
 	if err := authEnsureProfilesMigration(configDir); err != nil {
-		return apperrors.NewInternal(fmt.Sprintf("failed to migrate profiles: %v", err))
+		return apperrors.NewInternal("failed to migrate profiles",
+			apperrors.WithCause(authpkg.NewDiagnosticStageError("profile_migration", err)))
 	}
 	cfg, err := authLoadProfiles(configDir)
 	if err != nil {
-		return apperrors.NewInternal(fmt.Sprintf("failed to load profiles: %v", err))
+		return apperrors.NewInternal("failed to load profiles",
+			apperrors.WithCause(authpkg.NewDiagnosticStageError("profile_load", err)))
 	}
 	if cfg == nil || len(cfg.Profiles) == 0 {
 		_ = authRevokeToken(ctx)
@@ -750,7 +756,8 @@ func logoutAllProfiles(_ *cobra.Command, ctx context.Context, configDir string) 
 		}
 	}
 	if err := authDeleteAllTokenData(configDir); err != nil {
-		return apperrors.NewInternal(fmt.Sprintf("failed to clear token data: %v", err))
+		return apperrors.NewInternal("failed to clear token data",
+			apperrors.WithCause(authpkg.NewDiagnosticStageError("auth_logout_all", err)))
 	}
 	return nil
 }
@@ -819,7 +826,8 @@ func newAuthExportCommandWithSupport(supportError func() error) *cobra.Command {
 
 			var bundle bytes.Buffer
 			if err := authExportPortableBundle(defaultConfigDir(), &bundle); err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to export auth bundle: %v", err))
+				return apperrors.NewInternal("failed to export auth bundle",
+					apperrors.WithCause(authpkg.NewDiagnosticStageError("auth_export", err)))
 			}
 
 			if asBase64 {
@@ -829,7 +837,8 @@ func newAuthExportCommandWithSupport(supportError func() error) *cobra.Command {
 					return err
 				}
 				if err := authAtomicWrite(output, payload, config.FilePerm); err != nil {
-					return apperrors.NewInternal(fmt.Sprintf("failed to write auth bundle: %v", err))
+					return apperrors.NewInternal("failed to write auth bundle",
+						apperrors.WithCause(authpkg.NewDiagnosticStageError("auth_export_write", err)))
 				}
 				fmt.Fprintf(cmd.OutOrStdout(), "[OK] 已导出认证包: %s\n", output)
 				fmt.Fprintf(cmd.ErrOrStderr(), "认证包含敏感凭据，用完请删除: rm -P %s\n", output)
@@ -837,7 +846,8 @@ func newAuthExportCommandWithSupport(supportError func() error) *cobra.Command {
 			}
 
 			if err := authAtomicWrite(output, bundle.Bytes(), config.FilePerm); err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to write auth bundle: %v", err))
+				return apperrors.NewInternal("failed to write auth bundle",
+					apperrors.WithCause(authpkg.NewDiagnosticStageError("auth_export_write", err)))
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "[OK] 已导出认证包: %s\n", output)
 			fmt.Fprintf(cmd.ErrOrStderr(), "认证包含敏感凭据，用完请删除: rm -P %s\n", output)
@@ -892,7 +902,8 @@ func newAuthImportCommandWithSupport(supportError func() error) *cobra.Command {
 
 			payload, err := authReadFile(input)
 			if err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to read auth bundle: %v", err))
+				return apperrors.NewInternal("failed to read auth bundle",
+					apperrors.WithCause(authpkg.NewDiagnosticStageError("auth_import_read", err)))
 			}
 			if asBase64 {
 				payload, err = base64.StdEncoding.DecodeString(strings.TrimSpace(string(payload)))
@@ -902,7 +913,8 @@ func newAuthImportCommandWithSupport(supportError func() error) *cobra.Command {
 			}
 			report, err := authImportPortableBundle(configDir, bytes.NewReader(payload))
 			if err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to import auth bundle: %v", err))
+				return apperrors.NewInternal("failed to import auth bundle",
+					apperrors.WithCause(authpkg.NewDiagnosticStageError("auth_import", err)))
 			}
 			if report.OSMismatch {
 				fmt.Fprintf(cmd.ErrOrStderr(), "警告: 认证包来自 %s，当前系统为 %s，请确认解密材料兼容\n", report.BundleOS, runtime.GOOS)
@@ -953,7 +965,7 @@ func newAuthExchangeCommand(caller edition.ToolCaller) *cobra.Command {
 				logging.AuthDebug("auth.login.command.error", "stage", "auth_code_exchange", "error", err)
 				logAuthLoginCommandFailure("auth_code_exchange", err)
 				return apperrors.NewAuth("failed to exchange authorization code",
-					apperrors.WithReason("auth_code_exchange_failed"), apperrors.WithCause(err))
+					apperrors.WithReason("auth_code_exchange_failed"), apperrors.WithCause(authpkg.NewDiagnosticStageError("auth_code_exchange", err)))
 			}
 			ResetRuntimeTokenCache()
 			clearCompatCache()
@@ -991,7 +1003,8 @@ func newAuthResetCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			configDir := defaultConfigDir()
 			if err := authDeleteAllTokenData(configDir); err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to reset token data: %v", err))
+				return apperrors.NewInternal("failed to reset token data",
+					apperrors.WithCause(authpkg.NewDiagnosticStageError("auth_reset", err)))
 			}
 			_ = authRemove(filepath.Join(configDir, "mcp_url"))
 			_ = authRemove(filepath.Join(configDir, "token"))
@@ -1369,6 +1382,8 @@ func enrichAuthLoginProfileFromContact(ctx context.Context, _ string, caller edi
 			"error", err,
 		)
 		if strings.TrimSpace(data.UserID) != "" {
+			slog.Warn("auth.login.identity.lookup_failed",
+				auxiliaryAuthDiagnosticAttrs("contact_identity_lookup", err)...)
 			return nil
 		}
 		return err
@@ -1523,6 +1538,13 @@ func authStatusDiagnosticFromError(err error) *authStatusDiagnostic {
 	if err == nil {
 		return nil
 	}
+	if isTrueMissingCredential(err) {
+		return &authStatusDiagnostic{
+			Reason:  "not_authenticated",
+			Message: "尚未登录",
+			Hint:    "请运行 dws auth login 完成授权。",
+		}
+	}
 	if keychain.IsCiphertextKeyMismatch(err) {
 		return &authStatusDiagnostic{
 			Reason:  "ciphertext_key_mismatch",
@@ -1548,6 +1570,14 @@ func authStatusDiagnosticFromError(err error) *authStatusDiagnostic {
 		Reason:  "keychain_unavailable",
 		Message: "无法读取 macOS Keychain 中的登录密钥，无法判断登录状态",
 		Hint:    "检查 macOS 默认钥匙串是否存在且已解锁；修复后重试，或在测试环境设置 DWS_DISABLE_KEYCHAIN=1 后重新登录。",
+	}
+}
+
+func authStatusExpiredDiagnostic() *authStatusDiagnostic {
+	return &authStatusDiagnostic{
+		Reason:  "login_required",
+		Message: "登录态已失效",
+		Hint:    "Access Token 与 Refresh Token 均不可用，请重新运行 dws auth login 完成授权。",
 	}
 }
 

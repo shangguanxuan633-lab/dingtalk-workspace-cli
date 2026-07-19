@@ -1653,6 +1653,11 @@ func TestCrossPlatformCoveragePersonalSubscriptionAndSourceCoverage(t *testing.T
 }
 
 func TestCrossPlatformCoveragePersonalEventCommandRuntimeCoverage(t *testing.T) {
+	oldLease := personalResolveTokenLease
+	t.Cleanup(func() { personalResolveTokenLease = oldLease })
+	personalResolveTokenLease = func(context.Context, string, string) (personal.AccessTokenLease, error) {
+		return personal.AccessTokenLease{AccessToken: "access"}, nil
+	}
 	configDir := setupPersonalIdentityToken(t, &authpkg.TokenData{
 		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
 		CorpID: "corp", UserID: "user", ClientID: "client",

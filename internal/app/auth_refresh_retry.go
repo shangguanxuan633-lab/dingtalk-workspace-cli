@@ -72,7 +72,7 @@ func (r *runtimeRunner) maybeAuthRefreshRetry(
 			apperrors.WithOperation("tools/call"),
 			apperrors.WithReason("auth_retry_exhausted"),
 			apperrors.WithHint("重新登录后重试；若持续失败，请携带 trace/exec ID 排查服务端认证"),
-			apperrors.WithCause(originalErr),
+			apperrors.WithCause(authpkg.NewDiagnosticStageError("runtime_retry_exhausted", originalErr)),
 		)
 	}
 	_, refreshErr := forceRefreshRejectedTokenForSnapshot(ctx, defaultConfigDir(), rejected)
@@ -339,7 +339,7 @@ func authRefreshFailureError(originalErr, refreshErr error, class authpkg.Refres
 		apperrors.WithReason(reason),
 		apperrors.WithHint(hint),
 		apperrors.WithActions(actions...),
-		apperrors.WithCause(errors.Join(originalErr, refreshErr)),
+		apperrors.WithCause(authpkg.NewDiagnosticStageError("runtime_rejected_token_refresh", errors.Join(originalErr, refreshErr))),
 	)
 }
 

@@ -643,7 +643,7 @@ func handlePatAuthCheck(
 					apperrors.WithOperation("pat/save_app_config"),
 					apperrors.WithReason("pat_app_config_store_failed"),
 					apperrors.WithHint("检查 DWS_CONFIG_DIR 与凭证存储权限后重试"),
-					apperrors.WithCause(err),
+					apperrors.WithCause(authpkg.NewDiagnosticStageError("pat_app_config_store", err)),
 				)
 			}
 		}

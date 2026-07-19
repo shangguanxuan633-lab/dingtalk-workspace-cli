@@ -24,6 +24,7 @@ import (
 
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/keychain"
 )
 
 // auxiliaryAuthDiagnosticAttrs returns only bounded, machine-readable auth
@@ -76,6 +77,18 @@ func classifyAuxiliaryAuthError(err error) string {
 	if errors.Is(err, authpkg.ErrRefreshTokenExpired) {
 		return "credentials_expired"
 	}
+	if keychain.IsCiphertextKeyMismatch(err) {
+		return "ciphertext_key_mismatch"
+	}
+	if keychain.IsDEKMissing(err) {
+		return "dek_missing"
+	}
+	if keychain.IsUnavailable(err) {
+		return "keychain_unavailable"
+	}
+	if errors.Is(err, authpkg.ErrTokenDecryption) {
+		return "token_decryption"
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout"
 	}
@@ -83,7 +96,11 @@ func classifyAuxiliaryAuthError(err error) string {
 		return "canceled"
 	}
 	if errors.Is(err, os.ErrPermission) {
-		return "permission_denied"
+		return "store_permission"
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return "store_io"
 	}
 	var endpointErr *authpkg.OAuthEndpointError
 	if errors.As(err, &endpointErr) {

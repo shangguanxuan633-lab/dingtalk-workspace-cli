@@ -986,7 +986,7 @@ func authResolutionError(err error) error {
 		apperrors.WithReason(reason),
 		apperrors.WithHint(hint),
 		apperrors.WithActions(actions...),
-		apperrors.WithCause(err),
+		apperrors.WithCause(authpkg.NewDiagnosticStageError("token_resolution", err)),
 	)
 }
 

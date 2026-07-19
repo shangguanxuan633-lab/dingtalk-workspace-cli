@@ -41,10 +41,11 @@ func TestAuthMigrateKeychainRemainingBranches(t *testing.T) {
 		t.Fatalf("unsupported target error = %v", err)
 	}
 
-	migrateKeychainToFileDEK = func(string, bool) (int, error) { return 0, errors.New("backend") }
+	backendErr := errors.New("backend-secret")
+	migrateKeychainToFileDEK = func(string, bool) (int, error) { return 0, backendErr }
 	root, _ = newRoot("text")
 	root.SetArgs([]string{"migrate-keychain", "--dry-run"})
-	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "backend") {
+	if err := root.Execute(); err == nil || strings.Contains(err.Error(), backendErr.Error()) || !errors.Is(err, backendErr) {
 		t.Fatalf("migration backend error = %v", err)
 	}
 	migrateKeychainToFileDEK = func(string, bool) (int, error) { return 3, nil }
