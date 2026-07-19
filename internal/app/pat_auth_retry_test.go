@@ -545,6 +545,23 @@ func (m *mockRunner) Run(ctx context.Context, inv executor.Invocation) (executor
 func setupHandlePATServer(t *testing.T, terminalStatus string, authCode string) (*httptest.Server, string) {
 	t.Helper()
 	var pollCount atomic.Int32
+	previousResolve := patResolveAccessToken
+	patResolveAccessToken = func(context.Context, string) (string, error) {
+		return "", authpkg.ErrTokenDataNotFound
+	}
+	previousExchange := patExchangeCodeForToken
+	patExchangeCodeForToken = func(_ context.Context, _ string, code string) (*authpkg.TokenData, error) {
+		return &authpkg.TokenData{
+			AccessToken:  "pat-test-access-" + code,
+			RefreshToken: "pat-test-refresh",
+			ExpiresAt:    time.Now().Add(time.Hour),
+			RefreshExpAt: time.Now().Add(24 * time.Hour),
+		}, nil
+	}
+	t.Cleanup(func() {
+		patResolveAccessToken = previousResolve
+		patExchangeCodeForToken = previousExchange
+	})
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/cli/oauth/device/poll") {

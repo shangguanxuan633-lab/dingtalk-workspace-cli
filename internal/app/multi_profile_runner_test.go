@@ -14,7 +14,7 @@ func TestRuntimeRunnerAggregatesCommaSeparatedProfiles(t *testing.T) {
 		authLogoutTestToken("corp_a"),
 		authLogoutTestToken("corp_b"),
 	)
-	authpkg.SetRuntimeProfile("corp_a, corp_b")
+	setMultiProfileRuntimeProfile(t, "corp_a, corp_b")
 
 	runner := &runtimeRunner{fallback: multiProfileFallbackRunner{}}
 	result, err := runner.Run(context.Background(), executor.Invocation{
@@ -54,12 +54,15 @@ func TestRuntimeRunnerAggregatesCommaSeparatedProfiles(t *testing.T) {
 		if resultPayload["runtimeProfile"] != wantProfile {
 			t.Fatalf("profiles[%d].result.runtimeProfile = %#v, want %q", i, resultPayload["runtimeProfile"], wantProfile)
 		}
+		if resultPayload["globalRuntimeProfile"] != "corp_a, corp_b" {
+			t.Fatalf("profiles[%d].result.globalRuntimeProfile = %#v, want raw selector preserved", i, resultPayload["globalRuntimeProfile"])
+		}
 	}
 }
 
 func TestRuntimeRunnerDeduplicatesCommaSeparatedProfilesByCorpID(t *testing.T) {
 	configDir := setupAuthLogoutProfiles(t, authLogoutTestToken("corp_a"), authLogoutTestToken("corp_b"))
-	authpkg.SetRuntimeProfile("corp_a, corp_a org,corp_b")
+	setMultiProfileRuntimeProfile(t, "corp_a, corp_a org,corp_b")
 
 	selections, multi, err := resolveMultiProfileSelections(configDir, authpkg.RuntimeProfile())
 	if err != nil {
@@ -109,7 +112,7 @@ func TestRuntimeRunnerDeduplicatesByResolvedIdentityInSameCorp(t *testing.T) {
 
 func TestRuntimeRunnerKeepsSingleProfileBehavior(t *testing.T) {
 	setupAuthLogoutProfiles(t, authLogoutTestToken("corp_a"), authLogoutTestToken("corp_b"))
-	authpkg.SetRuntimeProfile("corp_a")
+	setMultiProfileRuntimeProfile(t, "corp_a")
 
 	runner := &runtimeRunner{fallback: multiProfileFallbackRunner{}}
 	result, err := runner.Run(context.Background(), executor.Invocation{
@@ -126,6 +129,9 @@ func TestRuntimeRunnerKeepsSingleProfileBehavior(t *testing.T) {
 	if got := result.Response["content"].(map[string]any)["runtimeProfile"]; got != "corp_a:user-corp_a" {
 		t.Fatalf("fallback runtime profile = %#v, want exact identity selector", got)
 	}
+	if got := result.Response["content"].(map[string]any)["globalRuntimeProfile"]; got != "corp_a" {
+		t.Fatalf("fallback global runtime profile = %#v, want raw selector preserved", got)
+	}
 	if got := authpkg.RuntimeProfile(); got != "corp_a" {
 		t.Fatalf("runtime profile after Run = %q, want corp_a", got)
 	}
@@ -137,7 +143,7 @@ func TestRuntimeRunnerRejectsAmbiguousSingleProfile(t *testing.T) {
 	second := authLogoutTestToken("corp_second")
 	second.CorpName = "Shared Org"
 	setupAuthLogoutProfiles(t, first, second)
-	authpkg.SetRuntimeProfile("Shared Org")
+	setMultiProfileRuntimeProfile(t, "Shared Org")
 
 	runner := &runtimeRunner{fallback: multiProfileFallbackRunner{}}
 	_, err := runner.Run(context.Background(), executor.Invocation{
@@ -193,15 +199,27 @@ func TestCommaSeparatedProfileRejectsEmptySelector(t *testing.T) {
 
 type multiProfileFallbackRunner struct{}
 
-func (multiProfileFallbackRunner) Run(_ context.Context, invocation executor.Invocation) (executor.Result, error) {
+func (multiProfileFallbackRunner) Run(ctx context.Context, invocation executor.Invocation) (executor.Result, error) {
+	requestProfile, ok := logicalProfile(ctx)
+	if !ok {
+		requestProfile = authpkg.RuntimeProfile()
+	}
 	invocation.Implemented = true
 	return executor.Result{
 		Invocation: invocation,
 		Response: map[string]any{
 			"content": map[string]any{
-				"runtimeProfile": authpkg.RuntimeProfile(),
-				"tool":           invocation.Tool,
+				"runtimeProfile":       requestProfile,
+				"globalRuntimeProfile": authpkg.RuntimeProfile(),
+				"tool":                 invocation.Tool,
 			},
 		},
 	}, nil
+}
+
+func setMultiProfileRuntimeProfile(t *testing.T, profile string) {
+	t.Helper()
+	previous := authpkg.RuntimeProfile()
+	authpkg.SetRuntimeProfile(profile)
+	t.Cleanup(func() { authpkg.SetRuntimeProfile(previous) })
 }
