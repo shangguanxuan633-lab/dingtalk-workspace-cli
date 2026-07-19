@@ -168,7 +168,7 @@ func TestCrossPlatformCoverageAppTokenEdges(t *testing.T) {
 		t.Fatalf("FetchAppToken = %q %d %v", token, expires, err)
 	}
 	response(http.StatusBadGateway, strings.Repeat("x", 250))
-	if _, _, err := FetchAppToken(context.Background(), "key", "secret"); err == nil || !strings.Contains(err.Error(), "...") {
+	if _, _, err := FetchAppToken(context.Background(), "key", "secret"); err == nil || !strings.Contains(err.Error(), "Bad Gateway") || strings.Contains(err.Error(), "xxx") {
 		t.Fatalf("HTTP app token error = %v", err)
 	}
 	response(http.StatusOK, "{")

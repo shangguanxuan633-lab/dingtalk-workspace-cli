@@ -15,7 +15,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -163,15 +162,17 @@ func loadTokenDataUnderHeldLock(configDir, profile string) (*TokenData, error) {
 		if err := validateEditionTokenStore(hooks); err != nil {
 			return nil, err
 		}
-		blob, err := loadEditionToken(hooks, configDir, profile)
+		var blob []byte
+		var err error
+		if hooks.TokenStoreV2 != nil {
+			blob, err = loadEditionTokenV2Locked(hooks, configDir, profile)
+		} else {
+			blob, err = loadEditionToken(hooks, configDir, profile)
+		}
 		if err != nil {
 			return nil, err
 		}
-		var data TokenData
-		if err := json.Unmarshal(blob, &data); err != nil {
-			return nil, fmt.Errorf("parse token data from hook: %w", err)
-		}
-		return &data, nil
+		return parseEditionTokenBlob(blob)
 	}
 	return loadTokenDataForProfileLocked(configDir, profile)
 }

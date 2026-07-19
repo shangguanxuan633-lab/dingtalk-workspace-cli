@@ -258,6 +258,53 @@ func TestEditionTokenStoreV2ABProfileLifecycleAndPinnedRefresh(t *testing.T) {
 	}
 }
 
+func TestEditionTokenStoreV2ExpiredSnapshotRefreshesThroughLockedHookLoader(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	previousRefresh := oauthRefreshToken
+	store := &memoryProfileTokenStoreV2{}
+	edition.Override(store.hooks(nil))
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+		oauthRefreshToken = previousRefresh
+	})
+	configDir := t.TempDir()
+	SetRuntimeProfile("ding-a")
+	expired := v2ProfileToken("ding-a", "user-a", "old")
+	expired.ExpiresAt = time.Now().Add(-time.Minute)
+	if err := SaveTokenData(configDir, expired); err != nil {
+		t.Fatal(err)
+	}
+	var refreshes atomic.Int32
+	oauthRefreshToken = func(p *OAuthProvider, _ context.Context, current *TokenData) (*TokenData, error) {
+		refreshes.Add(1)
+		updated := *current
+		updated.AccessToken = "new"
+		updated.RefreshToken = "refresh-new"
+		updated.ExpiresAt = time.Now().Add(time.Hour)
+		if err := saveTokenDataLockedForProfile(p.configDir, p.runtimeProfile(), &updated); err != nil {
+			return nil, err
+		}
+		return &updated, nil
+	}
+	provider := NewOAuthProviderForProfile(configDir, nil, "ding-a:user-a")
+	snapshot, err := provider.GetTokenSnapshot(context.Background())
+	if err != nil || snapshot.AccessToken != "new" {
+		t.Fatalf("GetTokenSnapshot() = %#v, %v", snapshot, err)
+	}
+	if refreshes.Load() != 1 {
+		t.Fatalf("refreshes = %d", refreshes.Load())
+	}
+	store.mu.Lock()
+	blob := append([]byte(nil), store.blobs["ding-a:user-a"]...)
+	store.mu.Unlock()
+	persisted, err := parseEditionTokenBlob(blob)
+	if err != nil || persisted.AccessToken != "new" {
+		t.Fatalf("persisted refreshed blob = %#v, %v", persisted, err)
+	}
+}
+
 func TestEditionTokenStoreV2MigratesLegacyEmptyOAuthSlot(t *testing.T) {
 	previous := edition.Get()
 	store := &memoryProfileTokenStoreV2{}
@@ -406,6 +453,81 @@ func TestEditionTokenStoreV2LogoutAllSweepsKnownAndOrphanSlots(t *testing.T) {
 	if _, present, err := ReadTokenMarkerGeneration(configDir); err != nil || present {
 		t.Fatalf("marker after logout-all present=%v err=%v", present, err)
 	}
+}
+
+func TestEditionTokenStoreV2LogoutAllRollsBackCorePublicationFailures(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	store := &memoryProfileTokenStoreV2{}
+	hooks := store.hooks(nil)
+	edition.Override(hooks)
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+	})
+	configDir := t.TempDir()
+	SetRuntimeProfile("ding-a")
+	seed := v2ProfileToken("ding-a", "user-a", "a")
+	if err := SaveTokenData(configDir, seed); err != nil {
+		t.Fatal(err)
+	}
+	assertRestored := func(t *testing.T) {
+		t.Helper()
+		loaded, err := LoadTokenDataForProfile(configDir, "ding-a:user-a")
+		if err != nil || loaded.AccessToken != "a" {
+			t.Fatalf("credential not restored = %#v, %v", loaded, err)
+		}
+		profiles, err := LoadProfiles(configDir)
+		if err != nil || len(profiles.Profiles) != 1 {
+			t.Fatalf("profiles not restored = %#v, %v", profiles, err)
+		}
+		if _, present, err := ReadTokenMarkerGeneration(configDir); err != nil || !present {
+			t.Fatalf("marker not restored present=%v err=%v", present, err)
+		}
+	}
+
+	t.Run("profiles publication", func(t *testing.T) {
+		original := tokenSaveProfiles
+		failure := errors.New("profiles publish failed")
+		calls := 0
+		tokenSaveProfiles = func(dir string, cfg *ProfilesConfig) error {
+			calls++
+			if calls == 1 {
+				return failure
+			}
+			return original(dir, cfg)
+		}
+		err := DeleteAllTokenData(configDir)
+		tokenSaveProfiles = original
+		if !errors.Is(err, failure) {
+			t.Fatalf("DeleteAllTokenData() = %v", err)
+		}
+		assertRestored(t)
+	})
+
+	t.Run("marker publication", func(t *testing.T) {
+		original := tokenDeleteMarker
+		failure := errors.New("marker delete failed")
+		tokenDeleteMarker = func(string) error { return failure }
+		err := DeleteAllTokenData(configDir)
+		tokenDeleteMarker = original
+		if !errors.Is(err, failure) {
+			t.Fatalf("DeleteAllTokenData() = %v", err)
+		}
+		assertRestored(t)
+	})
+
+	t.Run("host DeleteAll", func(t *testing.T) {
+		failure := errors.New("host sweep failed")
+		failingHooks := store.hooks(nil)
+		failingHooks.TokenStoreV2.DeleteAll = func(string) error { return failure }
+		edition.Override(failingHooks)
+		err := DeleteAllTokenData(configDir)
+		if !errors.Is(err, failure) {
+			t.Fatalf("DeleteAllTokenData() = %v", err)
+		}
+		assertRestored(t)
+	})
 }
 
 func TestHookLoadWaitsForBlobAndMarkerPublication(t *testing.T) {

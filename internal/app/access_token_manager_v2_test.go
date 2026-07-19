@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -197,6 +198,115 @@ func TestTokenManagerSerializesConcurrentResolutionPerConfigAndProfile(t *testin
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestTokenManagerCoalescesConcurrentTransientFailures(t *testing.T) {
+	configDir := t.TempDir()
+	writeTokenManagerMarker(t, configDir, 1)
+	sentinel := errors.New("token-secret-uid-4496576595")
+	var calls atomic.Int32
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
+		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
+			calls.Add(1)
+			time.Sleep(15 * time.Millisecond)
+			return nil, errors.Join(sentinel, &authpkg.OAuthEndpointError{StatusCode: http.StatusServiceUnavailable})
+		}}
+	})
+	manager := NewTokenManager()
+	base := time.Unix(100, 0)
+	manager.now = func() time.Time { return base }
+
+	const callers = 100
+	start := make(chan struct{})
+	errCh := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := manager.Get(context.Background(), configDir, "")
+			errCh <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("Get() error = %v, want shared sentinel cause", err)
+		}
+		if strings.Contains(err.Error(), "4496576595") || strings.Contains(err.Error(), "token-secret") {
+			t.Fatalf("cached failure exposed raw cause: %v", err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestTokenManagerTransientFailureRetriesAfterCooldown(t *testing.T) {
+	configDir := t.TempDir()
+	writeTokenManagerMarker(t, configDir, 7)
+	sentinel := errors.New("transient refresh sentinel")
+	var calls atomic.Int32
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
+		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
+			calls.Add(1)
+			return nil, errors.Join(sentinel, &authpkg.OAuthEndpointError{StatusCode: http.StatusTooManyRequests})
+		}}
+	})
+	manager := NewTokenManager()
+	base := time.Unix(200, 0)
+	current := base
+	manager.now = func() time.Time { return current }
+
+	if _, err := manager.Get(context.Background(), configDir, ""); !errors.Is(err, sentinel) {
+		t.Fatalf("first Get() error = %v", err)
+	}
+	if _, err := manager.Get(context.Background(), configDir, ""); !errors.Is(err, sentinel) {
+		t.Fatalf("cooldown Get() error = %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("provider calls inside cooldown = %d, want 1", got)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.Get(canceled, configDir, ""); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Get() error = %v, want context canceled", err)
+	}
+	current = base.Add(tokenFailureInitialBackoff)
+	if _, err := manager.Get(context.Background(), configDir, ""); !errors.Is(err, sentinel) {
+		t.Fatalf("post-cooldown Get() error = %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("provider calls after cooldown = %d, want 2", got)
+	}
+}
+
+func TestTokenManagerMarkerChangeBypassesTransientFailureCooldown(t *testing.T) {
+	configDir := t.TempDir()
+	writeTokenManagerMarker(t, configDir, 11)
+	sentinel := errors.New("transient refresh sentinel")
+	var calls atomic.Int32
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
+		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
+			calls.Add(1)
+			return nil, errors.Join(sentinel, &authpkg.OAuthEndpointError{StatusCode: http.StatusInternalServerError})
+		}}
+	})
+	manager := NewTokenManager()
+	manager.now = func() time.Time { return time.Unix(300, 0) }
+	if _, err := manager.Get(context.Background(), configDir, ""); !errors.Is(err, sentinel) {
+		t.Fatalf("first Get() error = %v", err)
+	}
+	writeTokenManagerMarker(t, configDir, 12)
+	if _, err := manager.Get(context.Background(), configDir, ""); !errors.Is(err, sentinel) {
+		t.Fatalf("marker-change Get() error = %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("provider calls after marker change = %d, want 2", got)
 	}
 }
 

@@ -317,8 +317,15 @@ func TestOAuthLoginPreflightsTokenPersistence(t *testing.T) {
 			provider := NewOAuthProvider(configDir, nil)
 			provider.NoBrowser = true
 			_, err := provider.Login(ctx, force)
-			if err == nil || !strings.Contains(err.Error(), "legacy token slot") {
-				t.Fatalf("Login(force=%v) error = %v, want token persistence preflight error", force, err)
+			if err == nil || !keychain.IsCiphertextKeyMismatch(err) {
+				t.Fatalf("Login(force=%v) error = %v, want ciphertext mismatch in cause chain", force, err)
+			}
+			if force {
+				if !strings.Contains(err.Error(), "legacy token slot") {
+					t.Fatalf("Login(force=true) error = %v, want token persistence preflight error", err)
+				}
+			} else if !strings.Contains(err.Error(), "OAuth login local state load failed") {
+				t.Fatalf("Login(force=false) error = %v, want fail-closed local state load error", err)
 			}
 		})
 	}
@@ -434,8 +441,11 @@ func TestLockedRefreshRejectsFutureProfilesVersionBeforeHTTP(t *testing.T) {
 		return nil, errors.New("unexpected refresh request")
 	})}
 	_, err = provider.Login(context.Background(), false)
-	if err == nil || !strings.Contains(err.Error(), "newer than supported") {
-		t.Fatalf("Login() error = %v, want future profiles rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "OAuth login silent refresh failed") {
+		t.Fatalf("Login() error = %v, want bounded silent-refresh error", err)
+	}
+	if cause := errors.Unwrap(err); cause == nil || !strings.Contains(cause.Error(), "newer than supported") {
+		t.Fatalf("Login() cause = %v, want future profiles rejection", cause)
 	}
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("refresh HTTP calls = %d, want 0", got)

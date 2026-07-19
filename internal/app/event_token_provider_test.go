@@ -120,6 +120,49 @@ func TestPortalSourceProductionProviderIsLazyAndPreservesCause(t *testing.T) {
 	}
 }
 
+func TestPortalSourceProviderAndSpawnArgsKeepExactProfileLease(t *testing.T) {
+	oldNew := eventNewDingtalkSource
+	oldResolve := eventResolveTokenForProfile
+	t.Cleanup(func() {
+		eventNewDingtalkSource = oldNew
+		eventResolveTokenForProfile = oldResolve
+	})
+	var captured source.Config
+	eventNewDingtalkSource = func(cfg source.Config, _ ...source.SourceOption) (*source.DingtalkSource, error) {
+		captured = cfg
+		return &source.DingtalkSource{}, nil
+	}
+	var gotProfile string
+	eventResolveTokenForProfile = func(_ context.Context, configDir, explicit, profile string) (string, error) {
+		if configDir != "/config" || explicit != "" {
+			t.Fatalf("resolve args = (%q,%q)", configDir, explicit)
+		}
+		gotProfile = profile
+		return "token-b", nil
+	}
+	opts := eventStreamTicketOptions{Mode: "normal", SourceID: "open", Profile: "corp-b:user-b"}
+	if _, err := newEventSource(t.Context(), "/config", "portal", "", opts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captured.PortalTicket.AccessTokenProvider(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if gotProfile != "corp-b:user-b" {
+		t.Fatalf("provider profile = %q", gotProfile)
+	}
+	args := opts.spawnArgs()
+	if !reflect.DeepEqual(args[len(args)-2:], []string{"--profile", "corp-b:user-b"}) {
+		t.Fatalf("spawn args = %#v", args)
+	}
+	for _, mode := range []string{"normal", "custom"} {
+		a := eventStreamIdentityHash("same-client", eventStreamTicketOptions{Mode: mode, SourceID: "open", Profile: "corp-a:user-a"})
+		b := eventStreamIdentityHash("same-client", eventStreamTicketOptions{Mode: mode, SourceID: "open", Profile: "corp-b:user-b"})
+		if a == b || strings.Contains(a, "corp-") || strings.Contains(b, "corp-") {
+			t.Fatalf("mode=%s bus hashes A=%q B=%q", mode, a, b)
+		}
+	}
+}
+
 func TestPersonalSourceProductionProviderFailureStopsBeforeTicketHTTP(t *testing.T) {
 	oldResolve := personalResolveAuxiliaryAccessToken
 	t.Cleanup(func() { personalResolveAuxiliaryAccessToken = oldResolve })

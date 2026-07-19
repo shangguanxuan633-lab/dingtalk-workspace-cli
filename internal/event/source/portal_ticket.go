@@ -72,7 +72,7 @@ func (e *portalStageError) Error() string {
 	if e == nil {
 		return "source: portal stream failed"
 	}
-	message := "source: portal " + strings.TrimSpace(e.stage) + " failed"
+	message := "source: portal " + strings.ReplaceAll(strings.TrimSpace(e.stage), "_", " ") + " failed"
 	if e.status != 0 {
 		message += fmt.Sprintf(" (HTTP %d)", e.status)
 	}

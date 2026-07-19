@@ -152,14 +152,35 @@ func TestPersonalSourceFetchTicketConnectsAndACKs(t *testing.T) {
 	// cancellation. Read the shared log buffer only after the goroutine exits so
 	// the assertion remains race-free under `go test -race`.
 	out := logs.String()
-	for _, want := range []string{"personal source received dataframe", "user_im_message_receive_at", "evt-1", "sub-1", "sourceId", "message", "<redacted>"} {
+	for _, want := range []string{"personal source received dataframe", "user_im_message_receive_at", "event_id_hash", "subscribe_id_hash", "source_id_hash", "message", "<redacted>"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("debug log missing %q: %s", want, out)
 		}
 	}
-	for _, leaked := range []string{"header-secret-token", "data-secret-token", "data-secret", "data-ticket", "Bearer data-auth"} {
+	for _, leaked := range []string{"evt-1", "sub-1", "header-secret-token", "data-secret-token", "data-secret", "data-ticket", "Bearer data-auth"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("debug log leaked %q: %s", leaked, out)
+		}
+	}
+}
+
+func TestPersonalRawDebugLogRedactsIdentityAndNonJSONPayload(t *testing.T) {
+	logs := capturePersonalSourceDebugLogs(t)
+	const uid = "4496576595"
+	logPersonalDataFrame(&dwsevent.RawEvent{
+		EventID: "event-" + uid, SubscribeID: "sub-" + uid, SourceID: "source-" + uid,
+		EventType: "safe_event", Headers: map[string]string{"corpId": "corp-" + uid, "userName": uid},
+	}, `{"uid":"`+uid+`","corpId":"corp-secret","message":"token-secret"}`)
+	logPersonalDataFrame(&dwsevent.RawEvent{EventType: "safe_event"}, "raw-token-"+uid)
+	out := logs.String()
+	for _, leaked := range []string{uid, "corp-secret", "token-secret", "raw-token"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("personal debug log leaked %q: %s", leaked, out)
+		}
+	}
+	for _, want := range []string{"event_id_hash", "<redacted>", "non-json payload redacted"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("personal debug log missing %q: %s", want, out)
 		}
 	}
 }

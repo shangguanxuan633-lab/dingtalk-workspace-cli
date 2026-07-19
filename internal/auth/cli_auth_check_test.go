@@ -594,8 +594,11 @@ func TestFetchClientIDFromMCP_BusinessError_FailClosed(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when server returns success=false, got nil")
 	}
-	if !strings.Contains(err.Error(), "access denied") {
-		t.Fatalf("error should contain server error message, got: %s", err)
+	if !strings.Contains(err.Error(), "code: other") {
+		t.Fatalf("error should retain a bounded diagnostic code, got: %s", err)
+	}
+	if strings.Contains(err.Error(), "access denied") {
+		t.Fatalf("error exposed untrusted server message: %s", err)
 	}
 	t.Logf("✅ /cli/clientId business error → fail-closed: error=%q", err)
 }

@@ -59,6 +59,13 @@ func auxiliaryAuthDiagnosticAttrs(stage string, err error) []any {
 	return attrs
 }
 
+func logAuthLoginCommandFailure(stage string, err error) {
+	// This warning is intentionally visible without DWS_DEBUG_AUTH. Its fields
+	// are bounded classifications only; verbose/JSON can still expose the safe
+	// typed cause attached at the command boundary.
+	slog.Warn("auth.login.command.failed", auxiliaryAuthDiagnosticAttrs(stage, err)...)
+}
+
 func classifyAuxiliaryAuthError(err error) string {
 	if err == nil {
 		return "none"

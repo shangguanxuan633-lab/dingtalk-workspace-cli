@@ -1518,18 +1518,46 @@ func TestEnrichAuthLoginProfileLogsIdentityResolutionWithoutCredentials(t *testi
 	for _, want := range []string{
 		`"msg":"auth.login.identity.lookup.start"`,
 		`"msg":"auth.login.identity.lookup.result"`,
-		`"corp_id":"ding_same_corp"`,
-		`"user_id":"user_two"`,
-		`"user_name":"账号二"`,
+		`"corp_id_hash":"`,
+		`"user_id_hash":"`,
+		`"user_name_hash":"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("diagnostic logs missing %q:\n%s", want, got)
 		}
 	}
-	for _, secret := range []string{"secret-access-token", "secret-refresh-token"} {
+	for _, secret := range []string{"secret-access-token", "secret-refresh-token", "ding_same_corp", "user_two", "账号二", "同一组织"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("diagnostic logs exposed credential %q:\n%s", secret, got)
 		}
+	}
+}
+
+func TestAuthLoginCommandFailureIsVisibleAndRedactedByDefault(t *testing.T) {
+	const secret = "token-secret-uid-4496576595"
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	logAuthLoginCommandFailure("device_login", &authpkg.OAuthEndpointError{
+		StatusCode: http.StatusBadRequest,
+		Code:       secret,
+		Message:    secret,
+	})
+	got := logs.String()
+	for _, want := range []string{
+		`"msg":"auth.login.command.failed"`,
+		`"stage":"device_login"`,
+		`"http_status":400`,
+		`"oauth_code":"other"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("safe login log missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, secret) || strings.Contains(got, "4496576595") {
+		t.Fatalf("login failure log leaked cause: %s", got)
 	}
 }
 

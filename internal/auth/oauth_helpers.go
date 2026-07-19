@@ -1440,6 +1440,9 @@ func (p *OAuthProvider) doCheckCLIAuthEnabled(ctx context.Context, accessToken s
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, oauthEndpointError(resp.StatusCode, data)
+	}
 
 	var status CLIAuthStatus
 	if err := json.Unmarshal(data, &status); err != nil {
@@ -1488,6 +1491,9 @@ func doGetSuperAdmins(ctx context.Context, accessToken string) (*SuperAdminRespo
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, oauthEndpointError(resp.StatusCode, data)
+	}
 
 	var result SuperAdminResponse
 	if err := json.Unmarshal(data, &result); err != nil {
@@ -1535,6 +1541,9 @@ func doSendCliAuthApply(ctx context.Context, accessToken, adminStaffID string) (
 	data, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, oauthEndpointError(resp.StatusCode, data)
 	}
 
 	var result SendApplyResponse
@@ -1590,6 +1599,9 @@ func doFetchClientIDFromMCP(ctx context.Context) (string, error) {
 	data, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
 	if err != nil {
 		return "", fmt.Errorf("reading response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", oauthEndpointError(resp.StatusCode, data)
 	}
 
 	var result ClientIDResponse

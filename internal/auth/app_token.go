@@ -157,7 +157,7 @@ func FetchAppToken(ctx context.Context, appKey, appSecret string) (token string,
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("获取 app token 失败 (HTTP %d): %s", resp.StatusCode, truncateStr(string(respBody), 200))
+		return "", 0, safeAppTokenEndpointError(resp.StatusCode, respBody)
 	}
 
 	var result struct {
@@ -174,6 +174,23 @@ func FetchAppToken(ctx context.Context, appKey, appSecret string) (token string,
 		result.ExpireIn = config.DefaultAccessTokenExpiry
 	}
 	return result.AccessToken, result.ExpireIn, nil
+}
+
+func safeAppTokenEndpointError(status int, body []byte) error {
+	var envelope struct {
+		Error     string `json:"error"`
+		ErrorCode string `json:"errorCode"`
+		Code      string `json:"code"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	code := envelope.Error
+	if code == "" {
+		code = envelope.ErrorCode
+	}
+	if code == "" {
+		code = envelope.Code
+	}
+	return &OAuthEndpointError{StatusCode: status, Code: code}
 }
 
 // --- AppTokenProvider ---

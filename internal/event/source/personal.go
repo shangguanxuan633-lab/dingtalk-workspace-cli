@@ -16,6 +16,7 @@ package source
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -319,9 +320,9 @@ func logPersonalDataFrame(raw *dwsevent.RawEvent, data string) {
 	slog.Debug("personal source received dataframe",
 		"event_type", raw.EventType,
 		"event_key", raw.EventType,
-		"event_id", raw.EventID,
-		"subscribe_id", raw.SubscribeID,
-		"source_id", raw.SourceID,
+		"event_id_hash", personalRawIdentifierHash(raw.EventID),
+		"subscribe_id_hash", personalRawIdentifierHash(raw.SubscribeID),
+		"source_id_hash", personalRawIdentifierHash(raw.SourceID),
 		"rule_type", raw.RuleType,
 		"headers", redactPersonalRawStringMap(raw.Headers),
 		"data", sanitizePersonalRawPayload([]byte(data)),
@@ -594,7 +595,7 @@ func sanitizePersonalRawPayload(data []byte) string {
 			return truncatePersonalRawLog(s)
 		}
 	}
-	return truncatePersonalRawLog(string(data))
+	return fmt.Sprintf("<non-json payload redacted; bytes=%d>", len(data))
 }
 
 func redactPersonalRawJSONValue(v any) any {
@@ -632,10 +633,31 @@ func marshalPersonalRawJSON(v any) (string, error) {
 
 func personalRawSensitiveKey(key string) bool {
 	key = strings.ToLower(strings.TrimSpace(key))
-	return strings.Contains(key, "token") ||
+	compact := strings.NewReplacer("_", "", "-", "", ".", "").Replace(key)
+	if strings.Contains(compact, "token") ||
 		strings.Contains(key, "secret") ||
 		strings.Contains(key, "ticket") ||
-		strings.Contains(key, "authorization")
+		strings.Contains(key, "authorization") {
+		return true
+	}
+	switch compact {
+	case "uid", "userid", "username", "staffid", "unionid", "openid",
+		"corpid", "corpname", "tenantid", "employeeid", "profile",
+		"localsubject", "eventid", "subscribeid", "subid", "sourceid",
+		"message", "errormsg", "errormessage", "content":
+		return true
+	default:
+		return false
+	}
+}
+
+func personalRawIdentifierHash(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum[:8])
 }
 
 func truncatePersonalRawLog(s string) string {

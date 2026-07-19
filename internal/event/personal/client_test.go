@@ -266,7 +266,7 @@ func TestClientBusinessErrorHTTP200(t *testing.T) {
 		RuleType:  "at",
 		RuleParam: map[string]any{},
 	})
-	if err == nil || !strings.Contains(err.Error(), "INVALID_PARAM") || !strings.Contains(err.Error(), "clientId is empty") {
+	if err == nil || !strings.Contains(err.Error(), "INVALID_PARAM") || strings.Contains(err.Error(), "clientId is empty") {
 		t.Fatalf("error = %v, want INVALID_PARAM business error", err)
 	}
 	var apiErr *APIError
@@ -285,6 +285,33 @@ func TestClientBusinessErrorHTTP200(t *testing.T) {
 	}
 	if strings.Contains(out, "clientId is empty") {
 		t.Fatalf("debug log leaked free-form server message: %s", out)
+	}
+}
+
+func TestClientBusinessErrorRedactsMaliciousCodeMessageAndRequestID(t *testing.T) {
+	const secret = "token-secret-uid-4496576595"
+	logs := captureClientDebugLogs(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success":   false,
+			"requestId": "request?token=" + secret,
+			"errorCode": "UNKNOWN_" + secret,
+			"errorMsg":  "server echoed " + secret,
+		})
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, Identity{AccessToken: "access", ClientID: "client", SourceID: "open"})
+	_, err := c.CreateSubscription(t.Context(), CreateSubscriptionRequest{
+		EventKey: EventMention, RuleType: "at", RuleParam: map[string]any{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "other") {
+		t.Fatalf("safe API error = %v", err)
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "4496576595") {
+		t.Fatalf("API error leaked server text: %v", err)
+	}
+	if strings.Contains(logs.String(), secret) || strings.Contains(logs.String(), "4496576595") {
+		t.Fatalf("control log leaked server text: %s", logs.String())
 	}
 }
 

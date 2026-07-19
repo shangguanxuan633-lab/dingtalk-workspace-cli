@@ -141,6 +141,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 				}
 				if err := authSaveTokenData(configDir, tokenData); err != nil {
 					logging.AuthDebug("auth.login.command.error", "stage", "manual_token_persist", "error", err)
+					logAuthLoginCommandFailure("manual_token_persist", err)
 					return apperrors.NewInternal("failed to persist auth token",
 						apperrors.WithReason("auth_token_persist_failed"), apperrors.WithCause(err))
 				}
@@ -157,6 +158,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 				tokenData, err = authDeviceLogin(provider, loginCtx)
 				if err != nil {
 					logging.AuthDebug("auth.login.command.error", "stage", "device_login", "error", err)
+					logAuthLoginCommandFailure("device_login", err)
 					return apperrors.NewAuth("device authorization failed",
 						apperrors.WithReason("device_login_failed"), apperrors.WithCause(err))
 				}
@@ -175,6 +177,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 				tokenData, err = authOAuthLogin(provider, loginCtx, authLoginForcesAuthorization(cfg))
 				if err != nil {
 					logging.AuthDebug("auth.login.command.error", "stage", "oauth_login", "error", err)
+					logAuthLoginCommandFailure("oauth_login", err)
 					return apperrors.NewAuth("dingtalk login failed",
 						apperrors.WithReason("oauth_login_failed"), apperrors.WithCause(err))
 				}
@@ -375,6 +378,7 @@ func applyAuthLoginGuideAction(cmd *cobra.Command, configDir string, action auth
 			ClientSecret: authpkg.PlainSecret(clientSecret),
 		}); err != nil {
 			logging.AuthDebug("auth.login.command.error", "stage", "app_credentials_persist", "error", err)
+			logAuthLoginCommandFailure("app_credentials_persist", err)
 			return apperrors.NewInternal("failed to persist app credentials",
 				apperrors.WithReason("app_credentials_persist_failed"), apperrors.WithCause(err))
 		}
@@ -947,6 +951,7 @@ func newAuthExchangeCommand(caller edition.ToolCaller) *cobra.Command {
 			tokenData, err := authOAuthExchange(provider, exchangeCtx, code, strings.TrimSpace(uid))
 			if err != nil {
 				logging.AuthDebug("auth.login.command.error", "stage", "auth_code_exchange", "error", err)
+				logAuthLoginCommandFailure("auth_code_exchange", err)
 				return apperrors.NewAuth("failed to exchange authorization code",
 					apperrors.WithReason("auth_code_exchange_failed"), apperrors.WithCause(err))
 			}

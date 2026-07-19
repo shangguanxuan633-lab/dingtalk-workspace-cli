@@ -1709,6 +1709,15 @@ func deleteAllTokenV2TransactionLocked(h *edition.Hooks, configDir string) error
 		}
 		return operationErr
 	}
+	// Publish the logged-out metadata state before asking the host to sweep
+	// non-enumerable orphans. A successful host DeleteAll must be the final
+	// fallible step: Core cannot reconstruct unknown orphan blobs afterward.
+	if err := tokenSaveProfiles(configDir, &ProfilesConfig{Version: profilesVersion}); err != nil {
+		return rollback(err)
+	}
+	if err := tokenDeleteMarker(configDir); err != nil {
+		return rollback(err)
+	}
 	if h.TokenStoreV2.DeleteAll != nil {
 		if err := h.TokenStoreV2.DeleteAll(configDir); err != nil {
 			return rollback(err)
@@ -1719,12 +1728,6 @@ func deleteAllTokenV2TransactionLocked(h *edition.Hooks, configDir string) error
 				return rollback(err)
 			}
 		}
-	}
-	if err := tokenSaveProfiles(configDir, &ProfilesConfig{Version: profilesVersion}); err != nil {
-		return rollback(err)
-	}
-	if err := tokenDeleteMarker(configDir); err != nil {
-		return rollback(err)
 	}
 	return nil
 }

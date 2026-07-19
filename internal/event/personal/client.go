@@ -157,13 +157,47 @@ func (e *APIError) Error() string {
 	if e == nil {
 		return ""
 	}
-	if e.Code != "" && e.Message != "" {
-		return e.Code + ": " + e.Message
+	message := "personal event API error"
+	if code := safePersonalAPIErrorCode(e.Code); code != "" {
+		message += ": " + code
 	}
-	if e.Code != "" {
-		return e.Code
+	if e.Details != nil {
+		if status, ok := e.Details["http_status"].(int); ok && status != 0 {
+			message += fmt.Sprintf(" (HTTP %d)", status)
+		}
+		if requestID, ok := e.Details["request_id"].(string); ok {
+			if safe := safePersonalRequestID(requestID); safe != "" {
+				message += " (request_id " + safe + ")"
+			}
+		}
 	}
-	return e.Message
+	return message
+}
+
+func safePersonalAPIErrorCode(code string) string {
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case "PERSONAL_EVENT_NOT_FOUND", "NOT_FOUND", "INVALID_PARAM", "INVALID_STATE",
+		"UNAUTHORIZED", "FORBIDDEN", "TOO_MANY_REQUESTS", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE":
+		return strings.ToUpper(strings.TrimSpace(code))
+	case "":
+		return ""
+	default:
+		return "other"
+	}
+}
+
+func safePersonalRequestID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == ':' || r == '.' {
+			continue
+		}
+		return ""
+	}
+	return value
 }
 
 func NewClient(baseURL string, identity Identity) *Client {
@@ -571,11 +605,13 @@ func logControlRequest(message, method, path string, q url.Values, status int, r
 		attrs = append(attrs, "response", responsePayload)
 	}
 	if requestID != "" {
-		attrs = append(attrs, "request_id", requestID)
+		if safe := safePersonalRequestID(requestID); safe != "" {
+			attrs = append(attrs, "request_id", safe)
+		}
 	}
 	if apiErr != nil {
-		if apiErr.Code != "" {
-			attrs = append(attrs, "error_code", apiErr.Code)
+		if code := safePersonalAPIErrorCode(apiErr.Code); code != "" {
+			attrs = append(attrs, "error_code", code)
 		}
 	}
 	slog.Debug(message, attrs...)
@@ -612,6 +648,27 @@ func redactJSONValue(v any) any {
 	case map[string]any:
 		out := make(map[string]any, len(x))
 		for k, value := range x {
+			compact := strings.NewReplacer("_", "", "-", "", ".", "").Replace(strings.ToLower(strings.TrimSpace(k)))
+			switch compact {
+			case "code", "errorcode", "servererrorcode":
+				if raw, ok := value.(string); ok {
+					out[k] = safePersonalAPIErrorCode(raw)
+				} else {
+					out[k] = "<redacted>"
+				}
+				continue
+			case "requestid", "traceid":
+				if raw, ok := value.(string); ok {
+					if safe := safePersonalRequestID(raw); safe != "" {
+						out[k] = safe
+					} else {
+						out[k] = "<redacted>"
+					}
+				} else {
+					out[k] = "<redacted>"
+				}
+				continue
+			}
 			if sensitiveLogKey(k) {
 				out[k] = "<redacted>"
 				continue

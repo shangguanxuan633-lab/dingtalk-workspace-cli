@@ -535,7 +535,7 @@ func TestCrossPlatformCoverageOAuthLoginExchangeFailure(t *testing.T) {
 		done <- err
 	}()
 	_, body := httpGetBody(t, f.callbackBase+CallbackPath+"?code=bad")
-	if !strings.Contains(body, "failed") {
+	if !strings.Contains(body, "授权失败") || !strings.Contains(body, "终端查看认证诊断") {
 		t.Fatalf("exchange failure page = %q", body)
 	}
 	if err := <-done; err == nil {
@@ -879,7 +879,13 @@ func TestCrossPlatformCoverageOAuthCallbackRemainingEdges(t *testing.T) {
 	t.Run("callback and API errors", func(t *testing.T) {
 		oauthPollInterval = time.Hour
 		fail := errors.New("hook failure")
-		oauthCheckStatus = func(*OAuthProvider, context.Context, string) (*CLIAuthStatus, error) { return nil, fail }
+		var statusChecks atomic.Int32
+		oauthCheckStatus = func(*OAuthProvider, context.Context, string) (*CLIAuthStatus, error) {
+			if statusChecks.Add(1) == 1 {
+				return &CLIAuthStatus{Success: true, Result: &CLIAuthResult{}}, nil
+			}
+			return nil, fail
+		}
 		oauthGetAdmins = func(context.Context, string) (*SuperAdminResponse, error) { return nil, fail }
 		oauthSendApply = func(context.Context, string, string) (*SendApplyResponse, error) { return nil, fail }
 		ctx, cancel := context.WithCancel(context.Background())
@@ -887,7 +893,7 @@ func TestCrossPlatformCoverageOAuthCallbackRemainingEdges(t *testing.T) {
 		done := startLogin(ctx, f)
 		finishExchange(t, f, "errors")
 		for _, path := range []string{"/api/superAdmin", "/api/sendApply?adminStaffId=admin", "/api/cliAuthEnabled"} {
-			if _, body := httpGetBody(t, f.callbackBase+path); !strings.Contains(body, "hook failure") {
+			if _, body := httpGetBody(t, f.callbackBase+path); strings.Contains(body, "hook failure") || !strings.Contains(body, "返回终端查看诊断") {
 				t.Fatalf("API error %s = %q", path, body)
 			}
 		}

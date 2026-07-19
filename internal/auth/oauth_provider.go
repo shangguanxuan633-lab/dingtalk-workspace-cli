@@ -45,7 +45,7 @@ var (
 	oauthPollInterval    = 5 * time.Second
 	oauthSuccessPause    = 2 * time.Second
 	oauthLoadToken       = LoadTokenData
-	oauthLoadTokenLocked = loadTokenDataForProfileLocked
+	oauthLoadTokenLocked = loadTokenDataUnderHeldLock
 	oauthAcquireLock     = AcquireDualLock
 	oauthMarkProfile     = MarkProfileStatus
 	oauthDeleteRejected  = DeleteTokenDataIfAccessTokenMatches
@@ -133,6 +133,29 @@ func (p *OAuthProvider) output() io.Writer {
 	return io.Discard
 }
 
+type oauthLoginStageError struct {
+	stage string
+	cause error
+}
+
+func (e *oauthLoginStageError) Error() string {
+	return "OAuth login " + strings.TrimSpace(e.stage) + " failed"
+}
+func (e *oauthLoginStageError) Unwrap() error { return e.cause }
+
+func logOAuthLoginFailure(logger *slog.Logger, event, stage string, err error) {
+	attrs := []any{"stage", stage, "error_type", fmt.Sprintf("%T", err)}
+	var endpointErr *OAuthEndpointError
+	if errors.As(err, &endpointErr) {
+		attrs = append(attrs, "http_status", endpointErr.StatusCode, "oauth_code", SafeOAuthDiagnosticCode(endpointErr.Code))
+	}
+	if logger != nil {
+		logger.Warn(event, attrs...)
+		return
+	}
+	slog.Warn(event, attrs...)
+}
+
 // Login performs authentication with smart degradation:
 // 1. If force=false, try silent token refresh first (refresh_token)
 // 2. If all silent methods fail (or force=true), fall back to browser OAuth flow
@@ -140,6 +163,10 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 	// Smart degradation: try silent refresh before opening browser.
 	if !force {
 		data, err := oauthLoadToken(p.configDir)
+		if err != nil && !errors.Is(err, ErrTokenDataNotFound) {
+			logOAuthLoginFailure(p.logger, "auth.login.oauth.local_state_load.failed", "local_state_load", err)
+			return nil, &oauthLoginStageError{stage: "local state load", cause: err}
+		}
 		if err == nil {
 			// Case 1: access_token still valid — no action needed.
 			if data.IsAccessTokenValid() {
@@ -166,11 +193,10 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 					}
 					return refreshed, nil
 				}
-				if p.logger != nil {
-					p.logger.Warn(i18n.T("refresh_token 刷新失败，将尝试扫码登录"),
-						"failure_class", string(ClassifyRefreshFailure(rErr)),
-						"error_type", fmt.Sprintf("%T", rErr),
-					)
+				failureClass := ClassifyRefreshFailure(rErr)
+				logOAuthLoginFailure(p.logger, "auth.login.oauth.silent_refresh.failed", "silent_refresh", rErr)
+				if failureClass != RefreshFailureTerminal {
+					return nil, &oauthLoginStageError{stage: "silent refresh", cause: rErr}
 				}
 			}
 		}
@@ -363,12 +389,18 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 
 		// Check CLI auth enabled status (fail-closed: treat errors as disabled)
 		authStatus, statusErr := oauthCheckStatus(p, ctx, tokenData.AccessToken)
-		var denialReason string
 		if statusErr != nil {
-			denialReason = "unknown"
-		} else {
-			denialReason = classifyDenialReason(authStatus, os.Getenv("DWS_CHANNEL"))
+			logOAuthLoginFailure(p.logger, "auth.login.oauth.organization_access.failed", "organization_access", statusErr)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprint(w, "<html><body><h1>授权状态检查失败</h1><p>请返回终端查看认证诊断并重试。</p></body></html>")
+			select {
+			case resultCh <- callbackResult{err: &oauthLoginStageError{stage: "organization access check", cause: statusErr}}:
+			default:
+			}
+			return
 		}
+		var denialReason string
+		denialReason = classifyDenialReason(authStatus, os.Getenv("DWS_CHANNEL"))
 		cliAuthEnabled := denialReason == ""
 		logging.AuthDebug(
 			"auth.login.oauth.organization_access.checked",
@@ -422,6 +454,7 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		}
 		result, err := oauthGetAdmins(ctx, token.AccessToken)
 		if err != nil {
+			logOAuthLoginFailure(p.logger, "auth.login.oauth.admin_lookup.failed", "admin_lookup", err)
 			_, _ = w.Write([]byte(`{"success":false,"errorMsg":"获取管理员信息失败，请返回终端查看诊断"}`))
 			return
 		}
@@ -446,7 +479,8 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		}
 		result, err := oauthSendApply(ctx, token.AccessToken, adminStaffID)
 		if err != nil {
-			_, _ = fmt.Fprintf(w, `{"success":false,"errorMsg":"%s"}`, err.Error())
+			logOAuthLoginFailure(p.logger, "auth.login.oauth.apply.failed", "apply", err)
+			_, _ = w.Write([]byte(`{"success":false,"errorMsg":"提交授权申请失败，请返回终端查看诊断"}`))
 			return
 		}
 		// Mark apply as sent and save selected admin on success
@@ -482,7 +516,8 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		}
 		result, err := oauthCheckStatus(p, ctx, token.AccessToken)
 		if err != nil {
-			_, _ = fmt.Fprintf(w, `{"success":false,"errorMsg":"%s"}`, err.Error())
+			logOAuthLoginFailure(p.logger, "auth.login.oauth.status_api.failed", "status_api", err)
+			_, _ = w.Write([]byte(`{"success":false,"errorMsg":"检查授权状态失败，请返回终端查看诊断"}`))
 			return
 		}
 		data, _ := json.Marshal(result)
@@ -570,10 +605,11 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		defer pollTicker.Stop()
 
 		elapsedSeconds := 0
+		var lastStatusErr error
 		for {
 			select {
 			case <-applyTimeout.C:
-				return nil, errors.New(i18n.T("操作超时，请重新登录"))
+				return nil, errors.Join(errors.New(i18n.T("操作超时，请重新登录")), lastStatusErr)
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-pollTicker.C:
@@ -598,6 +634,10 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 				// Check if CLI auth is now enabled (admin approved)
 				if currentToken != nil {
 					authStatus, err := oauthCheckStatus(p, ctx, currentToken.AccessToken)
+					if err != nil {
+						lastStatusErr = &oauthLoginStageError{stage: "approval status poll", cause: err}
+						logOAuthLoginFailure(p.logger, "auth.login.oauth.approval_poll.failed", "approval_status_poll", err)
+					}
 					if err == nil && classifyDenialReason(authStatus, os.Getenv("DWS_CHANNEL")) == "" {
 						_, _ = fmt.Fprintf(p.output(), "\r%s\n", i18n.T("✅ 权限已开启，继续登录..."))
 						oauthSleep(oauthSuccessPause)

@@ -45,6 +45,7 @@ const (
 
 var (
 	deviceFlowAfter     = time.After
+	deviceFlowNow       = time.Now
 	deviceOpenBrowser   = openBrowser
 	deviceFetchClientID = FetchClientIDFromMCP
 	deviceLoginOnce     = func(p *DeviceFlowProvider, ctx context.Context, attempt int) (*TokenData, error) {
@@ -73,6 +74,41 @@ var (
 		return p.pollDeviceToken(ctx, code)
 	}
 )
+
+type deviceFlowStageError struct {
+	stage string
+	cause error
+}
+
+func (e *deviceFlowStageError) Error() string {
+	if e == nil {
+		return "device flow request failed"
+	}
+	return "device flow " + strings.TrimSpace(e.stage) + " failed"
+}
+
+func (e *deviceFlowStageError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func logDevicePollFailure(logger *slog.Logger, stage string, err error) {
+	attrs := []any{"stage", stage, "error_type", fmt.Sprintf("%T", err)}
+	var endpointErr *OAuthEndpointError
+	if errors.As(err, &endpointErr) {
+		attrs = append(attrs,
+			"http_status", endpointErr.StatusCode,
+			"oauth_code", SafeOAuthDiagnosticCode(endpointErr.Code),
+		)
+	}
+	if logger != nil {
+		logger.Warn("auth.device.poll_failed", attrs...)
+		return
+	}
+	slog.Warn("auth.device.poll_failed", attrs...)
+}
 
 type DeviceFlowProvider struct {
 	configDir        string
@@ -334,6 +370,9 @@ func (p *DeviceFlowProvider) loginOnce(ctx context.Context, attempt int) (*Token
 			_, _ = fmt.Fprintln(p.output(), "")
 
 			admins, adminErr := deviceGetAdmins(ctx, tokenData.AccessToken)
+			if adminErr != nil {
+				logDevicePollFailure(p.logger, "device_admin_lookup", adminErr)
+			}
 			if adminErr == nil && admins.Success && len(admins.Result) > 0 {
 				maxAdmins := 3
 				if len(admins.Result) < maxAdmins {
@@ -454,7 +493,7 @@ func (p *DeviceFlowProvider) pollDeviceStatus(ctx context.Context, flowID string
 	// REJECTED/EXPIRED carry success=false but have a valid data.Status;
 	// only treat as a real server error when data.Status is empty.
 	if !resp.Success && resp.Data.Status == "" {
-		return nil, fmt.Errorf("%s: [%s] %s", i18n.T("服务端返回错误"), resp.Code, resp.Message)
+		return nil, &OAuthEndpointError{StatusCode: http.StatusOK, Code: resp.Code}
 	}
 	return &resp, nil
 }
@@ -469,16 +508,18 @@ func (p *DeviceFlowProvider) waitForAuthorization(ctx context.Context, auth *Dev
 }
 
 func (p *DeviceFlowProvider) waitForAuthorizationByFlowID(ctx context.Context, auth *DeviceAuthResponse) (*DeviceTokenResponse, error) {
-	startTime := time.Now()
+	startTime := deviceFlowNow()
 	interval := time.Duration(auth.Interval) * time.Second
 	deadline := time.Duration(auth.ExpiresIn) * time.Second
 	pollCount := 0
+	var lastPollErr error
 
 	for {
-		elapsed := time.Since(startTime)
+		elapsed := deviceFlowNow().Sub(startTime)
 		if elapsed >= maxPollTotalWait || elapsed >= deadline {
 			_, _ = fmt.Fprintln(p.output(), "")
-			return nil, fmt.Errorf("%s", i18n.Tf("设备授权码已过期（%d 秒），请重试", auth.ExpiresIn))
+			expiredErr := fmt.Errorf("%s", i18n.Tf("设备授权码已过期（%d 秒），请重试", auth.ExpiresIn))
+			return nil, errors.Join(expiredErr, lastPollErr)
 		}
 
 		select {
@@ -488,15 +529,14 @@ func (p *DeviceFlowProvider) waitForAuthorizationByFlowID(ctx context.Context, a
 		}
 
 		pollCount++
-		elapsedSec := int(time.Since(startTime).Seconds())
+		elapsedSec := int(deviceFlowNow().Sub(startTime).Seconds())
 		dfPrintPollStatus(p.output(), pollCount, elapsedSec)
 
 		pollResp, err := devicePollStatus(p, ctx, auth.FlowID)
 		if err != nil {
+			lastPollErr = &deviceFlowStageError{stage: "status_poll", cause: err}
 			dfPrintPollResult(p.output(), "network_error", i18n.T("网络错误，继续重试..."))
-			if p.logger != nil {
-				p.logger.Debug("poll error", "stage", "device_status_poll", "error_type", fmt.Sprintf("%T", err))
-			}
+			logDevicePollFailure(p.logger, "device_status_poll", err)
 			continue
 		}
 
@@ -514,22 +554,24 @@ func (p *DeviceFlowProvider) waitForAuthorizationByFlowID(ctx context.Context, a
 			_, _ = fmt.Fprintln(p.output(), "")
 			return nil, errors.New(i18n.T("设备授权码已过期"))
 		default:
-			dfPrintPollResult(p.output(), "unknown", fmt.Sprintf(i18n.T("未知状态: %s"), pollData.Status))
+			dfPrintPollResult(p.output(), "unknown", i18n.T("未知状态"))
 		}
 	}
 }
 
 func (p *DeviceFlowProvider) waitForAuthorizationByDeviceCode(ctx context.Context, auth *DeviceAuthResponse) (*DeviceTokenResponse, error) {
-	startTime := time.Now()
+	startTime := deviceFlowNow()
 	interval := time.Duration(auth.Interval) * time.Second
 	deadline := time.Duration(auth.ExpiresIn) * time.Second
 	pollCount := 0
+	var lastPollErr error
 
 	for {
-		elapsed := time.Since(startTime)
+		elapsed := deviceFlowNow().Sub(startTime)
 		if elapsed >= maxPollTotalWait || elapsed >= deadline {
 			_, _ = fmt.Fprintln(p.output(), "")
-			return nil, fmt.Errorf("%s", i18n.Tf("设备授权码已过期（%d 秒），请重试", auth.ExpiresIn))
+			expiredErr := fmt.Errorf("%s", i18n.Tf("设备授权码已过期（%d 秒），请重试", auth.ExpiresIn))
+			return nil, errors.Join(expiredErr, lastPollErr)
 		}
 
 		select {
@@ -539,15 +581,14 @@ func (p *DeviceFlowProvider) waitForAuthorizationByDeviceCode(ctx context.Contex
 		}
 
 		pollCount++
-		elapsedSec := int(time.Since(startTime).Seconds())
+		elapsedSec := int(deviceFlowNow().Sub(startTime).Seconds())
 		dfPrintPollStatus(p.output(), pollCount, elapsedSec)
 
 		resp, err := devicePollToken(p, ctx, auth.DeviceCode)
 		if err != nil {
+			lastPollErr = &deviceFlowStageError{stage: "token_poll", cause: err}
 			dfPrintPollResult(p.output(), "network_error", i18n.T("网络错误，继续重试..."))
-			if p.logger != nil {
-				p.logger.Debug("poll error", "stage", "device_token_poll", "error_type", fmt.Sprintf("%T", err))
-			}
+			logDevicePollFailure(p.logger, "device_token_poll", err)
 			continue
 		}
 
@@ -571,7 +612,7 @@ func (p *DeviceFlowProvider) waitForAuthorizationByDeviceCode(ctx context.Contex
 			_, _ = fmt.Fprintln(p.output(), "")
 			return nil, errors.New(i18n.T("设备授权码已过期"))
 		default:
-			dfPrintPollResult(p.output(), "unknown", fmt.Sprintf(i18n.T("未知错误: %s"), resp.Error))
+			dfPrintPollResult(p.output(), "unknown", fmt.Sprintf(i18n.T("未知错误 (code: %s)"), SafeOAuthDiagnosticCode(resp.Error)))
 		}
 	}
 }
@@ -579,22 +620,22 @@ func (p *DeviceFlowProvider) waitForAuthorizationByDeviceCode(ctx context.Contex
 func (p *DeviceFlowProvider) postForm(ctx context.Context, endpoint string, params url.Values) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(params.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", i18n.T("创建请求失败"), err)
+		return nil, &deviceFlowStageError{stage: "create_request", cause: err}
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", i18n.T("发送请求失败"), err)
+		return nil, &deviceFlowStageError{stage: "send_request", cause: err}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", i18n.T("读取响应失败"), err)
+		return nil, &deviceFlowStageError{stage: "read_response", cause: err}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateBody(body, 200))
+		return nil, safeDeviceEndpointError(resp.StatusCode, body)
 	}
 	return body, nil
 }
@@ -603,23 +644,40 @@ func (p *DeviceFlowProvider) postForm(ctx context.Context, endpoint string, para
 func (p *DeviceFlowProvider) doGet(ctx context.Context, endpoint string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", i18n.T("创建请求失败"), err)
+		return nil, &deviceFlowStageError{stage: "create_request", cause: err}
 	}
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", i18n.T("发送请求失败"), err)
+		return nil, &deviceFlowStageError{stage: "send_request", cause: err}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", i18n.T("读取响应失败"), err)
+		return nil, &deviceFlowStageError{stage: "read_response", cause: err}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateBody(body, 200))
+		return nil, safeDeviceEndpointError(resp.StatusCode, body)
 	}
 	return body, nil
+}
+
+func safeDeviceEndpointError(status int, body []byte) error {
+	var envelope struct {
+		Error     string `json:"error"`
+		ErrorCode string `json:"errorCode"`
+		Code      string `json:"code"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	code := strings.TrimSpace(envelope.Error)
+	if code == "" {
+		code = strings.TrimSpace(envelope.ErrorCode)
+	}
+	if code == "" {
+		code = strings.TrimSpace(envelope.Code)
+	}
+	return &OAuthEndpointError{StatusCode: status, Code: code}
 }
 
 // truncateBody returns a string of at most maxLen bytes from body, appending
@@ -717,6 +775,6 @@ func isInvalidGrantError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "invalid_grant") || (strings.Contains(msg, "code") && strings.Contains(msg, "expired"))
+	var endpointErr *OAuthEndpointError
+	return errors.As(err, &endpointErr) && strings.EqualFold(strings.TrimSpace(endpointErr.Code), "invalid_grant")
 }

@@ -60,6 +60,11 @@ type AccessTokenSnapshot struct {
 
 const accessTokenRefreshWindow = 5 * time.Minute
 
+const (
+	tokenFailureInitialBackoff = time.Second
+	tokenFailureMaxBackoff     = 30 * time.Second
+)
+
 type tokenManagerKey struct {
 	configDir string
 	profile   string
@@ -68,6 +73,31 @@ type tokenManagerKey struct {
 type tokenManagerEntry struct {
 	mu       sync.Mutex
 	snapshot AccessTokenSnapshot
+	failure  tokenManagerFailure
+}
+
+type tokenManagerFailure struct {
+	err              error
+	class            authpkg.RefreshFailureClass
+	markerGeneration uint64
+	markerPresent    bool
+	retryAt          time.Time
+	backoff          time.Duration
+}
+
+type tokenManagerTransientFailureError struct {
+	cause error
+}
+
+func (e *tokenManagerTransientFailureError) Error() string {
+	return "access token resolution temporarily failed"
+}
+
+func (e *tokenManagerTransientFailureError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 // TokenManager is the single runtime entry point for OAuth, legacy, explicit,
@@ -215,6 +245,9 @@ func (m *TokenManager) GetForProfile(ctx context.Context, configDir, explicitTok
 	if token := strings.TrimSpace(explicitToken); token != "" {
 		return AccessTokenSnapshot{AccessToken: token, Source: "explicit"}, nil
 	}
+	if strings.TrimSpace(configDir) == "" {
+		return AccessTokenSnapshot{}, fmt.Errorf("config directory is empty")
+	}
 	profile = strings.TrimSpace(profile)
 	if profile == "" {
 		manual, err := authpkg.ManualTokenMarkerActive(configDir)
@@ -257,6 +290,21 @@ func (m *TokenManager) getForProfile(ctx context.Context, configDir, explicitTok
 	if m != nil && m.now != nil {
 		now = m.now()
 	}
+	if entry.failure.err != nil {
+		markerGeneration, markerPresent, markerErr := authpkg.ReadTokenMarkerGeneration(configDir)
+		if markerErr != nil {
+			return AccessTokenSnapshot{}, fmt.Errorf("read token publication marker: %w", markerErr)
+		}
+		if markerPresent != entry.failure.markerPresent || markerGeneration != entry.failure.markerGeneration {
+			entry.failure = tokenManagerFailure{}
+		} else if now.Before(entry.failure.retryAt) {
+			if ctx != nil && ctx.Err() != nil {
+				return AccessTokenSnapshot{}, ctx.Err()
+			}
+			slog.Debug("auth.token.resolve", tokenResolutionFailureLogAttrs(ctx, key, entry.failure, "failure_cooldown")...)
+			return AccessTokenSnapshot{}, entry.failure.err
+		}
+	}
 	if tokenSnapshotUsable(entry.snapshot, now) {
 		markerGeneration, markerPresent, markerErr := authpkg.ReadTokenMarkerGeneration(configDir)
 		if markerErr != nil {
@@ -279,14 +327,39 @@ func (m *TokenManager) getForProfile(ctx context.Context, configDir, explicitTok
 		}
 		snapshot, err := resolveTokenSnapshotWithEdition(ctx, configDir, key.profile)
 		if err != nil {
+			returnErr := err
+			if shouldCacheTokenManagerFailure(ctx, err) {
+				afterGeneration, afterPresent, afterErr := authpkg.ReadTokenMarkerGeneration(configDir)
+				if afterErr != nil {
+					return AccessTokenSnapshot{}, fmt.Errorf("verify token publication marker after refresh failure: %w", afterErr)
+				}
+				if beforePresent != afterPresent || beforeGeneration != afterGeneration {
+					entry.failure = tokenManagerFailure{}
+					continue
+				}
+				backoff := nextTokenManagerFailureBackoff(entry.failure, beforeGeneration, beforePresent)
+				returnErr = &tokenManagerTransientFailureError{cause: err}
+				entry.failure = tokenManagerFailure{
+					err:              returnErr,
+					class:            authpkg.ClassifyRefreshFailure(err),
+					markerGeneration: beforeGeneration,
+					markerPresent:    beforePresent,
+					retryAt:          now.Add(backoff),
+					backoff:          backoff,
+				}
+			} else {
+				entry.failure = tokenManagerFailure{}
+			}
 			attrs := auxiliaryAuthDiagnosticAttrs("token_resolve", err)
 			attrs = append(attrs, tokenResolutionLogAttrs(ctx, key, AccessTokenSnapshot{}, "failed", false)...)
 			slog.Warn("auth.token.resolve", attrs...)
-			return AccessTokenSnapshot{}, err
+			return AccessTokenSnapshot{}, returnErr
 		}
 		if strings.TrimSpace(snapshot.AccessToken) == "" {
+			entry.failure = tokenManagerFailure{}
 			return AccessTokenSnapshot{}, noCredentialsError()
 		}
+		entry.failure = tokenManagerFailure{}
 		snapshot.ProfileFingerprint = tokenProfileFingerprint(key)
 		snapshot.profile = key.profile
 		snapshot.profilePinned = true
@@ -316,6 +389,37 @@ func (m *TokenManager) getForProfile(ctx context.Context, configDir, explicitTok
 		return snapshot, nil
 	}
 	return AccessTokenSnapshot{}, fmt.Errorf("token publication changed repeatedly while resolving credentials")
+}
+
+func shouldCacheTokenManagerFailure(ctx context.Context, err error) bool {
+	if err == nil || (ctx != nil && ctx.Err() != nil) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	return authpkg.ClassifyRefreshFailure(err) == authpkg.RefreshFailureTransient
+}
+
+func nextTokenManagerFailureBackoff(previous tokenManagerFailure, markerGeneration uint64, markerPresent bool) time.Duration {
+	if previous.err == nil || previous.markerGeneration != markerGeneration || previous.markerPresent != markerPresent || previous.backoff <= 0 {
+		return tokenFailureInitialBackoff
+	}
+	next := previous.backoff * 2
+	if next > tokenFailureMaxBackoff {
+		return tokenFailureMaxBackoff
+	}
+	return next
+}
+
+func tokenResolutionFailureLogAttrs(ctx context.Context, key tokenManagerKey, failure tokenManagerFailure, outcome string) []any {
+	execID, _ := logicalExecutionID(ctx)
+	return []any{
+		"outcome", outcome,
+		"exec_id", execID,
+		"profile_hash", tokenProfileFingerprint(key),
+		"profile_selected", key.profile != "",
+		"observed_generation", failure.markerGeneration,
+		"failure_class", string(failure.class),
+		"failure_backoff_ms", failure.backoff.Milliseconds(),
+	}
 }
 
 func tokenResolutionLogAttrs(ctx context.Context, key tokenManagerKey, snapshot AccessTokenSnapshot, outcome string, cacheable bool) []any {

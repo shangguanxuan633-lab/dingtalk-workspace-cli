@@ -56,18 +56,23 @@ var (
 	eventNewEventSource         = newEventSource
 	eventNewDingtalkSource      = source.New
 	eventResolveAccessToken     = ResolveAuxiliaryAccessToken
-	eventResolveTokenForProfile = ResolveAuxiliaryAccessTokenForProfile
-	eventBusRun                 = bus.Run
-	eventReadyFDFromEnv         = busctl.ReadyFDFromEnv
-	eventResolvePersonal        = resolvePersonalEventIdentity
-	eventNewPersonalSource      = newPersonalStreamSource
-	eventMkdirAll               = os.MkdirAll
-	eventOpenFile               = os.OpenFile
-	eventEnumerateBuses         = busctl.EnumerateBuses
-	eventFindBus                = busctl.FindBusByClientID
-	eventQueryEntry             = busctl.QueryEntry
-	eventStopBus                = busctl.Stop
-	eventResolveAppCredentials  = authpkg.ResolveAppCredentialsStrict
+	eventResolveTokenForProfile = func(ctx context.Context, configDir, explicitToken, profile string) (string, error) {
+		if strings.TrimSpace(profile) == "" {
+			return eventResolveAccessToken(ctx, configDir, explicitToken)
+		}
+		return ResolveAuxiliaryAccessTokenForProfile(ctx, configDir, explicitToken, profile)
+	}
+	eventBusRun                = bus.Run
+	eventReadyFDFromEnv        = busctl.ReadyFDFromEnv
+	eventResolvePersonal       = resolvePersonalEventIdentity
+	eventNewPersonalSource     = newPersonalStreamSource
+	eventMkdirAll              = os.MkdirAll
+	eventOpenFile              = os.OpenFile
+	eventEnumerateBuses        = busctl.EnumerateBuses
+	eventFindBus               = busctl.FindBusByClientID
+	eventQueryEntry            = busctl.QueryEntry
+	eventStopBus               = busctl.Stop
+	eventResolveAppCredentials = authpkg.ResolveAppCredentialsStrict
 )
 
 // newEventCommand returns the `event` parent command and all its subcommands.
@@ -207,7 +212,7 @@ SIGTERM、关 stdin，或先用 dws event stop <subscribe_id> --dry-run 预览�
 
 			// Step 2: derive bus working directory + IPC endpoint.
 			editionName := editionNameOrDefault()
-			clientIDHash := dwsevent.ClientIDHash(clientID)
+			clientIDHash := eventStreamIdentityHash(clientID, streamOpts)
 			workDir := eventWorkDir(configDir, editionName, dwsevent.SourceKindAppStream, clientIDHash)
 			ipcEndpoint := defaultIPCEndpoint(workDir, editionName, dwsevent.SourceKindAppStream, clientIDHash)
 
@@ -366,7 +371,7 @@ func runForegroundBus(ctx context.Context, cfg consume.Config, configDir, client
 		ClientID:     cfg.ClientID,
 		Edition:      editionNameOrDefault(),
 		SourceKind:   dwsevent.SourceKindAppStream,
-		IdentityHash: dwsevent.ClientIDHash(cfg.ClientID),
+		IdentityHash: eventStreamIdentityHash(cfg.ClientID, streamOpts),
 		Source:       src,
 		Logger:       slog.Default(),
 	}
@@ -446,6 +451,22 @@ func resolveEventCredentials(configDir string, streamOpts eventStreamTicketOptio
 func eventStreamBusID(streamOpts eventStreamTicketOptions) string {
 	sourceID := eventStreamSourceID(streamOpts.SourceID)
 	return "portal-ticket-normal:" + sourceID
+}
+
+func eventStreamIdentityHash(clientID string, streamOpts eventStreamTicketOptions) string {
+	profile := strings.TrimSpace(streamOpts.Profile)
+	if !streamOpts.enabled() || profile == "" {
+		return dwsevent.ClientIDHash(clientID)
+	}
+	// The exact profile must affect bus identity, but must never appear in
+	// workdir names or metadata. Including mode/source also prevents future
+	// portal connection variants from accidentally sharing one daemon.
+	return dwsevent.IdentityHash(strings.Join([]string{
+		strings.TrimSpace(clientID),
+		streamOpts.normalizedMode(),
+		eventStreamSourceID(streamOpts.SourceID),
+		profile,
+	}, "\x00"))
 }
 
 func newEventSource(ctx context.Context, configDir, clientID, clientSecret string, streamOpts eventStreamTicketOptions) (*source.DingtalkSource, error) {
@@ -610,7 +631,7 @@ func newEventBusCommand() *cobra.Command {
 				clientID = clientIDOverride
 			}
 			editionName := editionNameOrDefault()
-			clientIDHash := dwsevent.ClientIDHash(clientID)
+			clientIDHash := eventStreamIdentityHash(clientID, streamOpts)
 			workDir := eventWorkDir(configDir, editionName, dwsevent.SourceKindAppStream, clientIDHash)
 			endpoint := defaultIPCEndpoint(workDir, editionName, dwsevent.SourceKindAppStream, clientIDHash)
 

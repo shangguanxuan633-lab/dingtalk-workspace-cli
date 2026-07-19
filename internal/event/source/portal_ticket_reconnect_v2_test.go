@@ -195,6 +195,7 @@ func TestPortalErrorsDoNotExposeBodyMessageOrWebsocketTicket(t *testing.T) {
 
 	src, err := New(Config{PortalTicket: &PortalTicketConfig{
 		TicketURL: "https://ticket.invalid", AccessToken: "access", SourceID: "open",
+		DisableReconnect: true,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"endpoint":"ws://127.0.0.1:1/path?existing=` + secret + `","ticket":"` + secret + `"}`)), Header: make(http.Header)}, nil
 		})},
