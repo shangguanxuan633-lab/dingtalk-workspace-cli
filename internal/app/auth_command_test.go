@@ -433,6 +433,41 @@ func TestAuthStatusJSONReportsKeychainUnavailable(t *testing.T) {
 	}
 }
 
+func TestAuthStatusJSONReportsInternalLoadFailureWithoutLeakingCause(t *testing.T) {
+	t.Setenv("DWS_CONFIG_DIR", filepath.Join(t.TempDir(), "config"))
+	const secret = "token-secret-for-uid-4496576595"
+	prev := edition.Get()
+	edition.Override(&edition.Hooks{
+		SaveToken:   func(string, []byte) error { return nil },
+		LoadToken:   func(string) ([]byte, error) { return nil, errors.New("internal key store failed: " + secret) },
+		DeleteToken: func(string) error { return nil },
+	})
+	t.Cleanup(func() { edition.Override(prev) })
+
+	cmd := NewRootCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--format", "json", "auth", "status"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("auth status error = %v\n%s", err, out.String())
+	}
+	var resp struct {
+		Authenticated bool   `json:"authenticated"`
+		Reason        string `json:"reason"`
+		Message       string `json:"message"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Authenticated || resp.Reason != "auth_state_load_failed" || resp.Message == "" {
+		t.Fatalf("response = %+v", resp)
+	}
+	if strings.Contains(out.String(), secret) || strings.Contains(out.String(), "4496576595") {
+		t.Fatalf("internal auth cause leaked: %s", out.String())
+	}
+}
+
 func TestAuthStatusJSONReportsDEKMissing(t *testing.T) {
 	t.Setenv("DWS_CONFIG_DIR", filepath.Join(t.TempDir(), "config"))
 

@@ -144,7 +144,11 @@ func loadTokenDataKeychainAccount(account string) (*TokenData, error) {
 // stops the remote operation when existing ciphertext is already known to be
 // unreadable and therefore unsafe to update.
 func preflightTokenPersistence(configDir string) error {
-	profile := strings.TrimSpace(RuntimeProfile())
+	return preflightTokenPersistenceForProfile(configDir, RuntimeProfile())
+}
+
+func preflightTokenPersistenceForProfile(configDir, profile string) error {
+	profile = strings.TrimSpace(profile)
 	if h := edition.Get(); editionTokenStoreConfigured(h) {
 		if err := validateEditionTokenStore(h); err != nil {
 			return fmt.Errorf("unsafe edition token store: %w", err)
@@ -153,7 +157,11 @@ func preflightTokenPersistence(configDir string) error {
 			return fmt.Errorf("legacy edition token store does not support an explicitly selected profile")
 		}
 		if h.TokenStoreV2 != nil && h.TokenStoreV2.Preflight != nil {
-			if err := h.TokenStoreV2.Preflight(configDir, profile); err != nil {
+			preflightProfile, err := canonicalEditionPreflightProfile(configDir, profile)
+			if err != nil {
+				return fmt.Errorf("resolve TokenStoreV2 preflight profile: %w", err)
+			}
+			if err := h.TokenStoreV2.Preflight(configDir, preflightProfile); err != nil {
 				return fmt.Errorf("edition TokenStoreV2 preflight: %w", err)
 			}
 		} else if h.TokenStoreV2 == nil && h.PreflightTokenStore != nil {
@@ -224,7 +232,11 @@ func preflightTokenRefreshPersistenceForProfile(configDir, profile string, data 
 			return fmt.Errorf("legacy edition token store does not support an explicitly selected profile")
 		}
 		if h.TokenStoreV2 != nil && h.TokenStoreV2.Preflight != nil {
-			if err := h.TokenStoreV2.Preflight(configDir, profile); err != nil {
+			preflightProfile, _, err := canonicalEditionProfileForData(configDir, profile, data)
+			if err != nil {
+				return fmt.Errorf("resolve TokenStoreV2 refresh profile: %w", err)
+			}
+			if err := h.TokenStoreV2.Preflight(configDir, preflightProfile); err != nil {
 				return fmt.Errorf("edition TokenStoreV2 preflight: %w", err)
 			}
 		} else if h.TokenStoreV2 == nil && h.PreflightTokenStore != nil {
@@ -267,6 +279,33 @@ func preflightTokenRefreshPersistenceForProfile(configDir, profile string, data 
 		}
 	}
 	return nil
+}
+
+func canonicalEditionPreflightProfile(configDir, selector string) (string, error) {
+	cfg, err := LoadProfiles(configDir)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureProfilesWritable(cfg); err != nil {
+		return "", err
+	}
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		selector = strings.TrimSpace(cfg.CurrentProfile)
+	}
+	if selector == "" {
+		return "", nil
+	}
+	selected, _, err := resolveProfileSelection(configDir, cfg, selector)
+	if err != nil {
+		// A first login may target a corpId that has no profile metadata yet.
+		// Preflight is storage-wide in that case; never forward the raw alias.
+		return "", nil
+	}
+	if strings.TrimSpace(selected.UserID) == "" {
+		return "", fmt.Errorf("profile %q has no userId", ProfileSelector(*selected))
+	}
+	return ProfileSelector(*selected), nil
 }
 
 // DeleteTokenDataKeychain removes TokenData from the platform keychain.
@@ -328,17 +367,17 @@ func EnsureMigration(configDir string, logger *slog.Logger) {
 		if result.Migrated {
 			if logger != nil {
 				logger.Info("migrated token data to secure keychain storage",
-					"from", result.FromPath,
-					"backup", result.BackupPath)
+					"from_present", strings.TrimSpace(result.FromPath) != "",
+					"backup_present", strings.TrimSpace(result.BackupPath) != "")
 			}
 		} else if result.NeedRelogin {
 			if logger != nil {
 				logger.Warn("cannot migrate legacy token data, please re-login",
-					"error", result.Error)
+					"stage", "legacy_token_migration", "error_type", fmt.Sprintf("%T", result.Error))
 			}
 		} else if result.Error != nil {
 			if logger != nil {
-				logger.Error("migration failed", "error", result.Error)
+				logger.Error("migration failed", "stage", "legacy_token_migration", "error_type", fmt.Sprintf("%T", result.Error))
 			}
 		}
 	})

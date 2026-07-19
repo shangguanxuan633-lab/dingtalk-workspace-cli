@@ -229,6 +229,7 @@ func TestMemoryEditionStoreBlobCarriesGeneration(t *testing.T) {
 }
 
 func TestProfilePinnedProviderSavesRefreshToOriginalProfileAfterRuntimeSwitch(t *testing.T) {
+	t.Setenv("DWS_DISABLE_KEYCHAIN", "1")
 	cleanupKeychain(t)
 	configDir := t.TempDir()
 	previousHooks := edition.Get()

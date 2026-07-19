@@ -48,6 +48,15 @@ func (s *memoryProfileTokenStoreV2) hooks(preflight func(string, string) error) 
 	}}
 }
 
+func v2ProfileToken(corpID, userID, access string) *TokenData {
+	data := rejectedTokenData(access)
+	data.CorpID = corpID
+	data.UserID = userID
+	data.CorpName = corpID + " name"
+	data.UserName = userID + " name"
+	return data
+}
+
 func TestEditionTokenStorePreflightRequiresCompleteTransactionHooks(t *testing.T) {
 	previous := edition.Get()
 	edition.Override(&edition.Hooks{SaveToken: func(string, []byte) error { return nil }})
@@ -94,13 +103,13 @@ func TestEditionTokenStoreV2IsolatesProfilesAndPublishesDeletion(t *testing.T) {
 	})
 	configDir := t.TempDir()
 
-	SetRuntimeProfile("profile-a")
-	dataA := rejectedTokenData("token-a")
+	SetRuntimeProfile("corp-a")
+	dataA := v2ProfileToken("corp-a", "user-a", "token-a")
 	if err := SaveTokenData(configDir, dataA); err != nil {
 		t.Fatal(err)
 	}
-	SetRuntimeProfile("profile-b")
-	dataB := rejectedTokenData("token-b")
+	SetRuntimeProfile("corp-b")
+	dataB := v2ProfileToken("corp-b", "user-b", "token-b")
 	if err := SaveTokenData(configDir, dataB); err != nil {
 		t.Fatal(err)
 	}
@@ -108,18 +117,18 @@ func TestEditionTokenStoreV2IsolatesProfilesAndPublishesDeletion(t *testing.T) {
 		t.Fatalf("generations A=%d B=%d", dataA.Generation, dataB.Generation)
 	}
 
-	loadedA, err := LoadTokenDataForProfile(configDir, "profile-a")
+	loadedA, err := LoadTokenDataForProfile(configDir, "corp-a:user-a")
 	if err != nil || loadedA.AccessToken != "token-a" {
 		t.Fatalf("profile A = %#v, %v", loadedA, err)
 	}
-	loadedB, err := LoadTokenDataForProfile(configDir, "profile-b")
+	loadedB, err := LoadTokenDataForProfile(configDir, "corp-b:user-b")
 	if err != nil || loadedB.AccessToken != "token-b" {
 		t.Fatalf("profile B = %#v, %v", loadedB, err)
 	}
-	if err := preflightTokenRefreshPersistenceForProfile(configDir, "profile-a", loadedA); err != nil {
+	if err := preflightTokenRefreshPersistenceForProfile(configDir, "corp-a:user-a", loadedA); err != nil {
 		t.Fatal(err)
 	}
-	if preflightProfile != "profile-a" {
+	if preflightProfile != "corp-a:user-a" {
 		t.Fatalf("preflight profile = %q", preflightProfile)
 	}
 
@@ -127,17 +136,17 @@ func TestEditionTokenStoreV2IsolatesProfilesAndPublishesDeletion(t *testing.T) {
 	if err != nil || !present {
 		t.Fatalf("marker before delete = (%d, %v, %v)", beforeDelete, present, err)
 	}
-	if err := DeleteTokenDataForProfile(configDir, "profile-a"); err != nil {
+	if err := DeleteTokenDataForProfile(configDir, "corp-a:user-a"); err != nil {
 		t.Fatal(err)
 	}
 	afterDelete, present, err := ReadTokenMarkerGeneration(configDir)
 	if err != nil || !present || afterDelete <= beforeDelete {
 		t.Fatalf("marker after delete = (%d, %v, %v), want > %d", afterDelete, present, err, beforeDelete)
 	}
-	if _, err := LoadTokenDataForProfile(configDir, "profile-a"); !errors.Is(err, ErrTokenDataNotFound) {
+	if _, err := LoadTokenDataForProfile(configDir, "corp-a:user-a"); !errors.Is(err, ErrTokenDataNotFound) {
 		t.Fatalf("deleted profile A load error = %v", err)
 	}
-	loadedB, err = LoadTokenDataForProfile(configDir, "profile-b")
+	loadedB, err = LoadTokenDataForProfile(configDir, "corp-b:user-b")
 	if err != nil || loadedB.AccessToken != "token-b" {
 		t.Fatalf("profile B after deleting A = %#v, %v", loadedB, err)
 	}
@@ -155,14 +164,14 @@ func TestEditionTokenStoreV2PreflightBlocksRejectedRefreshBeforeOAuth(t *testing
 		oauthRefreshToken = previousRefresh
 	})
 	configDir := t.TempDir()
-	SetRuntimeProfile("profile-a")
-	data := rejectedTokenData("rejected")
+	SetRuntimeProfile("corp-a")
+	data := v2ProfileToken("corp-a", "user-a", "rejected")
 	if err := SaveTokenData(configDir, data); err != nil {
 		t.Fatal(err)
 	}
 	sentinel := errors.New("profile store preflight failed")
 	edition.Override(store.hooks(func(_, profile string) error {
-		if profile != "profile-a" {
+		if profile != "corp-a:user-a" {
 			t.Fatalf("preflight profile = %q", profile)
 		}
 		return sentinel
@@ -172,12 +181,230 @@ func TestEditionTokenStoreV2PreflightBlocksRejectedRefreshBeforeOAuth(t *testing
 		exchanges.Add(1)
 		return nil, errors.New("unexpected OAuth refresh")
 	}
-	provider := NewOAuthProviderForProfile(configDir, nil, "profile-a")
+	provider := NewOAuthProviderForProfile(configDir, nil, "corp-a:user-a")
 	if _, err := provider.ForceRefreshRejectedToken(context.Background(), data.AccessToken, data.Generation); !errors.Is(err, sentinel) {
 		t.Fatalf("ForceRefreshRejectedToken() error = %v", err)
 	}
 	if got := exchanges.Load(); got != 0 {
 		t.Fatalf("OAuth refresh exchanges = %d, want 0", got)
+	}
+}
+
+func TestEditionTokenStoreV2ABProfileLifecycleAndPinnedRefresh(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	previousRefresh := oauthRefreshToken
+	store := &memoryProfileTokenStoreV2{}
+	edition.Override(store.hooks(nil))
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+		oauthRefreshToken = previousRefresh
+	})
+	configDir := t.TempDir()
+
+	SetRuntimeProfile("ding-a")
+	a := v2ProfileToken("ding-a", "user-a", "a-old")
+	if err := SaveTokenData(configDir, a); err != nil {
+		t.Fatal(err)
+	}
+	SetRuntimeProfile("ding-b")
+	b := v2ProfileToken("ding-b", "user-b", "b-stable")
+	if err := SaveTokenData(configDir, b); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	_, hasAExact := store.blobs["ding-a:user-a"]
+	_, hasBExact := store.blobs["ding-b:user-b"]
+	_, hasARaw := store.blobs["ding-a"]
+	_, hasBRaw := store.blobs["ding-b"]
+	store.mu.Unlock()
+	if !hasAExact || !hasBExact || hasARaw || hasBRaw {
+		t.Fatalf("store keys exact=(%v,%v) raw=(%v,%v)", hasAExact, hasBExact, hasARaw, hasBRaw)
+	}
+	profiles, err := LoadProfiles(configDir)
+	if err != nil || len(profiles.Profiles) != 2 {
+		t.Fatalf("profiles after A/B login = %#v, %v", profiles, err)
+	}
+	if _, err := SetCurrentProfile(configDir, "ding-b"); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := LoadTokenDataForProfile(configDir, "")
+	if err != nil || selected.AccessToken != "b-stable" {
+		t.Fatalf("selected B token = %#v, %v", selected, err)
+	}
+
+	var refreshedProfile string
+	oauthRefreshToken = func(p *OAuthProvider, _ context.Context, current *TokenData) (*TokenData, error) {
+		refreshedProfile = p.runtimeProfile()
+		out := *current
+		out.AccessToken = "a-new"
+		out.ExpiresAt = time.Now().Add(time.Hour)
+		if err := saveTokenDataLockedForProfile(p.configDir, p.runtimeProfile(), &out); err != nil {
+			return nil, err
+		}
+		return &out, nil
+	}
+	providerA := NewOAuthProviderForProfile(configDir, nil, "ding-a:user-a")
+	if got, err := providerA.ForceRefreshRejectedToken(context.Background(), "a-old", a.Generation); err != nil || got != "a-new" {
+		t.Fatalf("refresh A = %q, %v", got, err)
+	}
+	if refreshedProfile != "ding-a:user-a" {
+		t.Fatalf("refresh lease = %q", refreshedProfile)
+	}
+	loadedB, err := LoadTokenDataForProfile(configDir, "ding-b:user-b")
+	if err != nil || loadedB.AccessToken != "b-stable" {
+		t.Fatalf("B changed during A refresh = %#v, %v", loadedB, err)
+	}
+}
+
+func TestEditionTokenStoreV2MigratesLegacyEmptyOAuthSlot(t *testing.T) {
+	previous := edition.Get()
+	store := &memoryProfileTokenStoreV2{}
+	edition.Override(store.hooks(nil))
+	t.Cleanup(func() { edition.Override(previous) })
+	configDir := t.TempDir()
+	legacy := v2ProfileToken("ding-a", "user-a", "legacy-a")
+	blob, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.blobs[""] = blob
+	if err := tokenWriteMarkerGeneration(configDir, false, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadTokenDataForProfile(configDir, "")
+	if err != nil || loaded.AccessToken != "legacy-a" {
+		t.Fatalf("legacy load = %#v, %v", loaded, err)
+	}
+	store.mu.Lock()
+	_, exactExists := store.blobs["ding-a:user-a"]
+	_, emptyExists := store.blobs[""]
+	store.mu.Unlock()
+	if !exactExists || emptyExists {
+		t.Fatalf("migration exact=%v empty=%v", exactExists, emptyExists)
+	}
+	profiles, err := LoadProfiles(configDir)
+	if err != nil || profiles.CurrentProfile != "ding-a:user-a" || len(profiles.Profiles) != 1 {
+		t.Fatalf("migrated profiles = %#v, %v", profiles, err)
+	}
+}
+
+func TestEditionTokenStoreV2MigratesCurrentMetadataFromLegacyEmptySlot(t *testing.T) {
+	previous := edition.Get()
+	store := &memoryProfileTokenStoreV2{}
+	edition.Override(store.hooks(nil))
+	t.Cleanup(func() { edition.Override(previous) })
+	configDir := t.TempDir()
+	legacy := v2ProfileToken("ding-a", "user-a", "legacy-a")
+	if err := SaveProfiles(configDir, &ProfilesConfig{
+		Version:        profilesVersion,
+		CurrentProfile: "ding-a:user-a",
+		Profiles: []Profile{{
+			Name: "alias-a", CorpID: "ding-a", UserID: "user-a", Status: ProfileStatusActive,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	blob, _ := json.Marshal(legacy)
+	store.blobs[""] = blob
+	if err := tokenWriteMarkerGeneration(configDir, false, 1); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadTokenDataForProfile(configDir, "alias-a")
+	if err != nil || loaded.AccessToken != "legacy-a" {
+		t.Fatalf("metadata migration load = %#v, %v", loaded, err)
+	}
+	store.mu.Lock()
+	_, exactExists := store.blobs["ding-a:user-a"]
+	_, emptyExists := store.blobs[""]
+	store.mu.Unlock()
+	if !exactExists || emptyExists {
+		t.Fatalf("metadata migration exact=%v empty=%v", exactExists, emptyExists)
+	}
+}
+
+func TestEditionTokenStoreV2ManualTokenOverridesAndSurvivesSelectiveLogout(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	store := &memoryProfileTokenStoreV2{}
+	edition.Override(store.hooks(nil))
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+	})
+	configDir := t.TempDir()
+	SetRuntimeProfile("")
+	if err := SaveTokenData(configDir, v2ProfileToken("ding-a", "user-a", "oauth-a")); err != nil {
+		t.Fatal(err)
+	}
+	manual := rejectedTokenData("manual")
+	manual.RefreshToken = ""
+	manual.RefreshExpAt = time.Time{}
+	if err := SaveTokenData(configDir, manual); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadTokenDataForProfile(configDir, "")
+	if err != nil || loaded.AccessToken != "manual" {
+		t.Fatalf("manual default = %#v, %v", loaded, err)
+	}
+	if err := DeleteTokenDataForProfile(configDir, "ding-a:user-a"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = LoadTokenDataForProfile(configDir, "")
+	if err != nil || loaded.AccessToken != "manual" {
+		t.Fatalf("manual after selective logout = %#v, %v", loaded, err)
+	}
+	manualMarker, err := manualTokenMarkerActive(configDir)
+	if err != nil || !manualMarker {
+		t.Fatalf("manual marker = %v, %v", manualMarker, err)
+	}
+}
+
+func TestEditionTokenStoreV2LogoutAllSweepsKnownAndOrphanSlots(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	store := &memoryProfileTokenStoreV2{}
+	hooks := store.hooks(nil)
+	hooks.TokenStoreV2.DeleteAll = func(string) error {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		clear(store.blobs)
+		return nil
+	}
+	edition.Override(hooks)
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+	})
+	configDir := t.TempDir()
+	SetRuntimeProfile("ding-a")
+	if err := SaveTokenData(configDir, v2ProfileToken("ding-a", "user-a", "a")); err != nil {
+		t.Fatal(err)
+	}
+	SetRuntimeProfile("ding-b")
+	if err := SaveTokenData(configDir, v2ProfileToken("ding-b", "user-b", "b")); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.blobs["old-raw-alias"] = []byte(`{"access_token":"orphan"}`)
+	store.mu.Unlock()
+	if err := DeleteAllTokenData(configDir); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	remaining := len(store.blobs)
+	store.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("remaining token blobs = %d", remaining)
+	}
+	profiles, err := LoadProfiles(configDir)
+	if err != nil || len(profiles.Profiles) != 0 || profiles.CurrentProfile != "" {
+		t.Fatalf("profiles after logout-all = %#v, %v", profiles, err)
+	}
+	if _, present, err := ReadTokenMarkerGeneration(configDir); err != nil || present {
+		t.Fatalf("marker after logout-all present=%v err=%v", present, err)
 	}
 }
 

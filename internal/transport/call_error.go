@@ -27,8 +27,6 @@ func (e *CallError) Error() string {
 		return ""
 	}
 	switch {
-	case e.Cause != nil:
-		return e.Cause.Error()
 	case e.HTTPStatus != 0:
 		return fmt.Sprintf("%s failure: http %d", e.Stage, e.HTTPStatus)
 	case e.RPCCode != 0:

@@ -105,6 +105,7 @@ type personalStopOptions struct {
 type personalStreamSourceOptions struct {
 	ConfigDir        string
 	Identity         personal.Identity
+	Profile          string
 	TicketMode       string
 	TicketURL        string
 	ClientIDOverride string
@@ -132,6 +133,12 @@ var (
 	personalFindProcess                 = os.FindProcess
 	personalSignalProcess               = (*os.Process).Signal
 	personalResolveAuxiliaryAccessToken = ResolveAuxiliaryAccessToken
+	personalResolveAuxiliaryForProfile  = func(ctx context.Context, configDir, explicitToken, profile string) (string, error) {
+		if strings.TrimSpace(profile) == "" {
+			return personalResolveAuxiliaryAccessToken(ctx, configDir, explicitToken)
+		}
+		return ResolveAuxiliaryAccessTokenForProfile(ctx, configDir, explicitToken, profile)
+	}
 	personalLoadTokenData               = authpkg.LoadTokenData
 	personalClientID                    = authpkg.ClientID
 	personalResolveAppCredentialsStrict = authpkg.ResolveAppCredentialsStrict
@@ -720,11 +727,20 @@ func printPersonalStopResult(w io.Writer, subscribeIDs []string, single bool, bu
 }
 
 func resolvePersonalEventIdentity(ctx context.Context, configDir string, sourceIDOverride string) (personal.Identity, error) {
-	accessToken, err := personalResolveAuxiliaryAccessToken(ctx, configDir, "")
+	profileLease, err := captureEventProfileLease(configDir)
 	if err != nil {
 		return personal.Identity{}, err
 	}
-	tokenData, err := personalLoadTokenData(configDir)
+	accessToken, err := personalResolveAuxiliaryForProfile(ctx, configDir, "", profileLease)
+	if err != nil {
+		return personal.Identity{}, err
+	}
+	var tokenData *authpkg.TokenData
+	if profileLease == "" {
+		tokenData, err = personalLoadTokenData(configDir)
+	} else {
+		tokenData, err = authpkg.LoadTokenDataForProfile(configDir, profileLease)
+	}
 	if err != nil && !errors.Is(err, authpkg.ErrTokenDataNotFound) && !errors.Is(err, os.ErrNotExist) {
 		return personal.Identity{}, fmt.Errorf("load OAuth identity metadata: %w", err)
 	}
@@ -778,8 +794,9 @@ func newPersonalEventControlClient(configDir, baseURL string, identity personal.
 	// callers, while this client must resolve the current token per request.
 	identity.AccessToken = ""
 	client := personal.NewClient(baseURL, identity)
+	profileLease := authpkg.ProfileSelector(authpkg.Profile{CorpID: identity.CorpID, UserID: identity.UserID})
 	client.AccessTokenProvider = func(ctx context.Context) (string, error) {
-		return personalResolveAuxiliaryAccessToken(ctx, configDir, "")
+		return personalResolveAuxiliaryForProfile(ctx, configDir, "", profileLease)
 	}
 	return client
 }
@@ -831,9 +848,13 @@ func newPersonalStreamSource(ctx context.Context, opts personalStreamSourceOptio
 		clientSecret = secret
 	}
 	_ = ctx
+	profileLease := strings.TrimSpace(opts.Profile)
+	if profileLease == "" {
+		profileLease = authpkg.ProfileSelector(authpkg.Profile{CorpID: opts.Identity.CorpID, UserID: opts.Identity.UserID})
+	}
 	return source.NewPersonal(source.PersonalConfig{
 		AccessTokenProvider: func(ctx context.Context) (string, error) {
-			return personalResolveAuxiliaryAccessToken(ctx, opts.ConfigDir, "")
+			return personalResolveAuxiliaryForProfile(ctx, opts.ConfigDir, "", profileLease)
 		},
 		ClientID:     clientID,
 		ClientSecret: clientSecret,

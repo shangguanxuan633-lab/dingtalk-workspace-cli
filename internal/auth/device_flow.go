@@ -220,7 +220,7 @@ func (p *DeviceFlowProvider) Login(ctx context.Context) (*TokenData, error) {
 		p.clientID = mcpClientID
 		SetClientIDFromMCP(mcpClientID)
 		if p.logger != nil {
-			p.logger.Debug("fetched client ID from MCP server", "clientID", mcpClientID)
+			p.logger.Debug("fetched client ID from MCP server", "stage", "device_client_id", "client_id_present", strings.TrimSpace(mcpClientID) != "")
 		}
 	}
 	preflightProvider := NewOAuthProvider(p.configDir, p.logger)
@@ -256,7 +256,7 @@ func (p *DeviceFlowProvider) loginOnce(ctx context.Context, attempt int) (*Token
 
 	if authResp.VerificationURIComplete != "" && !p.NoBrowser {
 		if bErr := deviceOpenBrowser(authResp.VerificationURIComplete); bErr != nil && p.logger != nil {
-			p.logger.Debug("could not open browser", "error", bErr)
+			p.logger.Debug("could not open browser", "stage", "device_browser_open", "error_type", fmt.Sprintf("%T", bErr))
 		}
 	}
 
@@ -319,9 +319,6 @@ func (p *DeviceFlowProvider) loginOnce(ctx context.Context, attempt int) (*Token
 			return nil, errors.New(i18n.T("当前组织已开启渠道管控，请升级到最新版本的 CLI 后重试"))
 		case "enterprise_not_authorized":
 			msg := i18n.T("本次请求未通过企业安全认证")
-			if authStatus != nil && strings.TrimSpace(authStatus.ErrorMsg) != "" {
-				msg = strings.TrimSpace(authStatus.ErrorMsg)
-			}
 			_, _ = fmt.Fprintln(p.output(), dfRed("⚠️  "+msg))
 			_, _ = fmt.Fprintln(p.output(), "")
 			return nil, errors.New(msg)
@@ -391,7 +388,7 @@ func (p *DeviceFlowProvider) requestDeviceCode(ctx context.Context) (*DeviceAuth
 		return nil, fmt.Errorf("%s: %w", i18n.T("解析响应失败"), err)
 	}
 	if !sr.Success {
-		return nil, fmt.Errorf("%s: [%s] %s", i18n.T("服务端返回错误"), sr.ErrorCode, sr.ErrorMsg)
+		return nil, fmt.Errorf("%s (code: %s)", i18n.T("服务端返回错误"), SafeOAuthDiagnosticCode(sr.ErrorCode))
 	}
 
 	var resp DeviceAuthResponse
@@ -427,7 +424,7 @@ func (p *DeviceFlowProvider) pollDeviceToken(ctx context.Context, deviceCode str
 		return nil, fmt.Errorf("%s: %w", i18n.T("解析响应失败"), err)
 	}
 	if !sr.Success {
-		return nil, fmt.Errorf("%s: %s %s", i18n.T("服务端返回错误"), sr.ErrorCode, sr.ErrorMsg)
+		return nil, fmt.Errorf("%s (code: %s)", i18n.T("服务端返回错误"), SafeOAuthDiagnosticCode(sr.ErrorCode))
 	}
 
 	var resp DeviceTokenResponse
@@ -498,7 +495,7 @@ func (p *DeviceFlowProvider) waitForAuthorizationByFlowID(ctx context.Context, a
 		if err != nil {
 			dfPrintPollResult(p.output(), "network_error", i18n.T("网络错误，继续重试..."))
 			if p.logger != nil {
-				p.logger.Debug("poll error", "error", err)
+				p.logger.Debug("poll error", "stage", "device_status_poll", "error_type", fmt.Sprintf("%T", err))
 			}
 			continue
 		}
@@ -549,7 +546,7 @@ func (p *DeviceFlowProvider) waitForAuthorizationByDeviceCode(ctx context.Contex
 		if err != nil {
 			dfPrintPollResult(p.output(), "network_error", i18n.T("网络错误，继续重试..."))
 			if p.logger != nil {
-				p.logger.Debug("poll error", "error", err)
+				p.logger.Debug("poll error", "stage", "device_token_poll", "error_type", fmt.Sprintf("%T", err))
 			}
 			continue
 		}

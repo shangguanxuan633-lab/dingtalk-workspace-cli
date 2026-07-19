@@ -74,7 +74,7 @@ func TestCrossPlatformCoverageCallErrorAndRedirectEdges(t *testing.T) {
 		t.Fatal("nil call error did not stay empty")
 	}
 	cause := errors.New("cause")
-	if got := (&CallError{Cause: cause}).Error(); got != "cause" {
+	if got := (&CallError{Stage: CallStageRequest, Cause: cause}).Error(); got != "request failure" {
 		t.Fatalf("cause error = %q", got)
 	}
 	if !errors.Is(&CallError{Cause: cause}, cause) {

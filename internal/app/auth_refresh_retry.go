@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
@@ -55,6 +56,7 @@ func withAuthRetrying(ctx context.Context) context.Context {
 }
 
 var forceRefreshRejectedTokenFunc = ForceRefreshRejectedToken
+var forceRefreshRejectedTokenForProfileFunc = forceRefreshRejectedTokenForProfile
 
 func (r *runtimeRunner) maybeAuthRefreshRetry(
 	ctx context.Context,
@@ -102,7 +104,7 @@ func forceRefreshRejectedTokenForSnapshot(ctx context.Context, configDir string,
 	if !rejected.profilePinned {
 		return forceRefreshRejectedTokenFunc(ctx, configDir, rejected.AccessToken, rejected.Generation)
 	}
-	return forceRefreshRejectedTokenForProfile(ctx, configDir, rejected.profile, rejected.AccessToken, rejected.Generation)
+	return forceRefreshRejectedTokenForProfileFunc(ctx, configDir, rejected.profile, rejected.AccessToken, rejected.Generation)
 }
 
 func deleteRejectedTokenForSnapshot(ctx context.Context, configDir string, rejected AccessTokenSnapshot) (bool, error) {
@@ -128,17 +130,104 @@ func coreAuthRejectionFromError(err error) (*authretry.AuthRefreshRequired, bool
 }
 
 func coreAuthRejectionFromContent(content map[string]any) (*authretry.AuthRefreshRequired, bool) {
+	if hasAuthRefreshVeto(content, 0) {
+		return nil, false
+	}
 	code := exactAuthRejectionCode(content, 0)
 	if code == "" {
 		return nil, false
 	}
-	diag := transport.ExtractServerDiagnosticsFromMap(content)
+	rawDiag := transport.ExtractServerDiagnosticsFromMap(content)
+	// Auth-recovery payloads are adversarial input. Preserve only correlation
+	// metadata and the exact allowlisted code that triggered this branch; free
+	// text and URLs may contain bearer tokens, user IDs, or signed credentials.
+	diag := apperrors.ServerDiagnostics{
+		TraceID:         safeAuthTraceID(rawDiag.TraceID),
+		ServerErrorCode: code,
+	}
 	return &authretry.AuthRefreshRequired{Cause: apperrors.NewAuth(
 		"access token was rejected by the server",
 		apperrors.WithOperation("tools/call"),
 		apperrors.WithReason("access_token_rejected"),
 		apperrors.WithServerDiag(diag),
 	)}, true
+}
+
+func safeAuthTraceID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == ':' || r == '.' {
+			continue
+		}
+		return ""
+	}
+	return value
+}
+
+func hasAuthRefreshVeto(value any, depth int) bool {
+	if depth > 8 {
+		return false
+	}
+	switch current := value.(type) {
+	case map[string]any:
+		for key, child := range current {
+			compactKey := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
+			switch compactKey {
+			case "httpstatus", "status", "statuscode", "rpcstatus":
+				if isForbiddenCode(child) {
+					return true
+				}
+			case "code", "errorcode", "errcode", "servererrorcode":
+				if code, ok := child.(string); ok && isAuthRefreshVetoCode(code) {
+					return true
+				}
+			case "missingscope", "missingscopes":
+				if child != nil && strings.TrimSpace(fmt.Sprint(child)) != "" {
+					return true
+				}
+			}
+			if hasAuthRefreshVeto(child, depth+1) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range current {
+			if hasAuthRefreshVeto(child, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isForbiddenCode(value any) bool {
+	switch code := value.(type) {
+	case int:
+		return code == http.StatusForbidden
+	case int64:
+		return code == http.StatusForbidden
+	case float64:
+		return code == http.StatusForbidden
+	case string:
+		return strings.TrimSpace(code) == "403"
+	default:
+		return false
+	}
+}
+
+func isAuthRefreshVetoCode(code string) bool {
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case "CLI_ORG_NOT_AUTHORIZED", "AUTH_PERMISSION_DENIED", "PERMISSION_DENIED",
+		"PAT_NO_PERMISSION", "PAT_LOW_RISK_NO_PERMISSION", "PAT_MEDIUM_RISK_NO_PERMISSION",
+		"PAT_HIGH_RISK_NO_PERMISSION", "PAT_ORG_POLICY_DENIED", "AGENT_CODE_NOT_EXISTS",
+		"PAT_BATCH_AUTH_PENDING", "PAT_SCOPE_AUTH_REQUIRED":
+		return true
+	default:
+		return false
+	}
 }
 
 func exactAuthRejectionCode(value any, depth int) string {

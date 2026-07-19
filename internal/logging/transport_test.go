@@ -78,8 +78,11 @@ func TestLogResponseError(t *testing.T) {
 	if !strings.Contains(out, "WARN") {
 		t.Error("error response should be WARN level")
 	}
-	if !strings.Contains(out, "connection refused") {
-		t.Error("error message missing")
+	if !strings.Contains(out, "error_type") {
+		t.Error("safe error type missing")
+	}
+	if strings.Contains(out, "connection refused") {
+		t.Error("raw transport error must not be logged")
 	}
 }
 

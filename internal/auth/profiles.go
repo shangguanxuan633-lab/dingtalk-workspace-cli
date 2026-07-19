@@ -619,7 +619,14 @@ func setCurrentProfileLocked(configDir, selector string) (*Profile, error) {
 		return nil, err
 	}
 	originalCfg := cloneProfilesConfig(cfg)
-	mirrors, err := snapshotProfileSelectionMirrors(configDir, p.CorpID)
+	profileStoreV2 := editionTokenStoreSupportsProfiles(edition.Get())
+	var mirrors profileSelectionMirrorSnapshot
+	var marker tokenMarkerSnapshot
+	if profileStoreV2 {
+		marker, err = snapshotTokenMarker(configDir)
+	} else {
+		mirrors, err = snapshotProfileSelectionMirrors(configDir, p.CorpID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -638,6 +645,18 @@ func setCurrentProfileLocked(configDir, selector string) (*Profile, error) {
 	touchProfileUsage(p)
 	if err := profilesSave(configDir, cfg); err != nil {
 		return nil, err
+	}
+	if profileStoreV2 {
+		if err := profilesBumpMarker(configDir, false, marker.generation); err != nil {
+			var rollbackErr error
+			rollbackErr = errors.Join(rollbackErr, profilesSave(configDir, originalCfg))
+			rollbackErr = errors.Join(rollbackErr, restoreTokenMarker(configDir, marker))
+			if rollbackErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("rollback TokenStoreV2 profile selection: %w", rollbackErr))
+			}
+			return nil, err
+		}
+		return findExactProfile(cfg, p.CorpID, p.UserID), nil
 	}
 	if err := syncOrganizationTokenMirrorForProfile(*p); err != nil {
 		return nil, rollbackProfileSelection(configDir, originalCfg, p.CorpID, mirrors, err)
@@ -679,7 +698,14 @@ func usePreviousProfileLocked(configDir string) (*Profile, error) {
 		return nil, fmt.Errorf("resolve previous profile %q: %w", prev, err)
 	}
 	originalCfg := cloneProfilesConfig(cfg)
-	mirrors, err := snapshotProfileSelectionMirrors(configDir, p.CorpID)
+	profileStoreV2 := editionTokenStoreSupportsProfiles(edition.Get())
+	var mirrors profileSelectionMirrorSnapshot
+	var marker tokenMarkerSnapshot
+	if profileStoreV2 {
+		marker, err = snapshotTokenMarker(configDir)
+	} else {
+		mirrors, err = snapshotProfileSelectionMirrors(configDir, p.CorpID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -697,6 +723,18 @@ func usePreviousProfileLocked(configDir string) (*Profile, error) {
 	touchProfileUsage(p)
 	if err := profilesSave(configDir, cfg); err != nil {
 		return nil, err
+	}
+	if profileStoreV2 {
+		if err := profilesBumpMarker(configDir, false, marker.generation); err != nil {
+			var rollbackErr error
+			rollbackErr = errors.Join(rollbackErr, profilesSave(configDir, originalCfg))
+			rollbackErr = errors.Join(rollbackErr, restoreTokenMarker(configDir, marker))
+			if rollbackErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("rollback TokenStoreV2 previous-profile selection: %w", rollbackErr))
+			}
+			return nil, err
+		}
+		return findExactProfile(cfg, p.CorpID, p.UserID), nil
 	}
 	if err := syncOrganizationTokenMirrorForProfile(*p); err != nil {
 		return nil, rollbackProfileSelection(configDir, originalCfg, p.CorpID, mirrors, err)

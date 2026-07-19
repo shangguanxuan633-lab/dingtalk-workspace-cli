@@ -66,15 +66,23 @@ type ToolCaller interface {
 type RuntimeDefaultFn func(ctx context.Context) (string, bool)
 
 // TokenStoreV2Hooks is the profile-aware transactional credential-store
-// contract. profile is a logical selector captured by Core for the complete
-// read/refresh/write transaction; implementations that use it in a filesystem
-// path must first map it to a fixed-width hash or another traversal-safe key.
-// Core remains the sole owner of token publication markers and generations.
+// contract. Every non-empty profile delivered to Save/Load/Delete/Preflight is
+// a Core-canonical exact identity (`corpId:userId`), never a user alias, org
+// name, or mutable current selector. Empty is reserved for the manual/legacy
+// singleton (and storage-wide preflight before a first login knows userId).
+// Hosts must treat the value as opaque and map it to a fixed-width hash or
+// another traversal-safe key; they must not resolve aliases themselves. Core
+// remains the sole owner of profiles metadata, publication markers, and
+// generations.
 type TokenStoreV2Hooks struct {
 	Preflight func(configDir, profile string) error
 	Save      func(configDir, profile string, data []byte) error
 	Load      func(configDir, profile string) ([]byte, error)
 	Delete    func(configDir, profile string) error
+	// DeleteAll removes only this store's token-blob namespace, including
+	// historical orphan/raw-selector blobs that Core cannot enumerate from
+	// profiles.json. Core remains responsible for metadata and marker cleanup.
+	DeleteAll func(configDir string) error
 }
 
 // Hooks groups all edition-specific behavioural overrides. Zero values

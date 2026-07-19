@@ -168,7 +168,7 @@ func cleanupLegacySiblingAppConfig(configDir string, config *AppConfig) {
 	}
 
 	if err := appConfigRemove(legacyPath); err != nil && !os.IsNotExist(err) {
-		slog.Debug("auth: best-effort cleanup of legacy app config failed", "path", legacyPath, "error", err)
+		slog.Debug("auth: best-effort cleanup of legacy app config failed", "stage", "legacy_app_config_cleanup", "path_present", legacyPath != "", "error_type", fmt.Sprintf("%T", err))
 	}
 }
 

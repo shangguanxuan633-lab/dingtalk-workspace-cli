@@ -45,28 +45,29 @@ import (
 )
 
 var (
-	eventRunPersonalConsume    = runPersonalEventConsume
-	eventRunPersonalList       = runPersonalEventList
-	eventRunPersonalStatus     = runPersonalEventStatus
-	eventRunPersonalStop       = runPersonalEventStop
-	eventNormalizeAs           = normalizeEventAs
-	eventResolveCredentials    = resolveEventCredentials
-	eventConsumeRun            = consume.Run
-	eventRunForeground         = runForegroundBus
-	eventNewEventSource        = newEventSource
-	eventNewDingtalkSource     = source.New
-	eventResolveAccessToken    = ResolveAuxiliaryAccessToken
-	eventBusRun                = bus.Run
-	eventReadyFDFromEnv        = busctl.ReadyFDFromEnv
-	eventResolvePersonal       = resolvePersonalEventIdentity
-	eventNewPersonalSource     = newPersonalStreamSource
-	eventMkdirAll              = os.MkdirAll
-	eventOpenFile              = os.OpenFile
-	eventEnumerateBuses        = busctl.EnumerateBuses
-	eventFindBus               = busctl.FindBusByClientID
-	eventQueryEntry            = busctl.QueryEntry
-	eventStopBus               = busctl.Stop
-	eventResolveAppCredentials = authpkg.ResolveAppCredentialsStrict
+	eventRunPersonalConsume     = runPersonalEventConsume
+	eventRunPersonalList        = runPersonalEventList
+	eventRunPersonalStatus      = runPersonalEventStatus
+	eventRunPersonalStop        = runPersonalEventStop
+	eventNormalizeAs            = normalizeEventAs
+	eventResolveCredentials     = resolveEventCredentials
+	eventConsumeRun             = consume.Run
+	eventRunForeground          = runForegroundBus
+	eventNewEventSource         = newEventSource
+	eventNewDingtalkSource      = source.New
+	eventResolveAccessToken     = ResolveAuxiliaryAccessToken
+	eventResolveTokenForProfile = ResolveAuxiliaryAccessTokenForProfile
+	eventBusRun                 = bus.Run
+	eventReadyFDFromEnv         = busctl.ReadyFDFromEnv
+	eventResolvePersonal        = resolvePersonalEventIdentity
+	eventNewPersonalSource      = newPersonalStreamSource
+	eventMkdirAll               = os.MkdirAll
+	eventOpenFile               = os.OpenFile
+	eventEnumerateBuses         = busctl.EnumerateBuses
+	eventFindBus                = busctl.FindBusByClientID
+	eventQueryEntry             = busctl.QueryEntry
+	eventStopBus                = busctl.Stop
+	eventResolveAppCredentials  = authpkg.ResolveAppCredentialsStrict
 )
 
 // newEventCommand returns the `event` parent command and all its subcommands.
@@ -190,6 +191,11 @@ SIGTERM、关 stdin，或先用 dws event stop <subscribe_id> --dry-run 预览�
 			// Portal ticket normal mode uses portal-managed app credentials, so
 			// local ClientSecret is intentionally not required there.
 			configDir := defaultConfigDir()
+			profileLease, err := captureEventProfileLease(configDir)
+			if err != nil {
+				return fmt.Errorf("event consume: resolve profile lease: %w", err)
+			}
+			streamOpts.Profile = profileLease
 			clientID, clientSecret, err := eventResolveCredentials(configDir, streamOpts)
 			if err != nil {
 				return fmt.Errorf("event consume: %w", err)
@@ -372,6 +378,8 @@ type eventStreamTicketOptions struct {
 	Mode      string
 	SourceID  string
 	TicketURL string
+	// Profile is the exact corpId:userId lease captured at logical startup.
+	Profile string
 }
 
 func (o eventStreamTicketOptions) enabled() bool {
@@ -397,7 +405,34 @@ func (o eventStreamTicketOptions) spawnArgs() []string {
 	if ticketURL := strings.TrimSpace(o.TicketURL); ticketURL != "" {
 		args = append(args, "--stream-ticket-url", ticketURL)
 	}
+	if profile := strings.TrimSpace(o.Profile); profile != "" {
+		args = append(args, "--profile", profile)
+	}
 	return args
+}
+
+func captureEventProfileLease(configDir string) (string, error) {
+	selector := strings.TrimSpace(authpkg.RuntimeProfile())
+	if selector == "" {
+		manual, err := authpkg.ManualTokenMarkerActive(configDir)
+		if err != nil {
+			return "", err
+		}
+		if manual {
+			return "", nil
+		}
+	}
+	selected, err := authpkg.ResolveProfile(configDir, selector)
+	if err != nil {
+		return "", err
+	}
+	if selected == nil {
+		if selector != "" {
+			return "", authpkg.ErrTokenDataNotFound
+		}
+		return "", nil
+	}
+	return authpkg.ProfileSelector(*selected), nil
 }
 
 func resolveEventCredentials(configDir string, streamOpts eventStreamTicketOptions) (clientID, clientSecret string, err error) {
@@ -434,7 +469,7 @@ func newEventSource(ctx context.Context, configDir, clientID, clientSecret strin
 		PortalTicket: &source.PortalTicketConfig{
 			TicketURL: eventStreamTicketURL(streamOpts.TicketURL),
 			AccessTokenProvider: func(ctx context.Context) (string, error) {
-				return eventResolveAccessToken(ctx, configDir, "")
+				return eventResolveTokenForProfile(ctx, configDir, "", streamOpts.Profile)
 			},
 			SourceID:     eventStreamSourceID(streamOpts.SourceID),
 			Mode:         streamOpts.Mode,
@@ -510,6 +545,11 @@ func newEventBusCommand() *cobra.Command {
 			}
 
 			configDir := defaultConfigDir()
+			profileLease, err := captureEventProfileLease(configDir)
+			if err != nil {
+				return failEarly(fmt.Errorf("event _bus: resolve profile lease: %w", err))
+			}
+			streamOpts.Profile = profileLease
 			sourceKind := dwsevent.SourceKind(strings.TrimSpace(sourceKindRaw))
 			if sourceKind == "" {
 				sourceKind = dwsevent.SourceKindAppStream
@@ -529,6 +569,7 @@ func newEventBusCommand() *cobra.Command {
 				src, err := eventNewPersonalSource(ctx, personalStreamSourceOptions{
 					ConfigDir:        configDir,
 					Identity:         identity,
+					Profile:          streamOpts.Profile,
 					TicketMode:       streamOpts.Mode,
 					TicketURL:        streamOpts.TicketURL,
 					ClientIDOverride: clientIDOverride,

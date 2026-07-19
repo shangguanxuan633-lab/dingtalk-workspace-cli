@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,6 +30,7 @@ func installAuthRetryUnitSeams(t *testing.T) (*int, *int) {
 	t.Helper()
 	previousHooks := edition.Get()
 	previousRefresh := forceRefreshRejectedTokenFunc
+	previousProfileRefresh := forceRefreshRejectedTokenForProfileFunc
 	hookCalls, refreshCalls := new(int), new(int)
 	edition.Override(&edition.Hooks{OnAuthError: func(string, error) error {
 		(*hookCalls)++
@@ -37,9 +40,14 @@ func installAuthRetryUnitSeams(t *testing.T) (*int, *int) {
 		(*refreshCalls)++
 		return "", context.DeadlineExceeded
 	}
+	forceRefreshRejectedTokenForProfileFunc = func(context.Context, string, string, string, ...uint64) (string, error) {
+		(*refreshCalls)++
+		return "", context.DeadlineExceeded
+	}
 	t.Cleanup(func() {
 		edition.Override(previousHooks)
 		forceRefreshRejectedTokenFunc = previousRefresh
+		forceRefreshRejectedTokenForProfileFunc = previousProfileRefresh
 	})
 	return hookCalls, refreshCalls
 }
@@ -185,6 +193,52 @@ func TestCoreAuthRejectionAcceptsExact40014RepresentationsOnly(t *testing.T) {
 	}
 }
 
+func TestCoreAuthRejectionMixedPermissionSignalVetoesRefresh(t *testing.T) {
+	for _, content := range []map[string]any{
+		{"code": 40014, "details": map[string]any{"errorCode": "PERMISSION_DENIED"}},
+		{"errorCode": "TOKEN_VERIFIED_FAILED", "data": map[string]any{"httpStatus": 403}},
+		{"code": 40014, "data": map[string]any{"missingScope": "mail:send"}},
+	} {
+		if _, ok := coreAuthRejectionFromContent(content); ok {
+			t.Fatalf("mixed permission payload triggered refresh: %#v", content)
+		}
+	}
+}
+
+func TestCoreAuthRejectionDropsFreeTextAndCredentialURLs(t *testing.T) {
+	const (
+		secret = "access-token-secret"
+		uid    = "4496576595"
+	)
+	marker, ok := coreAuthRejectionFromContent(map[string]any{
+		"code":             40014,
+		"trace_id":         "trace-safe-1",
+		"technical_detail": "token=" + secret + " uid=" + uid,
+		"friendly_hint":    "retry as uid " + uid,
+		"action_url":       "https://example.invalid/retry?access_token=" + secret,
+	})
+	if !ok {
+		t.Fatal("allowlisted rejection not recognized")
+	}
+	var typed *apperrors.Error
+	if !errors.As(marker, &typed) {
+		t.Fatalf("marker cause = %T", marker)
+	}
+	if typed.ServerDiag.TraceID != "trace-safe-1" || typed.ServerDiag.ServerErrorCode != "40014" {
+		t.Fatalf("safe diagnostics = %#v", typed.ServerDiag)
+	}
+	if typed.ServerDiag.TechnicalDetail != "" || typed.ServerDiag.FriendlyHint != "" || typed.ServerDiag.ActionURL != "" {
+		t.Fatalf("free-form diagnostics retained: %#v", typed.ServerDiag)
+	}
+	var out bytes.Buffer
+	if err := apperrors.PrintJSON(&out, marker); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), secret) || strings.Contains(out.String(), uid) || strings.Contains(out.String(), "action_url") {
+		t.Fatalf("credential diagnostics leaked: %s", out.String())
+	}
+}
+
 func TestAuthRetryExhaustionHasStableReasonAndDoesNotRefreshAgain(t *testing.T) {
 	_, refreshCalls := installAuthRetryUnitSeams(t)
 	original := apperrors.NewAuth("still rejected", apperrors.WithReason("access_token_rejected"))
@@ -277,6 +331,102 @@ func TestAuthRetryReusesLogicalExecutionAndMessageID(t *testing.T) {
 	}
 	if businessUUIDs[0] == "" || businessUUIDs[0] != businessUUIDs[1] {
 		t.Fatalf("business UUIDs = %v, want one stable non-empty UUID", businessUUIDs)
+	}
+}
+
+func TestAuthRetryKeepsExactDefaultProfileLeaseAcrossAtoBSwitch(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("DWS_CONFIG_DIR", configDir)
+	t.Setenv("DWS_DISABLE_KEYCHAIN", "1")
+	t.Setenv("DWS_KEYCHAIN_DIR", t.TempDir())
+	previousHooks := edition.Get()
+	previousProfile := authpkg.RuntimeProfile()
+	edition.Override(&edition.Hooks{})
+	authpkg.SetRuntimeProfile("")
+	t.Cleanup(func() {
+		edition.Override(previousHooks)
+		authpkg.SetRuntimeProfile(previousProfile)
+	})
+	seed := func(corpID, userID, access string) *authpkg.TokenData {
+		return &authpkg.TokenData{
+			AccessToken:  access,
+			RefreshToken: "refresh-" + access,
+			ExpiresAt:    time.Now().Add(time.Hour),
+			RefreshExpAt: time.Now().Add(24 * time.Hour),
+			CorpID:       corpID,
+			UserID:       userID,
+			ClientID:     "client",
+		}
+	}
+	if err := authpkg.SaveTokenData(configDir, seed("corp-a", "user-a", "stored-a")); err != nil {
+		t.Fatal(err)
+	}
+	authpkg.SetRuntimeProfile("corp-b:user-b")
+	if err := authpkg.SaveTokenData(configDir, seed("corp-b", "user-b", "stored-b")); err != nil {
+		t.Fatal(err)
+	}
+	authpkg.SetRuntimeProfile("")
+	if _, err := authpkg.SetCurrentProfile(configDir, "corp-a:user-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	var tokenMu sync.Mutex
+	tokensByProfile := map[string]string{
+		"corp-a:user-a": "token-a-old",
+		"corp-b:user-b": "token-b",
+	}
+	installTokenManagerProvider(t, func(_ string, profile string) accessTokenGetter {
+		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
+			tokenMu.Lock()
+			token := tokensByProfile[profile]
+			tokenMu.Unlock()
+			return managerToken(token, time.Now().Add(time.Hour), 1), nil
+		}}
+	})
+
+	previousFactory := newRejectedTokenRefresher
+	previousCall := runnerCallTool
+	defer func() {
+		newRejectedTokenRefresher = previousFactory
+		runnerCallTool = previousCall
+	}()
+	refreshedProfile := ""
+	newRejectedTokenRefresher = func(_ string, profile string) rejectedTokenRefresher {
+		refreshedProfile = profile
+		return rejectedTokenRefresherFunc(func(context.Context, string, ...uint64) (string, error) {
+			tokenMu.Lock()
+			tokensByProfile[profile] = "token-a-new"
+			tokenMu.Unlock()
+			generation, _, err := authpkg.ReadTokenMarkerGeneration(configDir)
+			if err != nil {
+				return "", err
+			}
+			writeTokenManagerMarker(t, configDir, generation+1)
+			return "token-a-new", nil
+		})
+	}
+
+	var sentTokens []string
+	runnerCallTool = func(client *transport.Client, _ context.Context, _, _ string, _ map[string]any) (transport.ToolCallResult, error) {
+		sentTokens = append(sentTokens, client.AuthToken)
+		if len(sentTokens) == 1 {
+			if _, err := authpkg.SetCurrentProfile(configDir, "corp-b:user-b"); err != nil {
+				t.Fatal(err)
+			}
+			return transport.ToolCallResult{Content: map[string]any{"code": 40014}}, nil
+		}
+		return transport.ToolCallResult{Content: map[string]any{"success": true}}, nil
+	}
+
+	runner := &runtimeRunner{transport: transport.NewClient(&http.Client{}), globalFlags: &GlobalFlags{}}
+	if _, err := runner.executeInvocation(context.Background(), "https://example.invalid/mcp", retryUnitInvocation()); err != nil {
+		t.Fatal(err)
+	}
+	if refreshedProfile != "corp-a:user-a" {
+		t.Fatalf("refreshed profile = %q, want profile A", refreshedProfile)
+	}
+	if len(sentTokens) != 2 || sentTokens[0] != "token-a-old" || sentTokens[1] != "token-a-new" {
+		t.Fatalf("sent tokens = %v, want A-old then A-new (never B)", sentTokens)
 	}
 }
 

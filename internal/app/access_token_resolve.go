@@ -179,28 +179,64 @@ func ResolveAuxiliaryAccessToken(ctx context.Context, configDir, explicitToken s
 	return snapshot.AccessToken, nil
 }
 
+// ResolveAuxiliaryAccessTokenForProfile resolves a token under an immutable
+// logical profile lease. The selector is canonicalized once to corpId:userId;
+// later process-wide profile switches cannot redirect this operation.
+func ResolveAuxiliaryAccessTokenForProfile(ctx context.Context, configDir, explicitToken, profile string) (string, error) {
+	snapshot, err := ResolveAuxiliaryAccessTokenSnapshotForProfile(ctx, configDir, explicitToken, profile)
+	if err != nil {
+		return "", err
+	}
+	return snapshot.AccessToken, nil
+}
+
 // ResolveAuxiliaryAccessTokenSnapshot exposes the same TokenManager used by
 // MCP calls to auxiliary HTTP/event clients.
 func ResolveAuxiliaryAccessTokenSnapshot(ctx context.Context, configDir, explicitToken string) (AccessTokenSnapshot, error) {
 	return runtimeTokenManager.Get(ctx, configDir, explicitToken)
 }
 
+// ResolveAuxiliaryAccessTokenSnapshotForProfile is the profile-pinned public
+// facade used by long-running event, PAT, A2A, and skill clients.
+func ResolveAuxiliaryAccessTokenSnapshotForProfile(ctx context.Context, configDir, explicitToken, profile string) (AccessTokenSnapshot, error) {
+	return runtimeTokenManager.GetForProfile(ctx, configDir, explicitToken, profile)
+}
+
 func (m *TokenManager) Get(ctx context.Context, configDir, explicitToken string) (AccessTokenSnapshot, error) {
 	if token := strings.TrimSpace(explicitToken); token != "" {
 		return AccessTokenSnapshot{AccessToken: token, Source: "explicit"}, nil
 	}
-	profile := strings.TrimSpace(authpkg.RuntimeProfile())
+	return m.GetForProfile(ctx, configDir, "", authpkg.RuntimeProfile())
+}
+
+// GetForProfile resolves any user-facing selector to one exact identity before
+// choosing the cache key. It is safe to retain for a complete logical request.
+func (m *TokenManager) GetForProfile(ctx context.Context, configDir, explicitToken, profile string) (AccessTokenSnapshot, error) {
+	if token := strings.TrimSpace(explicitToken); token != "" {
+		return AccessTokenSnapshot{AccessToken: token, Source: "explicit"}, nil
+	}
+	profile = strings.TrimSpace(profile)
 	if profile == "" {
-		// Empty means "the currently selected default" only at this instant.
-		// Convert it to an exact identity lease before choosing the cache key so
-		// a later A->B default switch cannot make A's 401 recovery adopt B.
-		selected, err := authpkg.ResolveProfile(configDir, "")
+		manual, err := authpkg.ManualTokenMarkerActive(configDir)
 		if err != nil {
-			return AccessTokenSnapshot{}, fmt.Errorf("resolve default token profile: %w", err)
+			return AccessTokenSnapshot{}, fmt.Errorf("resolve manual token override: %w", err)
 		}
-		if selected != nil {
-			profile = authpkg.ProfileSelector(*selected)
+		if manual {
+			return m.getForProfile(ctx, configDir, "", "")
 		}
+	}
+	selected, err := authpkg.ResolveProfile(configDir, profile)
+	if err != nil {
+		label := "selected"
+		if profile == "" {
+			label = "default"
+		}
+		return AccessTokenSnapshot{}, fmt.Errorf("resolve %s token profile: %w", label, err)
+	}
+	if selected != nil {
+		profile = authpkg.ProfileSelector(*selected)
+	} else if profile != "" {
+		return AccessTokenSnapshot{}, authpkg.ErrTokenDataNotFound
 	}
 	return m.getForProfile(ctx, configDir, "", profile)
 }
@@ -227,7 +263,7 @@ func (m *TokenManager) getForProfile(ctx context.Context, configDir, explicitTok
 			return AccessTokenSnapshot{}, fmt.Errorf("read token publication marker: %w", markerErr)
 		}
 		if markerPresent && markerGeneration == entry.snapshot.ObservedGeneration {
-			slog.Debug("auth.token.resolve", "outcome", "cache_hit", "source", entry.snapshot.Source, "profile_selected", key.profile != "")
+			slog.Debug("auth.token.resolve", tokenResolutionLogAttrs(ctx, key, entry.snapshot, "cache_hit", true)...)
 			return entry.snapshot, nil
 		}
 	}
@@ -244,7 +280,7 @@ func (m *TokenManager) getForProfile(ctx context.Context, configDir, explicitTok
 		snapshot, err := resolveTokenSnapshotWithEdition(ctx, configDir, key.profile)
 		if err != nil {
 			attrs := auxiliaryAuthDiagnosticAttrs("token_resolve", err)
-			attrs = append(attrs, "outcome", "failed", "profile_selected", key.profile != "")
+			attrs = append(attrs, tokenResolutionLogAttrs(ctx, key, AccessTokenSnapshot{}, "failed", false)...)
 			slog.Warn("auth.token.resolve", attrs...)
 			return AccessTokenSnapshot{}, err
 		}
@@ -256,7 +292,7 @@ func (m *TokenManager) getForProfile(ctx context.Context, configDir, explicitTok
 		snapshot.profilePinned = true
 		if !tokenSnapshotUsable(snapshot, now) {
 			entry.snapshot = AccessTokenSnapshot{}
-			slog.Debug("auth.token.resolve", "outcome", "resolved", "source", snapshot.Source, "cacheable", false, "profile_selected", key.profile != "")
+			slog.Debug("auth.token.resolve", tokenResolutionLogAttrs(ctx, key, snapshot, "resolved", false)...)
 			return snapshot, nil
 		}
 
@@ -276,10 +312,29 @@ func (m *TokenManager) getForProfile(ctx context.Context, configDir, explicitTok
 		// next fast path still detects every subsequent store commit.
 		snapshot.ObservedGeneration = afterGeneration
 		entry.snapshot = snapshot
-		slog.Debug("auth.token.resolve", "outcome", "resolved", "source", snapshot.Source, "cacheable", true, "profile_selected", key.profile != "")
+		slog.Debug("auth.token.resolve", tokenResolutionLogAttrs(ctx, key, snapshot, "resolved", true)...)
 		return snapshot, nil
 	}
 	return AccessTokenSnapshot{}, fmt.Errorf("token publication changed repeatedly while resolving credentials")
+}
+
+func tokenResolutionLogAttrs(ctx context.Context, key tokenManagerKey, snapshot AccessTokenSnapshot, outcome string, cacheable bool) []any {
+	execID, _ := logicalExecutionID(ctx)
+	profileHash := snapshot.ProfileFingerprint
+	if profileHash == "" {
+		profileHash = tokenProfileFingerprint(key)
+	}
+	return []any{
+		"outcome", outcome,
+		"exec_id", execID,
+		"source", snapshot.Source,
+		"profile_hash", profileHash,
+		"profile_selected", key.profile != "",
+		"credential_generation", snapshot.Generation,
+		"observed_generation", snapshot.ObservedGeneration,
+		"expires_bucket", tokenExpiryBucket(snapshot.ExpiresAt, time.Now()),
+		"cacheable", cacheable,
+	}
 }
 
 // RefreshRejectedAccessTokenSnapshot performs a profile-pinned CAS refresh for
@@ -290,7 +345,16 @@ func RefreshRejectedAccessTokenSnapshot(ctx context.Context, configDir string, r
 	if !rejected.profilePinned || strings.TrimSpace(rejected.AccessToken) == "" {
 		return AccessTokenSnapshot{}, fmt.Errorf("rejected token snapshot is not managed by TokenManager")
 	}
-	if _, err := forceRefreshRejectedTokenForProfile(ctx, configDir, rejected.profile, rejected.AccessToken, rejected.Generation); err != nil {
+	if _, err := forceRefreshRejectedTokenForProfileFunc(ctx, configDir, rejected.profile, rejected.AccessToken, rejected.Generation); err != nil {
+		if authpkg.ClassifyRefreshFailure(err) == authpkg.RefreshFailureTerminal {
+			_, cleanupErr := authpkg.DeleteTokenDataIfAccessTokenMatchesForProfile(
+				ctx, configDir, rejected.profile, rejected.AccessToken, rejected.Generation,
+			)
+			if cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("cleanup terminal rejected credential: %w", cleanupErr))
+			}
+		}
+		runtimeTokenManager.Invalidate()
 		return AccessTokenSnapshot{}, err
 	}
 	runtimeTokenManager.Invalidate()

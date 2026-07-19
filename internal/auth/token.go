@@ -274,6 +274,248 @@ func deleteEditionToken(h *edition.Hooks, configDir, profile string) error {
 	return h.DeleteToken(configDir)
 }
 
+// canonicalEditionProfileForData returns the only selector TokenStoreV2 is
+// allowed to persist for an OAuth identity. User-facing aliases, organization
+// names, and the mutable "current" selector never cross the edition boundary.
+// An identity-less token is the legacy/manual singleton and therefore uses the
+// empty key; it cannot be combined with an explicit profile lease.
+func canonicalEditionProfileForData(configDir, runtimeSelector string, data *TokenData) (string, bool, error) {
+	if data == nil {
+		return "", false, fmt.Errorf("token data is nil")
+	}
+	runtimeSelector = strings.TrimSpace(runtimeSelector)
+	corpID := strings.TrimSpace(data.CorpID)
+	userID := strings.TrimSpace(data.UserID)
+	if corpID == "" {
+		if runtimeSelector != "" {
+			return "", false, fmt.Errorf("identity-less token cannot be saved for an explicit profile")
+		}
+		return "", false, nil
+	}
+	if userID == "" {
+		return "", false, fmt.Errorf("TokenStoreV2 requires userId for organization %q", corpID)
+	}
+	canonical := profileSelector(corpID, userID)
+	makeCurrent := runtimeSelector == ""
+	if runtimeSelector == "" {
+		return canonical, makeCurrent, nil
+	}
+
+	cfg, err := tokenLoadProfiles(configDir)
+	if err != nil {
+		return "", false, err
+	}
+	if selected, _, resolveErr := tokenResolveSelection(configDir, cfg, runtimeSelector); resolveErr == nil {
+		if ProfileSelector(*selected) != canonical {
+			return "", false, fmt.Errorf("profile lease does not match refreshed token identity")
+		}
+		return canonical, false, nil
+	}
+	// A brand-new identity may be addressed by its already-canonical selector
+	// or its target corpId before profiles.json contains it. Arbitrary aliases
+	// are deliberately not accepted here because they cannot be reconstructed
+	// after process restart.
+	if runtimeSelector == corpID {
+		return canonical, false, nil
+	}
+	selectorCorp, selectorUser, exact := ParseIdentitySelector(runtimeSelector)
+	if !exact || profileSelector(selectorCorp, selectorUser) != canonical {
+		return "", false, fmt.Errorf("profile %q is not a canonical identity lease", runtimeSelector)
+	}
+	return canonical, false, nil
+}
+
+// resolveCanonicalEditionProfileLocked maps current/corp/name/alias selectors
+// to a stable identity key while the caller holds the auth/profile lock.
+func resolveCanonicalEditionProfileLocked(configDir, selector string) (string, *Profile, *ProfilesConfig, error) {
+	cfg, err := tokenLoadProfiles(configDir)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if err := ensureProfilesWritable(cfg); err != nil {
+		return "", nil, nil, err
+	}
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		selector = strings.TrimSpace(cfg.CurrentProfile)
+		if selector == "" {
+			return "", nil, cfg, nil
+		}
+	}
+	selected, _, err := tokenResolveSelection(configDir, cfg, selector)
+	if err != nil {
+		return "", nil, cfg, err
+	}
+	canonical := ProfileSelector(*selected)
+	if strings.TrimSpace(selected.CorpID) != "" && strings.TrimSpace(selected.UserID) == "" {
+		return "", nil, cfg, fmt.Errorf("TokenStoreV2 profile %q has no userId", canonical)
+	}
+	return canonical, selected, cfg, nil
+}
+
+func parseEditionTokenBlob(blob []byte) (*TokenData, error) {
+	var data TokenData
+	if err := json.Unmarshal(blob, &data); err != nil {
+		return nil, fmt.Errorf("parsing token data from hook: %w", err)
+	}
+	return &data, nil
+}
+
+func loadEditionTokenV2Locked(h *edition.Hooks, configDir, requested string) ([]byte, error) {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		manual, err := manualTokenMarkerActive(configDir)
+		if err != nil {
+			return nil, err
+		}
+		if manual {
+			blob, err := loadEditionToken(h, configDir, "")
+			if err != nil {
+				return nil, err
+			}
+			data, err := parseEditionTokenBlob(blob)
+			if err != nil {
+				return nil, err
+			}
+			if TokenProfileSelector(data) != "" {
+				return nil, fmt.Errorf("manual TokenStoreV2 slot contains an OAuth identity")
+			}
+			return blob, nil
+		}
+	}
+	canonical, _, cfg, resolveErr := resolveCanonicalEditionProfileLocked(configDir, requested)
+	if resolveErr == nil {
+		blob, err := loadEditionToken(h, configDir, canonical)
+		if err == nil {
+			data, parseErr := parseEditionTokenBlob(blob)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			blobIdentity := TokenProfileSelector(data)
+			if canonical == "" && blobIdentity != "" {
+				if strings.TrimSpace(data.UserID) == "" {
+					return nil, fmt.Errorf("legacy edition token profile has no userId")
+				}
+				if err := migrateEditionTokenV2Locked(h, configDir, "", blobIdentity, cfg, data, blob, true); err != nil {
+					return nil, err
+				}
+				return blob, nil
+			}
+			if canonical != "" && blobIdentity != canonical {
+				return nil, fmt.Errorf("edition token identity does not match canonical profile")
+			}
+			return blob, nil
+		}
+		if !errors.Is(err, ErrTokenDataNotFound) && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+
+	// Compatibility migration for builds that handed a raw alias/current key to
+	// TokenStoreV2 before Core owned canonicalization. The blob's embedded
+	// corpId:userId is authoritative; aliases are never retained as store keys.
+	candidates := make([]string, 0, 2)
+	if requested != canonical {
+		candidates = append(candidates, requested)
+	}
+	if requested == "" && canonical != "" {
+		candidates = append(candidates, "")
+	}
+	if canonical != "" && cfg != nil && canonicalStoredSelector(cfg, cfg.CurrentProfile) == canonical {
+		candidates = append(candidates, "")
+	}
+	seen := map[string]struct{}{canonical: {}}
+	for _, legacyKey := range candidates {
+		if _, ok := seen[legacyKey]; ok {
+			continue
+		}
+		seen[legacyKey] = struct{}{}
+		blob, err := loadEditionToken(h, configDir, legacyKey)
+		if err != nil {
+			if errors.Is(err, ErrTokenDataNotFound) || errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		data, err := parseEditionTokenBlob(blob)
+		if err != nil {
+			return nil, err
+		}
+		exact := TokenProfileSelector(data)
+		if exact == "" {
+			if requested == "" && canonical == "" {
+				return blob, nil
+			}
+			return nil, fmt.Errorf("legacy edition token has no profile identity")
+		}
+		if strings.TrimSpace(data.UserID) == "" {
+			return nil, fmt.Errorf("legacy edition token profile has no userId")
+		}
+		if canonical != "" && exact != canonical {
+			if legacyKey == "" {
+				continue
+			}
+			return nil, fmt.Errorf("legacy edition token identity does not match selected profile")
+		}
+		if corpID, userID, isExact := ParseIdentitySelector(requested); isExact && profileSelector(corpID, userID) != exact {
+			return nil, fmt.Errorf("legacy edition token identity does not match requested profile")
+		}
+		if err := migrateEditionTokenV2Locked(h, configDir, legacyKey, exact, cfg, data, blob, requested == ""); err != nil {
+			return nil, err
+		}
+		return blob, nil
+	}
+	if resolveErr != nil {
+		return nil, errors.Join(ErrTokenDataNotFound, resolveErr)
+	}
+	return nil, ErrTokenDataNotFound
+}
+
+func migrateEditionTokenV2Locked(h *edition.Hooks, configDir, legacyKey, canonical string, cfg *ProfilesConfig, data *TokenData, blob []byte, makeCurrent bool) error {
+	markerSnapshot, err := snapshotTokenMarker(configDir)
+	if err != nil {
+		return err
+	}
+	profilesSnapshot := cloneProfilesConfig(cfg)
+	canonicalPrevious, loadErr := loadEditionToken(h, configDir, canonical)
+	canonicalExisted := loadErr == nil
+	if loadErr != nil && !errors.Is(loadErr, ErrTokenDataNotFound) && !errors.Is(loadErr, os.ErrNotExist) {
+		return loadErr
+	}
+	rollback := func(operationErr error) error {
+		var rollbackErr error
+		if canonicalExisted {
+			rollbackErr = errors.Join(rollbackErr, saveEditionToken(h, configDir, canonical, canonicalPrevious))
+		} else {
+			rollbackErr = errors.Join(rollbackErr, deleteEditionToken(h, configDir, canonical))
+		}
+		if legacyKey != canonical {
+			rollbackErr = errors.Join(rollbackErr, saveEditionToken(h, configDir, legacyKey, blob))
+		}
+		rollbackErr = errors.Join(rollbackErr, tokenSaveProfiles(configDir, cloneProfilesConfig(profilesSnapshot)))
+		rollbackErr = errors.Join(rollbackErr, restoreTokenMarker(configDir, markerSnapshot))
+		if rollbackErr != nil {
+			return errors.Join(operationErr, fmt.Errorf("rollback legacy TokenStoreV2 migration: %w", rollbackErr))
+		}
+		return operationErr
+	}
+	if err := saveEditionToken(h, configDir, canonical, blob); err != nil {
+		return rollback(err)
+	}
+	if err := tokenUpsertProfile(configDir, data, makeCurrent); err != nil {
+		return rollback(err)
+	}
+	if legacyKey != canonical {
+		if err := deleteEditionToken(h, configDir, legacyKey); err != nil {
+			return rollback(err)
+		}
+	}
+	if err := tokenBumpMarkerGeneration(configDir, false, data.Generation); err != nil {
+		return rollback(err)
+	}
+	return nil
+}
+
 // ReadTokenMarkerGeneration reads the lightweight publication marker without
 // opening Keychain. present=false represents logout/deletion and invalidates
 // every in-memory snapshot, including legacy generation-zero entries.
@@ -329,6 +571,13 @@ func manualTokenMarkerActive(configDir string) (bool, error) {
 		return false, nil
 	}
 	return marker.ManualToken, nil
+}
+
+// ManualTokenMarkerActive reports whether the default credential is the
+// identity-less token installed by `auth login --token`. Explicit profile
+// requests intentionally ignore this override.
+func ManualTokenMarkerActive(configDir string) (bool, error) {
+	return manualTokenMarkerActive(configDir)
 }
 
 // DeleteTokenMarker removes the token.json marker file.
@@ -517,58 +766,68 @@ func saveTokenViaHookTransaction(h *edition.Hooks, configDir, profile string, da
 	if err := validateEditionTokenStore(h); err != nil {
 		return err
 	}
+	storeProfile := strings.TrimSpace(profile)
+	makeCurrent := false
+	if h.TokenStoreV2 != nil {
+		var err error
+		storeProfile, makeCurrent, err = canonicalEditionProfileForData(configDir, profile, data)
+		if err != nil {
+			return err
+		}
+	}
 	markerSnapshot, err := snapshotTokenMarker(configDir)
 	if err != nil {
 		return err
 	}
+	profilesSnapshot, err := tokenLoadProfiles(configDir)
+	if err != nil {
+		return err
+	}
+	profilesSnapshot = cloneProfilesConfig(profilesSnapshot)
 	var previous []byte
 	previousExists := false
-	if loaded, loadErr := loadEditionToken(h, configDir, profile); loadErr == nil {
+	if loaded, loadErr := loadEditionToken(h, configDir, storeProfile); loadErr == nil {
 		previous = append([]byte(nil), loaded...)
 		previousExists = true
 	} else if !errors.Is(loadErr, ErrTokenDataNotFound) && !errors.Is(loadErr, os.ErrNotExist) {
 		return fmt.Errorf("snapshot hook token: %w", loadErr)
 	}
-	if err := saveTokenViaHook(h, configDir, profile, data); err != nil {
+	rollback := func(operationErr error) error {
 		var rollbackErr error
 		if previousExists {
-			if restoreErr := saveEditionToken(h, configDir, profile, previous); restoreErr != nil {
+			if restoreErr := saveEditionToken(h, configDir, storeProfile, previous); restoreErr != nil {
 				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore hook token: %w", restoreErr))
 			}
-		} else if restoreErr := deleteEditionToken(h, configDir, profile); restoreErr != nil {
+		} else if restoreErr := deleteEditionToken(h, configDir, storeProfile); restoreErr != nil {
 			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove partially-written hook token: %w", restoreErr))
 		}
+		if restoreErr := tokenSaveProfiles(configDir, cloneProfilesConfig(profilesSnapshot)); restoreErr != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore profile metadata: %w", restoreErr))
+		}
 		if restoreErr := restoreTokenMarker(configDir, markerSnapshot); restoreErr != nil {
 			rollbackErr = errors.Join(rollbackErr, restoreErr)
 		}
 		if rollbackErr != nil {
-			return errors.Join(err, fmt.Errorf("rollback failed hook token save: %w", rollbackErr))
+			return errors.Join(operationErr, fmt.Errorf("rollback failed hook token save: %w", rollbackErr))
 		}
-		return err
+		return operationErr
 	}
-	if err := tokenWriteMarkerGeneration(configDir, false, data.Generation); err == nil {
+	if err := saveTokenViaHook(h, configDir, storeProfile, data); err != nil {
+		return rollback(err)
+	}
+	if h.TokenStoreV2 != nil && storeProfile != "" {
+		if err := tokenUpsertProfile(configDir, data, makeCurrent); err != nil {
+			return rollback(fmt.Errorf("publish profile metadata: %w", err))
+		}
+	}
+	manualMarker := h.TokenStoreV2 != nil && storeProfile == ""
+	if h.TokenStoreV2 != nil && !makeCurrent && markerSnapshot.exists && markerSnapshot.manual {
+		manualMarker = true
+	}
+	if err := tokenWriteMarkerGeneration(configDir, manualMarker, data.Generation); err == nil {
 		return nil
 	} else {
-		// Restore the unpublished credential first and publish its marker last.
-		// A concurrent reader must never observe the previous marker pointing at
-		// the newly-written (but uncommitted) blob.
-		var rollbackErr error
-		if previousExists {
-			if restoreErr := saveEditionToken(h, configDir, profile, previous); restoreErr != nil {
-				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore hook token: %w", restoreErr))
-			}
-		} else {
-			if restoreErr := deleteEditionToken(h, configDir, profile); restoreErr != nil {
-				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove unpublished hook token: %w", restoreErr))
-			}
-		}
-		if restoreErr := restoreTokenMarker(configDir, markerSnapshot); restoreErr != nil {
-			rollbackErr = errors.Join(rollbackErr, restoreErr)
-		}
-		if rollbackErr != nil {
-			return errors.Join(err, fmt.Errorf("rollback unpublished hook token: %w", rollbackErr))
-		}
-		return err
+		return rollback(err)
 	}
 }
 
@@ -613,15 +872,21 @@ func LoadTokenDataForProfile(configDir, profile string) (*TokenData, error) {
 			if hookErr := validateEditionTokenStore(h); hookErr != nil {
 				return hookErr
 			}
-			jsonData, hookErr := loadEditionToken(h, configDir, profile)
+			var jsonData []byte
+			var hookErr error
+			if h.TokenStoreV2 != nil {
+				jsonData, hookErr = loadEditionTokenV2Locked(h, configDir, profile)
+			} else {
+				jsonData, hookErr = loadEditionToken(h, configDir, profile)
+			}
 			if hookErr != nil {
 				return hookErr
 			}
-			var td TokenData
-			if hookErr := json.Unmarshal(jsonData, &td); hookErr != nil {
-				return fmt.Errorf("parsing token data from hook: %w", hookErr)
+			td, hookErr := parseEditionTokenBlob(jsonData)
+			if hookErr != nil {
+				return hookErr
 			}
-			result = &td
+			result = td
 			return nil
 		}
 		result, loadErr = loadTokenDataForProfileLocked(configDir, profile)
@@ -749,6 +1014,9 @@ func deleteTokenViaHookTransaction(h *edition.Hooks, configDir, profile string, 
 	if err := validateEditionTokenStore(h); err != nil {
 		return err
 	}
+	if h.TokenStoreV2 != nil {
+		return deleteTokenV2TransactionLocked(h, configDir, profile)
+	}
 	markerSnapshot, err := snapshotTokenMarker(configDir)
 	if err != nil {
 		return err
@@ -796,6 +1064,121 @@ func deleteTokenViaHookTransaction(h *edition.Hooks, configDir, profile string, 
 		}
 		return publishErr
 	}
+}
+
+type editionBlobSnapshot struct {
+	key    string
+	blob   []byte
+	exists bool
+}
+
+func deleteTokenV2TransactionLocked(h *edition.Hooks, configDir, selector string) error {
+	selector = strings.TrimSpace(selector)
+	cfg, err := tokenLoadProfiles(configDir)
+	if err != nil {
+		return err
+	}
+	if err := ensureProfilesWritable(cfg); err != nil {
+		return err
+	}
+	profilesSnapshot := cloneProfilesConfig(cfg)
+	markerSnapshot, err := snapshotTokenMarker(configDir)
+	if err != nil {
+		return err
+	}
+
+	keys := make([]string, 0, 2)
+	removeSelector := ""
+	deletingManual := selector == "" && markerSnapshot.manual
+	if deletingManual || (selector == "" && strings.TrimSpace(cfg.CurrentProfile) == "") {
+		keys = append(keys, "")
+	} else {
+		effective := selector
+		if effective == "" {
+			effective = strings.TrimSpace(cfg.CurrentProfile)
+		}
+		selected, exact, resolveErr := tokenResolveDeletion(cfg, effective)
+		if resolveErr != nil {
+			// Compatibility cleanup for a raw-key orphan created by an older V2
+			// adapter. It has no reconstructable metadata, so remove only that
+			// exact raw slot and leave profiles.json untouched.
+			if _, loadErr := loadEditionToken(h, configDir, selector); loadErr == nil {
+				keys = append(keys, selector)
+			} else {
+				return resolveErr
+			}
+		} else if exact {
+			keys = append(keys, ProfileSelector(*selected))
+			removeSelector = ProfileSelector(*selected)
+		} else {
+			for _, candidate := range profilesForCorpID(cfg, selected.CorpID) {
+				if strings.TrimSpace(candidate.UserID) == "" {
+					return fmt.Errorf("TokenStoreV2 profile %q has no userId", ProfileSelector(*candidate))
+				}
+				keys = append(keys, ProfileSelector(*candidate))
+			}
+			removeSelector = selected.CorpID
+		}
+	}
+	if len(keys) == 0 {
+		return ErrTokenDataNotFound
+	}
+
+	snapshots := make([]editionBlobSnapshot, 0, len(keys))
+	for _, key := range keys {
+		blob, loadErr := loadEditionToken(h, configDir, key)
+		if loadErr == nil {
+			snapshots = append(snapshots, editionBlobSnapshot{key: key, blob: append([]byte(nil), blob...), exists: true})
+			continue
+		}
+		if errors.Is(loadErr, ErrTokenDataNotFound) || errors.Is(loadErr, os.ErrNotExist) {
+			snapshots = append(snapshots, editionBlobSnapshot{key: key})
+			continue
+		}
+		return fmt.Errorf("snapshot hook token for deletion: %w", loadErr)
+	}
+	rollback := func(operationErr error) error {
+		var rollbackErr error
+		for _, snapshot := range snapshots {
+			if snapshot.exists {
+				rollbackErr = errors.Join(rollbackErr, saveEditionToken(h, configDir, snapshot.key, snapshot.blob))
+			} else {
+				rollbackErr = errors.Join(rollbackErr, deleteEditionToken(h, configDir, snapshot.key))
+			}
+		}
+		rollbackErr = errors.Join(rollbackErr, tokenSaveProfiles(configDir, cloneProfilesConfig(profilesSnapshot)))
+		rollbackErr = errors.Join(rollbackErr, restoreTokenMarker(configDir, markerSnapshot))
+		if rollbackErr != nil {
+			return errors.Join(operationErr, fmt.Errorf("rollback TokenStoreV2 deletion: %w", rollbackErr))
+		}
+		return operationErr
+	}
+	for _, key := range keys {
+		if err := deleteEditionToken(h, configDir, key); err != nil {
+			return rollback(err)
+		}
+	}
+	if removeSelector != "" {
+		if _, err := tokenRemoveProfile(configDir, removeSelector); err != nil {
+			return rollback(err)
+		}
+	}
+	updated, err := tokenLoadProfiles(configDir)
+	if err != nil {
+		return rollback(err)
+	}
+	if markerSnapshot.manual && !deletingManual {
+		if err := tokenBumpMarkerGeneration(configDir, true, markerSnapshot.generation); err != nil {
+			return rollback(err)
+		}
+	} else if len(updated.Profiles) == 0 {
+		if err := tokenDeleteMarker(configDir); err != nil {
+			return rollback(err)
+		}
+	} else if err := tokenBumpMarkerGeneration(configDir, false, markerSnapshot.generation); err != nil {
+		return rollback(err)
+	}
+	return nil
 }
 
 func deleteTokenDataForProfileLocked(configDir, profile string) error {
@@ -1233,6 +1616,9 @@ func DeleteAllTokenData(configDir string) error {
 			if err := validateEditionTokenStore(h); err != nil {
 				return err
 			}
+			if h.TokenStoreV2 != nil {
+				return deleteAllTokenV2TransactionLocked(h, configDir)
+			}
 			return deleteTokenViaHookTransaction(h, configDir, "", true)
 		}
 		var firstErr error
@@ -1267,6 +1653,80 @@ func DeleteAllTokenData(configDir string) error {
 		}
 		return firstErr
 	})
+}
+
+func deleteAllTokenV2TransactionLocked(h *edition.Hooks, configDir string) error {
+	cfg, err := tokenLoadProfiles(configDir)
+	if err != nil {
+		return err
+	}
+	if err := ensureProfilesWritable(cfg); err != nil {
+		return err
+	}
+	profilesSnapshot := cloneProfilesConfig(cfg)
+	markerSnapshot, err := snapshotTokenMarker(configDir)
+	if err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(cfg.Profiles)+1)
+	seen := make(map[string]struct{}, len(cfg.Profiles)+1)
+	for _, profile := range cfg.Profiles {
+		key := ProfileSelector(profile)
+		if strings.TrimSpace(profile.CorpID) == "" || strings.TrimSpace(profile.UserID) == "" {
+			return fmt.Errorf("TokenStoreV2 profile %q has no exact identity", key)
+		}
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			keys = append(keys, key)
+		}
+	}
+	// Empty is the historical singleton/raw-current slot. A V2 DeleteAll hook
+	// additionally sweeps non-enumerable hashed aliases/orphans.
+	keys = append(keys, "")
+	snapshots := make([]editionBlobSnapshot, 0, len(keys))
+	for _, key := range keys {
+		blob, loadErr := loadEditionToken(h, configDir, key)
+		snapshot := editionBlobSnapshot{key: key}
+		if loadErr == nil {
+			snapshot.exists = true
+			snapshot.blob = append([]byte(nil), blob...)
+		} else if !errors.Is(loadErr, ErrTokenDataNotFound) && !errors.Is(loadErr, os.ErrNotExist) {
+			return fmt.Errorf("snapshot TokenStoreV2 key for logout-all: %w", loadErr)
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	rollback := func(operationErr error) error {
+		var rollbackErr error
+		for _, snapshot := range snapshots {
+			if snapshot.exists {
+				rollbackErr = errors.Join(rollbackErr, saveEditionToken(h, configDir, snapshot.key, snapshot.blob))
+			}
+		}
+		rollbackErr = errors.Join(rollbackErr, tokenSaveProfiles(configDir, cloneProfilesConfig(profilesSnapshot)))
+		rollbackErr = errors.Join(rollbackErr, restoreTokenMarker(configDir, markerSnapshot))
+		if rollbackErr != nil {
+			return errors.Join(operationErr, fmt.Errorf("rollback TokenStoreV2 logout-all: %w", rollbackErr))
+		}
+		return operationErr
+	}
+	if h.TokenStoreV2.DeleteAll != nil {
+		if err := h.TokenStoreV2.DeleteAll(configDir); err != nil {
+			return rollback(err)
+		}
+	} else {
+		for _, key := range keys {
+			if err := deleteEditionToken(h, configDir, key); err != nil {
+				return rollback(err)
+			}
+		}
+	}
+	if err := tokenSaveProfiles(configDir, &ProfilesConfig{Version: profilesVersion}); err != nil {
+		return rollback(err)
+	}
+	if err := tokenDeleteMarker(configDir); err != nil {
+		return rollback(err)
+	}
+	return nil
 }
 
 // RevokeTokenRemote calls the appropriate logout/revoke endpoint to invalidate the access token.

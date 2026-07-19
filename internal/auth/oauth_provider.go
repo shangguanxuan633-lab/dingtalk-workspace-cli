@@ -175,7 +175,7 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 			}
 		}
 	}
-	if err := preflightTokenPersistence(p.configDir); err != nil {
+	if err := preflightTokenPersistenceForProfile(p.configDir, p.runtimeProfile()); err != nil {
 		return nil, fmt.Errorf("%s: %w", i18n.T("本地登录态无法安全更新"), err)
 	}
 
@@ -201,7 +201,7 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		p.clientID = mcpClientID
 		SetClientIDFromMCP(mcpClientID)
 		if p.logger != nil {
-			p.logger.Debug("fetched client ID from MCP server", "clientID", mcpClientID)
+			p.logger.Debug("fetched client ID from MCP server", "stage", "oauth_client_id", "client_id_present", strings.TrimSpace(mcpClientID) != "")
 		}
 	}
 	if err := p.persistResolvedAppCredentials(); err != nil {
@@ -330,7 +330,7 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 			callbackTokenMu.Unlock()
 
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = fmt.Fprintf(w, "<html><body><h1>授权失败</h1><p>%s</p></body></html>", exchangeErr.Error())
+			_, _ = fmt.Fprint(w, "<html><body><h1>授权失败</h1><p>请返回终端查看认证诊断并重试。</p></body></html>")
 			select {
 			case resultCh <- callbackResult{err: exchangeErr}:
 			default:
@@ -380,11 +380,6 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 
 		// Server-provided errorMsg (nil-safe), surfaced both on the page and to
 		// the terminal so portal can update copy without releasing the CLI.
-		serverMsg := ""
-		if authStatus != nil {
-			serverMsg = authStatus.ErrorMsg
-		}
-
 		// Update CLI auth disabled state
 		callbackTokenMu.Lock()
 		callbackAuthDisabled = !cliAuthEnabled
@@ -400,7 +395,7 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		case denialReason == "channel_not_allowed" || denialReason == "channel_required":
 			_, _ = fmt.Fprint(w, channelDeniedHTML)
 		case denialReason == "enterprise_not_authorized":
-			_, _ = fmt.Fprint(w, renderEnterpriseDeniedHTML(serverMsg))
+			_, _ = fmt.Fprint(w, renderEnterpriseDeniedHTML(""))
 		default:
 			_, _ = fmt.Fprint(w, notEnabledHTML)
 		}
@@ -410,7 +405,7 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		}
 		// Notify main goroutine with full result
 		select {
-		case resultCh <- callbackResult{token: tokenData, cliAuthDisabled: !cliAuthEnabled, denialReason: denialReason, errorMsg: serverMsg}:
+		case resultCh <- callbackResult{token: tokenData, cliAuthDisabled: !cliAuthEnabled, denialReason: denialReason}:
 		default:
 		}
 	})
@@ -427,7 +422,7 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		}
 		result, err := oauthGetAdmins(ctx, token.AccessToken)
 		if err != nil {
-			_, _ = fmt.Fprintf(w, `{"success":false,"errorMsg":"%s"}`, err.Error())
+			_, _ = w.Write([]byte(`{"success":false,"errorMsg":"获取管理员信息失败，请返回终端查看诊断"}`))
 			return
 		}
 		data, _ := json.Marshal(result)
@@ -517,11 +512,11 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 
 	authURL := buildAuthURL(p.clientID, redirectURI, p.TargetCorpID)
 	if p.logger != nil {
-		p.logger.Debug("authorization URL", "url", authURL)
+		p.logger.Debug("authorization URL ready", "stage", "oauth_browser", "client_id_present", strings.TrimSpace(p.clientID) != "", "target_corp_present", strings.TrimSpace(p.TargetCorpID) != "")
 	}
 	if !p.NoBrowser {
 		if err := oauthOpenBrowser(authURL); err != nil && p.logger != nil {
-			p.logger.Warn(i18n.T("无法自动打开浏览器"), "error", err)
+			p.logger.Warn(i18n.T("无法自动打开浏览器"), "stage", "oauth_browser_open", "error_type", fmt.Sprintf("%T", err))
 		}
 	}
 
@@ -562,9 +557,6 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		case "channel_not_allowed", "channel_required":
 			return nil, errors.New(i18n.T("当前渠道未获得该组织授权，或组织已开启渠道管控，请联系组织管理员开通渠道访问权限，或升级到最新版本的 CLI"))
 		case "enterprise_not_authorized":
-			if msg := strings.TrimSpace(result.errorMsg); msg != "" {
-				return nil, errors.New(msg)
-			}
 			return nil, errors.New(i18n.T("本次请求未通过企业安全认证"))
 		}
 

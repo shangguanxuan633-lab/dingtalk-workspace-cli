@@ -39,7 +39,7 @@ var (
 )
 
 func (p *OAuthProvider) exchangeCode(ctx context.Context, code string) (*TokenData, error) {
-	if err := preflightTokenPersistence(p.configDir); err != nil {
+	if err := preflightTokenPersistenceForProfile(p.configDir, p.runtimeProfile()); err != nil {
 		return nil, fmt.Errorf("%s: %w", i18n.T("本地登录态无法安全更新"), err)
 	}
 	// Persist the app/client-id store before consuming the one-time auth code.
@@ -1597,7 +1597,7 @@ func doFetchClientIDFromMCP(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("parsing response: %w", err)
 	}
 	if !result.Success {
-		return "", fmt.Errorf("%s: %s", result.ErrorCode, result.ErrorMsg)
+		return "", fmt.Errorf("fetch client ID rejected (code: %s)", SafeOAuthDiagnosticCode(result.ErrorCode))
 	}
 	return result.Result, nil
 }

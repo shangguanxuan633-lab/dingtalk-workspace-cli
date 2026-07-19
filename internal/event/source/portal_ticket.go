@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -48,6 +49,44 @@ type PortalTicketConfig struct {
 	ClientSecret        string
 	UserAgent           string
 	HTTPClient          *http.Client
+	WebSocketDialer     *websocket.Dialer
+	ReconnectMin        time.Duration
+	ReconnectMax        time.Duration
+	DisableReconnect    bool
+}
+
+const (
+	portalReconnectMinBackoff = time.Second
+	portalReconnectMaxBackoff = 30 * time.Second
+)
+
+type portalStageError struct {
+	stage     string
+	status    int
+	code      string
+	retryable bool
+	cause     error
+}
+
+func (e *portalStageError) Error() string {
+	if e == nil {
+		return "source: portal stream failed"
+	}
+	message := "source: portal " + strings.TrimSpace(e.stage) + " failed"
+	if e.status != 0 {
+		message += fmt.Sprintf(" (HTTP %d)", e.status)
+	}
+	if e.code != "" {
+		message += " (code " + e.code + ")"
+	}
+	return message
+}
+
+func (e *portalStageError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 var portalWriteMessage = func(conn *websocket.Conn, messageType int, data []byte) error {
@@ -97,48 +136,95 @@ func normalizePortalTicketMode(mode string) string {
 
 func (s *DingtalkSource) startPortalTicket(ctx context.Context, emit dwsevent.EmitFn) error {
 	s.machine.OnConnecting()
+	defer s.machine.OnStopped()
+	minBackoff := s.cfg.PortalTicket.ReconnectMin
+	if minBackoff <= 0 {
+		minBackoff = portalReconnectMinBackoff
+	}
+	maxBackoff := s.cfg.PortalTicket.ReconnectMax
+	if maxBackoff <= 0 {
+		maxBackoff = portalReconnectMaxBackoff
+	}
+	if maxBackoff < minBackoff {
+		maxBackoff = minBackoff
+	}
+	backoff := minBackoff
+	for {
+		acked, err := s.runPortalTicketAttempt(ctx, emit)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var stageErr *portalStageError
+		isStageError := errors.As(err, &stageErr)
+		if !isStageError || !stageErr.retryable || s.cfg.PortalTicket.DisableReconnect {
+			return err
+		}
+		if acked {
+			backoff = minBackoff
+		}
+		s.machine.OnReconnect()
+		slog.Warn("portal source reconnecting",
+			"stage", stageErr.stage,
+			"http_status", stageErr.status,
+			"server_code", stageErr.code,
+			"error_type", fmt.Sprintf("%T", stageErr.cause),
+			"retry_in", backoff,
+			"reconnect_count", s.machine.Snapshot().ReconnectCount,
+		)
+		if err := waitPersonalReconnect(ctx, backoff); err != nil {
+			return err
+		}
+		backoff = nextPersonalBackoff(backoff, maxBackoff)
+	}
+}
 
+func (s *DingtalkSource) runPortalTicketAttempt(ctx context.Context, emit dwsevent.EmitFn) (bool, error) {
 	ticket, err := requestPortalTicket(ctx, s.cfg.PortalTicket)
 	if err != nil {
-		s.machine.OnStopped()
-		return err
+		return false, err
 	}
 	wsURL, err := websocketURL(ticket)
 	if err != nil {
-		s.machine.OnStopped()
-		return err
+		return false, &portalStageError{stage: "websocket_url", cause: err}
 	}
 
 	userAgent := strings.TrimSpace(s.cfg.PortalTicket.UserAgent)
 	if userAgent == "" {
 		userAgent = "dws-event-consume"
 	}
-	conn, resp, err := (&websocket.Dialer{HandshakeTimeout: 20 * time.Second}).DialContext(ctx, wsURL, http.Header{
+	dialer := s.cfg.PortalTicket.WebSocketDialer
+	if dialer == nil {
+		dialer = &websocket.Dialer{HandshakeTimeout: 20 * time.Second}
+	}
+	conn, resp, err := dialer.DialContext(ctx, wsURL, http.Header{
 		"User-Agent": []string{userAgent},
 	})
 	if err != nil {
-		s.machine.OnStopped()
+		status := 0
 		if resp != nil {
 			defer resp.Body.Close()
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			return fmt.Errorf("source: portal stream connect HTTP %d: %s: %w",
-				resp.StatusCode, truncatePortalTicketLog(string(raw), 300), err)
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			status = resp.StatusCode
 		}
-		return fmt.Errorf("source: portal stream connect: %w", err)
+		return false, &portalStageError{stage: "stream_connect", status: status, retryable: status == 0 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500, cause: err}
 	}
-	defer conn.Close()
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer func() {
+		cancel()
+		_ = conn.Close()
+	}()
 	s.machine.OnConnected()
 
-	closeOnContext(ctx, conn)
+	closeOnContext(attemptCtx, conn)
 	handler := s.makeHandler(emit)
+	acked := false
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			s.machine.OnStopped()
 			if isContextDone(ctx) {
-				return ctx.Err()
+				return acked, ctx.Err()
 			}
-			return fmt.Errorf("source: portal stream read: %w", err)
+			return acked, &portalStageError{stage: "stream_read", retryable: true, cause: err}
 		}
 		df, err := payload.DecodeDataFrame(message)
 		if err != nil {
@@ -147,12 +233,12 @@ func (s *DingtalkSource) startPortalTicket(ctx context.Context, emit dwsevent.Em
 		resp, _ := handler(ctx, df)
 		ensurePortalAckHeaders(resp, df)
 		if err := portalWriteMessage(conn, websocket.TextMessage, resp.Encode()); err != nil {
-			s.machine.OnStopped()
 			if isContextDone(ctx) {
-				return ctx.Err()
+				return acked, ctx.Err()
 			}
-			return fmt.Errorf("source: portal stream ack: %w", err)
+			return acked, &portalStageError{stage: "stream_ack", retryable: true, cause: err}
 		}
+		acked = true
 	}
 }
 
@@ -193,13 +279,14 @@ func requestPortalTicket(ctx context.Context, cfg *PortalTicketConfig) (portalSt
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return portalStreamTicket{}, fmt.Errorf("source: portal ticket request: %w", err)
+		return portalStreamTicket{}, &portalStageError{stage: "ticket_request", retryable: true, cause: err}
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return portalStreamTicket{}, fmt.Errorf("source: portal ticket HTTP %d: %s",
-			resp.StatusCode, truncatePortalTicketLog(string(raw), 300))
+		code := portalResponseCode(raw)
+		retryable := resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		return portalStreamTicket{}, &portalStageError{stage: "ticket_request", status: resp.StatusCode, code: code, retryable: retryable}
 	}
 
 	var direct portalStreamTicket
@@ -214,16 +301,43 @@ func requestPortalTicket(ctx context.Context, cfg *PortalTicketConfig) (portalSt
 		ErrorMsg  string             `json:"errorMsg"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return portalStreamTicket{}, fmt.Errorf("source: portal ticket parse: %w", err)
+		return portalStreamTicket{}, &portalStageError{stage: "ticket_parse", cause: err}
 	}
 	if !envelope.Success {
-		return portalStreamTicket{}, fmt.Errorf("source: portal ticket failed: %s %s",
-			envelope.ErrorCode, envelope.ErrorMsg)
+		return portalStreamTicket{}, &portalStageError{stage: "ticket_response", code: safePortalCode(envelope.ErrorCode)}
 	}
 	if envelope.Result.Endpoint == "" || envelope.Result.Ticket == "" {
-		return portalStreamTicket{}, errors.New("source: portal ticket result missing endpoint/ticket")
+		return portalStreamTicket{}, &portalStageError{stage: "ticket_response", code: "MISSING_ENDPOINT_OR_TICKET"}
 	}
 	return envelope.Result, nil
+}
+
+func portalResponseCode(raw []byte) string {
+	var envelope struct {
+		ErrorCode string `json:"errorCode"`
+		Code      string `json:"code"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil {
+		return ""
+	}
+	if envelope.ErrorCode != "" {
+		return safePortalCode(envelope.ErrorCode)
+	}
+	return safePortalCode(envelope.Code)
+}
+
+func safePortalCode(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 {
+		return ""
+	}
+	for _, r := range value {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			continue
+		}
+		return ""
+	}
+	return value
 }
 
 func websocketURL(ticket portalStreamTicket) (string, error) {

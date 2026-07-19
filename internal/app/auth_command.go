@@ -140,7 +140,9 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 					ExpiresAt:   time.Now().Add(config.ManualTokenExpiry),
 				}
 				if err := authSaveTokenData(configDir, tokenData); err != nil {
-					return apperrors.NewInternal(fmt.Sprintf("failed to persist auth token: %v", err))
+					logging.AuthDebug("auth.login.command.error", "stage", "manual_token_persist", "error", err)
+					return apperrors.NewInternal("failed to persist auth token",
+						apperrors.WithReason("auth_token_persist_failed"), apperrors.WithCause(err))
 				}
 			case cfg.Device:
 				loginCtx, cancel := context.WithTimeout(cmd.Context(), config.DeviceFlowTimeout)
@@ -154,7 +156,9 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 				}
 				tokenData, err = authDeviceLogin(provider, loginCtx)
 				if err != nil {
-					return apperrors.NewAuth(fmt.Sprintf("device authorization failed: %v", err))
+					logging.AuthDebug("auth.login.command.error", "stage", "device_login", "error", err)
+					return apperrors.NewAuth("device authorization failed",
+						apperrors.WithReason("device_login_failed"), apperrors.WithCause(err))
 				}
 			default:
 				loginCtx, cancel := context.WithTimeout(cmd.Context(), config.OAuthFlowTimeout)
@@ -170,7 +174,9 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 				configureOAuthProviderCompatibility(provider, configDir)
 				tokenData, err = authOAuthLogin(provider, loginCtx, authLoginForcesAuthorization(cfg))
 				if err != nil {
-					return apperrors.NewAuth(fmt.Sprintf("dingtalk login failed: %v", err))
+					logging.AuthDebug("auth.login.command.error", "stage", "oauth_login", "error", err)
+					return apperrors.NewAuth("dingtalk login failed",
+						apperrors.WithReason("oauth_login_failed"), apperrors.WithCause(err))
 				}
 			}
 
@@ -368,7 +374,9 @@ func applyAuthLoginGuideAction(cmd *cobra.Command, configDir string, action auth
 			ClientID:     clientID,
 			ClientSecret: authpkg.PlainSecret(clientSecret),
 		}); err != nil {
-			return apperrors.NewInternal(fmt.Sprintf("failed to persist app credentials: %v", err))
+			logging.AuthDebug("auth.login.command.error", "stage", "app_credentials_persist", "error", err)
+			return apperrors.NewInternal("failed to persist app credentials",
+				apperrors.WithReason("app_credentials_persist_failed"), apperrors.WithCause(err))
 		}
 		return nil
 	default:
@@ -516,9 +524,13 @@ func newAuthStatusCommand() *cobra.Command {
 					_, refreshErr := authOAuthAccessToken(provider, refreshCtx)
 					cancel()
 					if refreshErr == nil {
-						if updatedData, statusErr := authOAuthStatus(provider); statusErr == nil {
+						updatedData, reloadErr := authOAuthStatus(provider)
+						if reloadErr == nil {
 							tokenData = updatedData
 							refreshed = true
+						} else {
+							statusErr = reloadErr
+							slog.Warn("auth.status.reload_failed", auxiliaryAuthDiagnosticAttrs("auth_status_reload", reloadErr)...)
 						}
 					} else {
 						refreshFailure = refreshErr
@@ -568,6 +580,9 @@ func newAuthStatusCommand() *cobra.Command {
 				}
 			} else {
 				statusErr = err
+				if !isTrueMissingCredential(err) {
+					slog.Warn("auth.status.load_failed", auxiliaryAuthDiagnosticAttrs("auth_status_load", err)...)
+				}
 			}
 			diagnostic := authStatusDiagnosticFromError(statusErr)
 			if refreshFailure != nil {
@@ -931,7 +946,9 @@ func newAuthExchangeCommand(caller edition.ToolCaller) *cobra.Command {
 			defer cancel()
 			tokenData, err := authOAuthExchange(provider, exchangeCtx, code, strings.TrimSpace(uid))
 			if err != nil {
-				return apperrors.NewAuth(fmt.Sprintf("failed to exchange authorization code: %v", err))
+				logging.AuthDebug("auth.login.command.error", "stage", "auth_code_exchange", "error", err)
+				return apperrors.NewAuth("failed to exchange authorization code",
+					apperrors.WithReason("auth_code_exchange_failed"), apperrors.WithCause(err))
 			}
 			ResetRuntimeTokenCache()
 			clearCompatCache()
@@ -1516,7 +1533,11 @@ func authStatusDiagnosticFromError(err error) *authStatusDiagnostic {
 		}
 	}
 	if !keychain.IsUnavailable(err) {
-		return nil
+		return &authStatusDiagnostic{
+			Reason:  "auth_state_load_failed",
+			Message: "读取本地登录态失败",
+			Hint:    "使用 --verbose 查看认证阶段和错误类型日志；修复本地凭证存储后重试。",
+		}
 	}
 	return &authStatusDiagnostic{
 		Reason:  "keychain_unavailable",

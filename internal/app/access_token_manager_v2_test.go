@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -201,6 +202,14 @@ func TestTokenManagerSerializesConcurrentResolutionPerConfigAndProfile(t *testin
 
 func TestTokenManagerIsolatesConfigDirectoryAndProfile(t *testing.T) {
 	dirA, dirB := t.TempDir(), t.TempDir()
+	for _, dir := range []string{dirA, dirB} {
+		if err := authpkg.SaveProfiles(dir, &authpkg.ProfilesConfig{
+			Version:  2,
+			Profiles: []authpkg.Profile{{Name: "profile-b", CorpID: "corp-b", UserID: "user-b"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	writeTokenManagerMarker(t, dirA, 1)
 	writeTokenManagerMarker(t, dirB, 1)
 	counts := map[string]int{}
@@ -322,6 +331,15 @@ func TestTokenManagerDefaultProfileObservesCrossProcessSelectionPublication(t *t
 
 func TestTokenManagerPinsLoaderToKeyAcrossConcurrentRuntimeProfileSwitch(t *testing.T) {
 	configDir := t.TempDir()
+	if err := authpkg.SaveProfiles(configDir, &authpkg.ProfilesConfig{
+		Version: 2,
+		Profiles: []authpkg.Profile{
+			{Name: "profile-a", CorpID: "corp-a", UserID: "user-a"},
+			{Name: "profile-b", CorpID: "corp-b", UserID: "user-b"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	writeTokenManagerMarker(t, configDir, 1)
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -349,16 +367,48 @@ func TestTokenManagerPinsLoaderToKeyAcrossConcurrentRuntimeProfileSwitch(t *test
 	authpkg.SetRuntimeProfile("profile-b")
 	close(release)
 	first := <-done
-	if first.err != nil || first.snapshot.AccessToken != "token-for-profile-a" {
+	if first.err != nil || first.snapshot.AccessToken != "token-for-corp-a:user-a" {
 		t.Fatalf("in-flight profile-a resolution = %#v, %v", first.snapshot, first.err)
 	}
 	authpkg.SetRuntimeProfile("profile-a")
 	again, err := manager.Get(context.Background(), configDir, "")
-	if err != nil || again.AccessToken != "token-for-profile-a" {
+	if err != nil || again.AccessToken != "token-for-corp-a:user-a" {
 		t.Fatalf("cached profile-a resolution = %#v, %v", again, err)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestResolveAuxiliaryAccessTokenSnapshotForProfileCanonicalizesAlias(t *testing.T) {
+	configDir := t.TempDir()
+	if err := authpkg.SaveProfiles(configDir, &authpkg.ProfilesConfig{
+		Version:        2,
+		CurrentProfile: "corp-a:user-a",
+		Profiles: []authpkg.Profile{{
+			Name: "friendly-a", CorpID: "corp-a", UserID: "user-a",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeTokenManagerMarker(t, configDir, 1)
+	var providerProfile string
+	installTokenManagerProvider(t, func(_ string, profile string) accessTokenGetter {
+		providerProfile = profile
+		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
+			return managerToken("alias-token", time.Now().Add(time.Hour), 1), nil
+		}}
+	})
+	previousManager := runtimeTokenManager
+	runtimeTokenManager = NewTokenManager()
+	t.Cleanup(func() { runtimeTokenManager = previousManager })
+
+	snapshot, err := ResolveAuxiliaryAccessTokenSnapshotForProfile(context.Background(), configDir, "", "friendly-a")
+	if err != nil || snapshot.AccessToken != "alias-token" {
+		t.Fatalf("alias facade = %#v, %v", snapshot, err)
+	}
+	if providerProfile != "corp-a:user-a" || snapshot.profile != "corp-a:user-a" {
+		t.Fatalf("provider=%q snapshot lease=%q", providerProfile, snapshot.profile)
 	}
 }
 
@@ -387,5 +437,93 @@ func TestPassiveRefreshUsesSnapshotProfileAfterRuntimeSwitch(t *testing.T) {
 	}
 	if gotProfile != "profile-a" {
 		t.Fatalf("refresh factory profile = %q, want profile-a", gotProfile)
+	}
+}
+
+func TestPublicSnapshotRecoveryDeletesOnlyTerminalCredential(t *testing.T) {
+	configDir := t.TempDir()
+	previousHooks := edition.Get()
+	previousProfile := authpkg.RuntimeProfile()
+	previousForce := forceRefreshRejectedTokenForProfileFunc
+	var storeMu sync.Mutex
+	store := make(map[string][]byte)
+	edition.Override(&edition.Hooks{TokenStoreV2: &edition.TokenStoreV2Hooks{
+		Save: func(_, profile string, blob []byte) error {
+			storeMu.Lock()
+			defer storeMu.Unlock()
+			store[profile] = append([]byte(nil), blob...)
+			return nil
+		},
+		Load: func(_, profile string) ([]byte, error) {
+			storeMu.Lock()
+			defer storeMu.Unlock()
+			blob, ok := store[profile]
+			if !ok {
+				return nil, authpkg.ErrTokenDataNotFound
+			}
+			return append([]byte(nil), blob...), nil
+		},
+		Delete: func(_, profile string) error {
+			storeMu.Lock()
+			defer storeMu.Unlock()
+			delete(store, profile)
+			return nil
+		},
+	}})
+	t.Cleanup(func() {
+		edition.Override(previousHooks)
+		authpkg.SetRuntimeProfile(previousProfile)
+		forceRefreshRejectedTokenForProfileFunc = previousForce
+	})
+	profile := "corp-a:user-a"
+	authpkg.SetRuntimeProfile(profile)
+	seed := func(access string) *authpkg.TokenData {
+		return &authpkg.TokenData{
+			AccessToken:  access,
+			RefreshToken: "refresh-" + access,
+			ExpiresAt:    time.Now().Add(time.Hour),
+			RefreshExpAt: time.Now().Add(24 * time.Hour),
+			ClientID:     "client",
+			CorpID:       "corp-a",
+			UserID:       "user-a",
+		}
+	}
+
+	terminalData := seed("terminal-token")
+	if err := authpkg.SaveTokenData(configDir, terminalData); err != nil {
+		t.Fatal(err)
+	}
+	terminalCause := &authpkg.OAuthEndpointError{StatusCode: http.StatusBadRequest, Code: "invalid_grant"}
+	forceRefreshRejectedTokenForProfileFunc = func(context.Context, string, string, string, ...uint64) (string, error) {
+		return "", terminalCause
+	}
+	terminalSnapshot := AccessTokenSnapshot{
+		AccessToken: terminalData.AccessToken, Generation: terminalData.Generation,
+		Source: "oauth", profile: profile, profilePinned: true,
+	}
+	if _, err := RefreshRejectedAccessTokenSnapshot(context.Background(), configDir, terminalSnapshot); !errors.Is(err, terminalCause) {
+		t.Fatalf("terminal recovery error = %v", err)
+	}
+	if _, err := authpkg.LoadTokenDataForProfile(configDir, profile); !errors.Is(err, authpkg.ErrTokenDataNotFound) {
+		t.Fatalf("terminal credential still present: %v", err)
+	}
+
+	transientData := seed("transient-token")
+	if err := authpkg.SaveTokenData(configDir, transientData); err != nil {
+		t.Fatal(err)
+	}
+	forceRefreshRejectedTokenForProfileFunc = func(context.Context, string, string, string, ...uint64) (string, error) {
+		return "", context.DeadlineExceeded
+	}
+	transientSnapshot := AccessTokenSnapshot{
+		AccessToken: transientData.AccessToken, Generation: transientData.Generation,
+		Source: "oauth", profile: profile, profilePinned: true,
+	}
+	if _, err := RefreshRejectedAccessTokenSnapshot(context.Background(), configDir, transientSnapshot); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("transient recovery error = %v", err)
+	}
+	stored, err := authpkg.LoadTokenDataForProfile(configDir, profile)
+	if err != nil || stored.AccessToken != transientData.AccessToken {
+		t.Fatalf("transient credential changed = %#v, %v", stored, err)
 	}
 }
