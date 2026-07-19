@@ -14,8 +14,10 @@
 package keychain
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -79,7 +81,11 @@ func MigrateFromLegacy(configDir string) *MigrationResult {
 	}
 
 	// Store in new keychain
-	jsonData, _ := json.Marshal(legacyData)
+	jsonData, err := json.Marshal(legacyData)
+	if err != nil {
+		result.Error = fmt.Errorf("encode legacy token data: %w", err)
+		return result
+	}
 
 	if err := migrateSet(Service, AccountToken, string(jsonData)); err != nil {
 		result.Error = fmt.Errorf("store in keychain: %w", err)
@@ -122,7 +128,15 @@ func loadLegacyData(configDir string) (map[string]interface{}, error) {
 
 	// Parse JSON
 	var data map[string]interface{}
-	if err := json.Unmarshal(plaintext, &data); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(plaintext))
+	decoder.UseNumber()
+	if err := decoder.Decode(&data); err != nil {
+		return nil, fmt.Errorf("parse legacy JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
 		return nil, fmt.Errorf("parse legacy JSON: %w", err)
 	}
 

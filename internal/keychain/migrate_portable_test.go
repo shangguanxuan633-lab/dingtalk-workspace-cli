@@ -14,10 +14,65 @@
 package keychain
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"testing"
 )
+
+func TestLegacyMigrationPreservesLargeGenerationExactly(t *testing.T) {
+	origMAC := migrateGetMACAddress
+	origDecrypt := migrateDecrypt
+	origExists := migrateExists
+	origSet := migrateSet
+	origRead := keychainReadFile
+	origStat := keychainStat
+	origRename := keychainRename
+	t.Cleanup(func() {
+		migrateGetMACAddress = origMAC
+		migrateDecrypt = origDecrypt
+		migrateExists = origExists
+		migrateSet = origSet
+		keychainReadFile = origRead
+		keychainStat = origStat
+		keychainRename = origRename
+	})
+
+	const generation = "9223372036854775813"
+	legacyJSON := []byte(`{"access_token":"legacy-token","generation":` + generation + `}`)
+	migrateGetMACAddress = func() (string, error) { return "test-mac", nil }
+	keychainReadFile = func(string) ([]byte, error) { return []byte("ciphertext"), nil }
+	migrateDecrypt = func([]byte, []byte) ([]byte, error) { return legacyJSON, nil }
+	migrateExists = func(string, string) bool { return false }
+	keychainStat = func(string) (os.FileInfo, error) { return nil, nil }
+	keychainRename = func(string, string) error { return nil }
+
+	decoded, err := loadLegacyData(t.TempDir())
+	if err != nil {
+		t.Fatalf("loadLegacyData() error = %v", err)
+	}
+	gotNumber, ok := decoded["generation"].(json.Number)
+	if !ok || gotNumber.String() != generation {
+		t.Fatalf("decoded generation = %#v, want json.Number(%s)", decoded["generation"], generation)
+	}
+
+	var stored string
+	migrateSet = func(_, _, value string) error {
+		stored = value
+		return nil
+	}
+	result := MigrateFromLegacy(t.TempDir())
+	if result.Error != nil || !result.Migrated {
+		t.Fatalf("MigrateFromLegacy() = %#v", result)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(stored), &fields); err != nil {
+		t.Fatalf("decode migrated payload: %v", err)
+	}
+	if got := string(fields["generation"]); got != generation {
+		t.Fatalf("stored generation = %s, want %s", got, generation)
+	}
+}
 
 func TestCrossPlatformCoverageMigrateFromLegacyPortableEdges(t *testing.T) {
 	injectedErr := errors.New("injected migration failure")

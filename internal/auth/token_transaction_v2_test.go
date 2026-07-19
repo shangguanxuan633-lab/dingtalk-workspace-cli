@@ -1,15 +1,18 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
@@ -57,6 +60,191 @@ func v2ProfileToken(corpID, userID, access string) *TokenData {
 	data.CorpName = corpID + " name"
 	data.UserName = userID + " name"
 	return data
+}
+
+func TestDefaultTokenGenerationSeedIsJSSafe(t *testing.T) {
+	originalReader := tokenGenerationRandomReader
+	t.Cleanup(func() { tokenGenerationRandomReader = originalReader })
+
+	for _, tc := range []struct {
+		name    string
+		entropy []byte
+		want    uint64
+	}{
+		{name: "lower bound", entropy: make([]byte, 8), want: tokenGenerationSeedBase},
+		{name: "upper bound", entropy: bytes.Repeat([]byte{0xff}, 8), want: tokenGenerationSeedLimit - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tokenGenerationRandomReader = bytes.NewReader(tc.entropy)
+			got, err := defaultTokenGenerationSeed()
+			if err != nil {
+				t.Fatalf("defaultTokenGenerationSeed() error = %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("defaultTokenGenerationSeed() = %d, want %d", got, tc.want)
+			}
+			if got < tokenGenerationSeedBase || got >= tokenGenerationSeedLimit || got > maxTokenGeneration {
+				t.Fatalf("seed %d is outside the JSON-safe seed band", got)
+			}
+		})
+	}
+}
+
+func TestInjectedTokenGenerationSeedMustStayInReservedBand(t *testing.T) {
+	originalSeed := tokenGenerationSeed
+	t.Cleanup(func() { tokenGenerationSeed = originalSeed })
+
+	for _, seed := range []uint64{tokenGenerationSeedBase - 1, tokenGenerationSeedLimit} {
+		tokenGenerationSeed = func() (uint64, error) { return seed, nil }
+		if _, err := newTokenGenerationSeed(); err == nil || !strings.Contains(err.Error(), "outside") {
+			t.Fatalf("newTokenGenerationSeed(%d) error = %v", seed, err)
+		}
+	}
+}
+
+func TestTokenGenerationEntropyFailurePreventsPublication(t *testing.T) {
+	originalReader := tokenGenerationRandomReader
+	originalSeed := tokenGenerationSeed
+	t.Cleanup(func() {
+		tokenGenerationRandomReader = originalReader
+		tokenGenerationSeed = originalSeed
+	})
+
+	sentinel := errors.New("entropy unavailable")
+	tokenGenerationRandomReader = iotest.ErrReader(sentinel)
+	tokenGenerationSeed = defaultTokenGenerationSeed
+	configDir := t.TempDir()
+
+	if err := WriteTokenMarker(configDir); !errors.Is(err, sentinel) {
+		t.Fatalf("WriteTokenMarker() error = %v, want entropy failure", err)
+	}
+	for _, name := range []string{tokenJSONFile, tokenGenerationFile} {
+		if _, err := os.Stat(filepath.Join(configDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s exists after entropy failure; stat error = %v", name, err)
+		}
+	}
+}
+
+func TestTokenGenerationAllocatorEnforcesJSSafeMaximum(t *testing.T) {
+	configDir := t.TempDir()
+	if err := withProfilesLock(configDir, func() error {
+		if err := writeTokenGeneration(configDir, maxTokenGeneration-1); err != nil {
+			return err
+		}
+		generation, err := allocateTokenGenerationLocked(configDir, 0)
+		if err != nil {
+			return err
+		}
+		if generation != maxTokenGeneration {
+			t.Fatalf("last allocation = %d, want %d", generation, maxTokenGeneration)
+		}
+		if _, err := allocateTokenGenerationLocked(configDir, 0); err == nil || !strings.Contains(err.Error(), "JSON-safe maximum") {
+			t.Fatalf("allocation past maximum error = %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("maximum allocation setup error = %v", err)
+	}
+
+	stored, exists, err := readTokenGeneration(configDir)
+	if err != nil || !exists || stored != maxTokenGeneration {
+		t.Fatalf("allocator after exhaustion = (%d, %v, %v), want %d", stored, exists, err, maxTokenGeneration)
+	}
+	if err := writeTokenGeneration(configDir, maxTokenGeneration+1); err == nil || !strings.Contains(err.Error(), "JSON-safe maximum") {
+		t.Fatalf("unsafe allocator write error = %v", err)
+	}
+	if err := writeTokenMarker(configDir, false, maxTokenGeneration+1); err == nil || !strings.Contains(err.Error(), "JSON-safe maximum") {
+		t.Fatalf("unsafe marker write error = %v", err)
+	}
+}
+
+func TestTokenGenerationAllocatorRepairsUnsafeLegacyState(t *testing.T) {
+	originalSeed := tokenGenerationSeed
+	t.Cleanup(func() { tokenGenerationSeed = originalSeed })
+	tokenGenerationSeed = func() (uint64, error) { return tokenGenerationSeedBase + 17, nil }
+
+	configDir := t.TempDir()
+	unsafeState, err := json.Marshal(tokenGenerationState{Generation: maxTokenGeneration + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, tokenGenerationFile), unsafeState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := withProfilesLock(configDir, func() error {
+		generation, err := allocateTokenGenerationLocked(configDir, 0)
+		if err != nil {
+			return err
+		}
+		if generation != tokenGenerationSeedBase+18 {
+			t.Fatalf("repaired generation = %d, want %d", generation, tokenGenerationSeedBase+18)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("repair unsafe allocator: %v", err)
+	}
+}
+
+func TestTokenGenerationAllocatorRepairWarningIsSafeAndEmittedOnce(t *testing.T) {
+	originalSeed := tokenGenerationSeed
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		tokenGenerationSeed = originalSeed
+		slog.SetDefault(originalLogger)
+	})
+	tokenGenerationSeed = func() (uint64, error) { return tokenGenerationSeedBase + 29, nil }
+
+	const corruptPayload = "CORRUPT_GENERATION_DO_NOT_LOG_8f397d"
+	for _, tc := range []struct {
+		name   string
+		repair func(string) error
+	}{
+		{
+			name: "ensure floor",
+			repair: func(configDir string) error {
+				return ensureTokenGenerationFloorLocked(configDir, 0)
+			},
+		},
+		{
+			name: "allocate",
+			repair: func(configDir string) error {
+				_, err := allocateTokenGenerationLocked(configDir, 0)
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+			configDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(configDir, tokenGenerationFile), []byte(corruptPayload), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := withProfilesLock(configDir, func() error { return tc.repair(configDir) }); err != nil {
+				t.Fatalf("repair allocator: %v", err)
+			}
+
+			got := logs.String()
+			if count := strings.Count(got, `"msg":"auth.token_generation_allocator.repaired"`); count != 1 {
+				t.Fatalf("repair warning count = %d, log = %s", count, got)
+			}
+			for _, want := range []string{
+				`"level":"WARN"`,
+				`"stage":"token_generation_allocator_repair"`,
+				`"outcome":"repaired"`,
+				`"error_type":"token_generation_allocator_corrupt"`,
+			} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("repair warning missing %s: %s", want, got)
+				}
+			}
+			for _, forbidden := range []string{corruptPayload, configDir, tokenGenerationFile} {
+				if strings.Contains(got, forbidden) {
+					t.Fatalf("repair warning leaked %q: %s", forbidden, got)
+				}
+			}
+		})
+	}
 }
 
 func TestEditionTokenStorePreflightRequiresCompleteTransactionHooks(t *testing.T) {

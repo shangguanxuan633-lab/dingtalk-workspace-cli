@@ -16,9 +16,13 @@ package auth
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -89,6 +93,8 @@ var (
 	tokenRevokeHTTPClient       = &http.Client{Timeout: 10 * time.Second}
 )
 
+var tokenGenerationRandomReader io.Reader = cryptorand.Reader
+
 // TokenData holds the OAuth token set persisted to disk.
 type TokenData struct {
 	AccessToken    string    `json:"access_token"`
@@ -129,8 +135,11 @@ func (t *TokenData) HasPersistentCode() bool {
 }
 
 const (
-	tokenJSONFile       = "token.json"
-	tokenGenerationFile = ".token-generation.json"
+	tokenJSONFile                   = "token.json"
+	tokenGenerationFile             = ".token-generation.json"
+	tokenGenerationSeedBase  uint64 = 1 << 51
+	tokenGenerationSeedLimit uint64 = 1 << 52
+	maxTokenGeneration       uint64 = (1 << 53) - 1
 )
 
 // TokenMarker is a lightweight file the host application reads to detect
@@ -166,14 +175,46 @@ func (e *tokenGenerationCorruptionError) Error() string {
 func (e *tokenGenerationCorruptionError) Unwrap() error { return e.cause }
 
 // defaultTokenGenerationSeed gives a new/migrated allocator a publication
-// epoch far above historical small counters. This covers the mixed-version
-// case where an older binary already removed token.json before a fixed binary
-// can import its generation. Unix nanoseconds make a repeated epoch across two
-// independent reset/re-login cycles practically impossible while leaving half
-// of uint64 available for future increments.
-func defaultTokenGenerationSeed() uint64 {
-	const epochBase = uint64(1) << 63
-	return epochBase | (uint64(time.Now().UnixNano()) & (epochBase - 1))
+// epoch far above historical small counters while remaining exactly
+// representable by every JSON number consumer, including JavaScript. A random
+// 51-bit suffix makes an ABA collision after complete allocator loss
+// vanishingly unlikely and leaves at least 2^52 future increments before the
+// explicit JSON-safe ceiling. Entropy failures are returned to the caller;
+// falling back to a clock-derived value would silently weaken ABA protection.
+func defaultTokenGenerationSeed() (uint64, error) {
+	var entropy [8]byte
+	if _, err := io.ReadFull(tokenGenerationRandomReader, entropy[:]); err != nil {
+		return 0, fmt.Errorf("read token generation entropy: %w", err)
+	}
+	return tokenGenerationSeedBase |
+		(binary.BigEndian.Uint64(entropy[:]) & (tokenGenerationSeedBase - 1)), nil
+}
+
+func newTokenGenerationSeed() (uint64, error) {
+	seed, err := tokenGenerationSeed()
+	if err != nil {
+		return 0, fmt.Errorf("seed token generation allocator: %w", err)
+	}
+	if seed < tokenGenerationSeedBase || seed >= tokenGenerationSeedLimit {
+		return 0, fmt.Errorf("token generation seed %d outside [%d,%d)", seed, tokenGenerationSeedBase, tokenGenerationSeedLimit)
+	}
+	return seed, nil
+}
+
+func validateTokenGeneration(generation uint64) error {
+	if generation > maxTokenGeneration {
+		return fmt.Errorf("token generation %d exceeds JSON-safe maximum %d", generation, maxTokenGeneration)
+	}
+	return nil
+}
+
+func logTokenGenerationAllocatorRepair() {
+	slog.Warn(
+		"auth.token_generation_allocator.repaired",
+		"stage", "token_generation_allocator_repair",
+		"outcome", "repaired",
+		"error_type", "token_generation_allocator_corrupt",
+	)
 }
 
 // WriteTokenMarker publishes a token.json marker under the auth dual lock. The
@@ -211,6 +252,9 @@ func writeFreshTokenMarkerLocked(configDir string, manual bool) error {
 }
 
 func writeTokenMarker(configDir string, manual bool, generation uint64) error {
+	if err := validateTokenGeneration(generation); err != nil {
+		return err
+	}
 	marker := TokenMarker{
 		UpdatedAt:   time.Now().Format(time.RFC3339),
 		ManualToken: manual,
@@ -258,10 +302,16 @@ func readTokenGeneration(configDir string) (generation uint64, exists bool, err 
 	if err := json.Unmarshal(data, &state); err != nil {
 		return 0, true, &tokenGenerationCorruptionError{cause: err}
 	}
+	if err := validateTokenGeneration(state.Generation); err != nil {
+		return 0, true, &tokenGenerationCorruptionError{cause: err}
+	}
 	return state.Generation, true, nil
 }
 
 func writeTokenGeneration(configDir string, generation uint64) error {
+	if err := validateTokenGeneration(generation); err != nil {
+		return err
+	}
 	data, err := tokenJSONMarshalIndent(tokenGenerationState{Generation: generation}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal token generation allocator: %w", err)
@@ -297,17 +347,25 @@ func writeTokenGeneration(configDir string, generation uint64) error {
 // under the auth dual lock so a concurrent allocator cannot be overwritten by
 // a smaller floor.
 func ensureTokenGenerationFloorLocked(configDir string, floor uint64) error {
+	if err := validateTokenGeneration(floor); err != nil {
+		return err
+	}
+	repairingCorruptAllocator := false
 	current, exists, err := readTokenGeneration(configDir)
 	if err != nil {
 		var corrupt *tokenGenerationCorruptionError
 		if !errors.As(err, &corrupt) {
 			return err
 		}
+		repairingCorruptAllocator = true
 		exists = false
 		current = 0
 	}
 	if !exists {
-		current = tokenGenerationSeed()
+		current, err = newTokenGenerationSeed()
+		if err != nil {
+			return err
+		}
 	}
 	if exists && current >= floor {
 		return nil
@@ -315,24 +373,38 @@ func ensureTokenGenerationFloorLocked(configDir string, floor uint64) error {
 	if floor > current {
 		current = floor
 	}
-	return writeTokenGeneration(configDir, current)
+	if err := writeTokenGeneration(configDir, current); err != nil {
+		return err
+	}
+	if repairingCorruptAllocator {
+		logTokenGenerationAllocatorRepair()
+	}
+	return nil
 }
 
 // allocateTokenGenerationLocked reserves the next durable generation before
 // the credential transaction starts. Gaps are intentional: rolling this value
 // back after a failed save could let another process observe an ABA reuse.
 func allocateTokenGenerationLocked(configDir string, floor uint64) (uint64, error) {
+	if err := validateTokenGeneration(floor); err != nil {
+		return 0, err
+	}
+	repairingCorruptAllocator := false
 	current, exists, err := readTokenGeneration(configDir)
 	if err != nil {
 		var corrupt *tokenGenerationCorruptionError
 		if !errors.As(err, &corrupt) {
 			return 0, err
 		}
+		repairingCorruptAllocator = true
 		exists = false
 		current = 0
 	}
 	if !exists {
-		current = tokenGenerationSeed()
+		current, err = newTokenGenerationSeed()
+		if err != nil {
+			return 0, err
+		}
 	}
 	markerGeneration, _, err := ReadTokenMarkerGeneration(configDir)
 	if err != nil {
@@ -344,12 +416,15 @@ func allocateTokenGenerationLocked(configDir string, floor uint64) (uint64, erro
 	if floor > current {
 		current = floor
 	}
-	if current == ^uint64(0) {
-		return 0, fmt.Errorf("token generation overflow")
+	if current >= maxTokenGeneration {
+		return 0, fmt.Errorf("token generation exhausted at JSON-safe maximum %d", maxTokenGeneration)
 	}
 	next := current + 1
 	if err := writeTokenGeneration(configDir, next); err != nil {
 		return 0, err
+	}
+	if repairingCorruptAllocator {
+		logTokenGenerationAllocatorRepair()
 	}
 	return next, nil
 }
