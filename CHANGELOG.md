@@ -14,6 +14,7 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/) and th
 ### Fixed
 
 - **Tag-push GitHub Release publication** — Draft publication now locks one GitHub Release database ID, verifies its exact tag, channel, notes, recovery marker, asset set, and uploaded bytes, then publishes and rechecks that same ID as immutable. Recovery runs use the trusted default-branch release helpers instead of the sealed tag's historical scripts, fixing the Draft-only `GET /releases/tags/{tag}` 404 without allowing the release identity to drift during recovery.
+- **Long-running OAuth token refresh and truthful auth diagnostics** — all runtime, personal/portal event, control, and Skill requests now resolve expiry-aware token snapshots through one generation-aware manager; rejected OAuth tokens use a strict permission/PAT-vetoed compare-and-refresh path with at most one idempotent replay. Transient refresh or credential-store failures preserve the login state and surface safe stage-specific diagnostics instead of collapsing into `not_authenticated`, while terminal refresh failures alone may conditionally remove the rejected generation.
 - **Release preflight reliability** — source-mode installer tests now use isolated temporary checkouts and HOME directories instead of overwriting and deleting the real repository `dws` binary, release preflight explicitly rebuilds before policy checks, and the full-suite runner gives the growing script package a non-flaky five-minute per-suite budget.
 
 ## [1.0.53-beta.4] - 2026-07-17
