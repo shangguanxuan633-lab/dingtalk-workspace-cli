@@ -72,10 +72,11 @@ var (
 	tokenSyncOrganizationMirror = syncOrganizationTokenMirrorForProfile
 	tokenLoadProfiles           = LoadProfiles
 	tokenSaveProfiles           = SaveProfiles
-	tokenWriteMarker            = WriteTokenMarker
-	tokenWriteManualMarker      = WriteManualTokenMarker
+	tokenWriteMarker            = writeTokenMarkerLocked
+	tokenWriteManualMarker      = writeManualTokenMarkerLocked
 	tokenWriteMarkerGeneration  = writeTokenMarkerGeneration
-	tokenDeleteMarker           = DeleteTokenMarker
+	tokenDeleteMarker           = deleteTokenMarkerLocked
+	tokenGenerationSeed         = defaultTokenGenerationSeed
 	tokenParseURL               = url.Parse
 	tokenNewRequest             = http.NewRequestWithContext
 	tokenDefaultConfigDir       = getDefaultConfigDir
@@ -127,7 +128,10 @@ func (t *TokenData) HasPersistentCode() bool {
 	return t != nil && t.PersistentCode != ""
 }
 
-const tokenJSONFile = "token.json"
+const (
+	tokenJSONFile       = "token.json"
+	tokenGenerationFile = ".token-generation.json"
+)
 
 // TokenMarker is a lightweight file the host application reads to detect
 // whether the CLI has a valid token without accessing the keychain.
@@ -137,26 +141,73 @@ type TokenMarker struct {
 	Generation  uint64 `json:"generation,omitempty"`
 }
 
-// WriteTokenMarker writes a token.json marker containing only an updated_at
-// timestamp. The host application uses this file's presence and mtime to
-// decide whether it needs to trigger a new auth exchange.
+// tokenGenerationState is a durable, non-sensitive sequence allocator shared
+// by every process that publishes authentication state. It intentionally lives
+// outside token.json: logout removes the compatibility marker, but must never
+// erase the last allocated generation and allow a later login to reuse it.
+//
+// The allocator contains no token or identity material. Writes use the same
+// atomic rename + file/directory fsync protocol as token.json. Callers of the
+// *Locked helpers below must hold the auth dual lock; failed transactions do
+// not roll this file back, so a crash or rollback may leave a harmless gap but
+// can never make the sequence decrease.
+type tokenGenerationState struct {
+	Generation uint64 `json:"generation"`
+}
+
+type tokenGenerationCorruptionError struct {
+	cause error
+}
+
+func (e *tokenGenerationCorruptionError) Error() string {
+	return "token generation allocator is corrupt"
+}
+
+func (e *tokenGenerationCorruptionError) Unwrap() error { return e.cause }
+
+// defaultTokenGenerationSeed gives a new/migrated allocator a publication
+// epoch far above historical small counters. This covers the mixed-version
+// case where an older binary already removed token.json before a fixed binary
+// can import its generation. Unix nanoseconds make a repeated epoch across two
+// independent reset/re-login cycles practically impossible while leaving half
+// of uint64 available for future increments.
+func defaultTokenGenerationSeed() uint64 {
+	const epochBase = uint64(1) << 63
+	return epochBase | (uint64(time.Now().UnixNano()) & (epochBase - 1))
+}
+
+// WriteTokenMarker publishes a token.json marker under the auth dual lock. The
+// host application uses this file's presence and mtime to decide whether it
+// needs to trigger a new auth exchange.
 func WriteTokenMarker(configDir string) error {
-	generation, _, err := ReadTokenMarkerGeneration(configDir)
-	if err != nil {
-		return err
-	}
-	return writeTokenMarker(configDir, false, generation)
+	return withProfilesLock(configDir, func() error {
+		return writeTokenMarkerLocked(configDir)
+	})
 }
 
 // WriteManualTokenMarker marks the legacy global keychain slot as an explicit
 // `auth login --token` credential. The additive field keeps older hosts, which
 // only inspect token.json presence and mtime, fully compatible.
 func WriteManualTokenMarker(configDir string) error {
-	generation, _, err := ReadTokenMarkerGeneration(configDir)
+	return withProfilesLock(configDir, func() error {
+		return writeManualTokenMarkerLocked(configDir)
+	})
+}
+
+func writeTokenMarkerLocked(configDir string) error {
+	return writeFreshTokenMarkerLocked(configDir, false)
+}
+
+func writeManualTokenMarkerLocked(configDir string) error {
+	return writeFreshTokenMarkerLocked(configDir, true)
+}
+
+func writeFreshTokenMarkerLocked(configDir string, manual bool) error {
+	generation, err := allocateTokenGenerationLocked(configDir, 0)
 	if err != nil {
 		return err
 	}
-	return writeTokenMarker(configDir, true, generation)
+	return writeTokenMarker(configDir, manual, generation)
 }
 
 func writeTokenMarker(configDir string, manual bool, generation uint64) error {
@@ -193,6 +244,114 @@ func writeTokenMarker(configDir string, manual bool, generation uint64) error {
 		return fmt.Errorf("sync token publication directory: %w", err)
 	}
 	return nil
+}
+
+func readTokenGeneration(configDir string) (generation uint64, exists bool, err error) {
+	data, err := tokenReadFile(filepath.Join(configDir, tokenGenerationFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	var state tokenGenerationState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return 0, true, &tokenGenerationCorruptionError{cause: err}
+	}
+	return state.Generation, true, nil
+}
+
+func writeTokenGeneration(configDir string, generation uint64) error {
+	data, err := tokenJSONMarshalIndent(tokenGenerationState{Generation: generation}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal token generation allocator: %w", err)
+	}
+	if err := tokenMkdirAll(configDir, 0o700); err != nil {
+		return err
+	}
+	tmp := filepath.Join(configDir, tokenGenerationFile+"."+uuid.New().String()+".tmp")
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = tokenRemove(tmp)
+		}
+	}()
+	if err := tokenWriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := tokenSyncFile(tmp); err != nil {
+		return fmt.Errorf("sync token generation allocator: %w", err)
+	}
+	if err := tokenRename(tmp, filepath.Join(configDir, tokenGenerationFile)); err != nil {
+		return err
+	}
+	renamed = true
+	if err := tokenSyncDirectory(configDir); err != nil {
+		return fmt.Errorf("sync token generation directory: %w", err)
+	}
+	return nil
+}
+
+// ensureTokenGenerationFloorLocked imports generations written by older
+// versions or host editions before a marker is deleted/restored. It must run
+// under the auth dual lock so a concurrent allocator cannot be overwritten by
+// a smaller floor.
+func ensureTokenGenerationFloorLocked(configDir string, floor uint64) error {
+	current, exists, err := readTokenGeneration(configDir)
+	if err != nil {
+		var corrupt *tokenGenerationCorruptionError
+		if !errors.As(err, &corrupt) {
+			return err
+		}
+		exists = false
+		current = 0
+	}
+	if !exists {
+		current = tokenGenerationSeed()
+	}
+	if exists && current >= floor {
+		return nil
+	}
+	if floor > current {
+		current = floor
+	}
+	return writeTokenGeneration(configDir, current)
+}
+
+// allocateTokenGenerationLocked reserves the next durable generation before
+// the credential transaction starts. Gaps are intentional: rolling this value
+// back after a failed save could let another process observe an ABA reuse.
+func allocateTokenGenerationLocked(configDir string, floor uint64) (uint64, error) {
+	current, exists, err := readTokenGeneration(configDir)
+	if err != nil {
+		var corrupt *tokenGenerationCorruptionError
+		if !errors.As(err, &corrupt) {
+			return 0, err
+		}
+		exists = false
+		current = 0
+	}
+	if !exists {
+		current = tokenGenerationSeed()
+	}
+	markerGeneration, _, err := ReadTokenMarkerGeneration(configDir)
+	if err != nil {
+		return 0, err
+	}
+	if markerGeneration > current {
+		current = markerGeneration
+	}
+	if floor > current {
+		current = floor
+	}
+	if current == ^uint64(0) {
+		return 0, fmt.Errorf("token generation overflow")
+	}
+	next := current + 1
+	if err := writeTokenGeneration(configDir, next); err != nil {
+		return 0, err
+	}
+	return next, nil
 }
 
 func syncTokenFile(path string) error {
@@ -535,6 +694,9 @@ func ReadTokenMarkerGeneration(configDir string) (generation uint64, present boo
 }
 
 func writeTokenMarkerGeneration(configDir string, manual bool, generation uint64) error {
+	if err := ensureTokenGenerationFloorLocked(configDir, generation); err != nil {
+		return err
+	}
 	return writeTokenMarker(configDir, manual, generation)
 }
 
@@ -543,17 +705,11 @@ func writeTokenMarkerGeneration(configDir string, manual bool, generation uint64
 // optional floor keeps the publication generation ahead of the selected
 // credential even when migrating an old/missing marker.
 func bumpTokenMarkerGeneration(configDir string, manual bool, floor uint64) error {
-	generation, _, err := ReadTokenMarkerGeneration(configDir)
+	generation, err := allocateTokenGenerationLocked(configDir, floor)
 	if err != nil {
 		return err
 	}
-	if floor > generation {
-		generation = floor
-	}
-	if generation == ^uint64(0) {
-		return fmt.Errorf("token generation overflow")
-	}
-	return writeTokenMarkerGeneration(configDir, manual, generation+1)
+	return writeTokenMarker(configDir, manual, generation)
 }
 
 func manualTokenMarkerActive(configDir string) (bool, error) {
@@ -580,8 +736,28 @@ func ManualTokenMarkerActive(configDir string) (bool, error) {
 	return manualTokenMarkerActive(configDir)
 }
 
-// DeleteTokenMarker removes the token.json marker file.
+// DeleteTokenMarker removes token.json under the auth dual lock while retaining
+// the durable generation allocator. Keeping the allocator is what prevents a
+// delete -> re-login cycle from reusing a generation that a long process has
+// already cached.
 func DeleteTokenMarker(configDir string) error {
+	return withProfilesLock(configDir, func() error {
+		return deleteTokenMarkerLocked(configDir)
+	})
+}
+
+func deleteTokenMarkerLocked(configDir string) error {
+	generation, present, err := ReadTokenMarkerGeneration(configDir)
+	if err != nil {
+		return err
+	}
+	if present {
+		// Upgrade markers created by older versions before removing them. The
+		// allocator is intentionally not part of transaction rollback.
+		if err := ensureTokenGenerationFloorLocked(configDir, generation); err != nil {
+			return err
+		}
+	}
 	if err := tokenRemove(filepath.Join(configDir, tokenJSONFile)); err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -832,18 +1008,11 @@ func saveTokenViaHookTransaction(h *edition.Hooks, configDir, profile string, da
 }
 
 func assignNextTokenGeneration(configDir string, data *TokenData) error {
-	markerGeneration, _, err := ReadTokenMarkerGeneration(configDir)
+	generation, err := allocateTokenGenerationLocked(configDir, data.Generation)
 	if err != nil {
 		return err
 	}
-	base := markerGeneration
-	if data.Generation > base {
-		base = data.Generation
-	}
-	if base == ^uint64(0) {
-		return fmt.Errorf("token generation overflow")
-	}
-	data.Generation = base + 1
+	data.Generation = generation
 	return nil
 }
 

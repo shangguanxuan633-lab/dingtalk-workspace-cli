@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -85,6 +87,128 @@ func TestEditionTokenStoreV2RequiresCompleteTransactionHooks(t *testing.T) {
 	t.Cleanup(func() { edition.Override(previous) })
 	if err := preflightTokenPersistence(t.TempDir()); err == nil || !strings.Contains(err.Error(), "TokenStoreV2 must provide Save, Load, and Delete") {
 		t.Fatalf("incomplete TokenStoreV2 preflight error = %v", err)
+	}
+}
+
+func TestGenerationAllocatorSurvivesLogoutFromLegacyMarker(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	store := &memoryProfileTokenStoreV2{}
+	edition.Override(store.hooks(nil))
+	SetRuntimeProfile("")
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+	})
+	configDir := t.TempDir()
+
+	first := v2ProfileToken("corp-epoch", "user-epoch", "token-before-logout")
+	if err := SaveTokenData(configDir, first); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an installation upgraded from a build that had generation in
+	// token.json but no durable allocator yet.
+	if err := os.Remove(filepath.Join(configDir, tokenGenerationFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteAllTokenData(configDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, present, err := ReadTokenMarkerGeneration(configDir); err != nil || present {
+		t.Fatalf("marker after logout = present %v, err %v", present, err)
+	}
+	remembered, exists, err := readTokenGeneration(configDir)
+	if err != nil || !exists || remembered < first.Generation {
+		t.Fatalf("allocator after logout = (%d, %v, %v), want >= %d", remembered, exists, err, first.Generation)
+	}
+
+	second := v2ProfileToken("corp-epoch", "user-epoch", "token-after-relogin")
+	if err := SaveTokenData(configDir, second); err != nil {
+		t.Fatal(err)
+	}
+	if second.Generation <= first.Generation {
+		t.Fatalf("re-login generation = %d, want > %d", second.Generation, first.Generation)
+	}
+}
+
+func TestGenerationAllocatorDoesNotRollBackFailedReservation(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	store := &memoryProfileTokenStoreV2{}
+	edition.Override(store.hooks(nil))
+	SetRuntimeProfile("")
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+	})
+	configDir := t.TempDir()
+
+	first := v2ProfileToken("corp-gap", "user-gap", "token-a")
+	if err := SaveTokenData(configDir, first); err != nil {
+		t.Fatal(err)
+	}
+	originalWriteMarker := tokenWriteMarkerGeneration
+	sentinel := errors.New("injected marker publication failure")
+	tokenWriteMarkerGeneration = func(string, bool, uint64) error { return sentinel }
+	t.Cleanup(func() { tokenWriteMarkerGeneration = originalWriteMarker })
+	failed := v2ProfileToken("corp-gap", "user-gap", "token-b")
+	if err := SaveTokenData(configDir, failed); !errors.Is(err, sentinel) {
+		t.Fatalf("failed SaveTokenData() error = %v, want %v", err, sentinel)
+	}
+	if failed.Generation != 0 {
+		t.Fatalf("failed save mutated caller generation to %d", failed.Generation)
+	}
+	reserved, exists, err := readTokenGeneration(configDir)
+	if err != nil || !exists || reserved <= first.Generation {
+		t.Fatalf("reserved generation = (%d, %v, %v), want > %d", reserved, exists, err, first.Generation)
+	}
+
+	tokenWriteMarkerGeneration = originalWriteMarker
+	third := v2ProfileToken("corp-gap", "user-gap", "token-c")
+	if err := SaveTokenData(configDir, third); err != nil {
+		t.Fatal(err)
+	}
+	if third.Generation <= reserved {
+		t.Fatalf("generation after failed reservation = %d, want > %d", third.Generation, reserved)
+	}
+}
+
+func TestCorruptGenerationAllocatorDoesNotPermanentlyBlockResetOrLogin(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	store := &memoryProfileTokenStoreV2{}
+	edition.Override(store.hooks(nil))
+	SetRuntimeProfile("")
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+	})
+	configDir := t.TempDir()
+
+	first := v2ProfileToken("corp-repair", "user-repair", "token-before-corruption")
+	if err := SaveTokenData(configDir, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, tokenGenerationFile), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteAllTokenData(configDir); err != nil {
+		t.Fatalf("auth reset with corrupt allocator: %v", err)
+	}
+	if _, present, err := ReadTokenMarkerGeneration(configDir); err != nil || present {
+		t.Fatalf("marker after repaired reset = present %v, err %v", present, err)
+	}
+	repaired, exists, err := readTokenGeneration(configDir)
+	if err != nil || !exists || repaired == 0 {
+		t.Fatalf("repaired allocator = (%d, %v, %v)", repaired, exists, err)
+	}
+
+	second := v2ProfileToken("corp-repair", "user-repair", "token-after-corruption")
+	if err := SaveTokenData(configDir, second); err != nil {
+		t.Fatalf("login after repaired reset: %v", err)
+	}
+	if second.Generation <= repaired {
+		t.Fatalf("generation after repair = %d, want > %d", second.Generation, repaired)
 	}
 }
 

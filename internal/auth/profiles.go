@@ -52,12 +52,12 @@ var (
 	profilesDeleteCorp        = DeleteTokenDataKeychainForCorpID
 	profilesLoadIdentity      = LoadTokenDataKeychainForIdentity
 	profilesSaveLegacy        = SaveTokenDataKeychain
-	profilesWriteMarker       = WriteTokenMarker
-	profilesWriteManualMarker = WriteManualTokenMarker
+	profilesWriteMarker       = writeTokenMarkerLocked
+	profilesWriteManualMarker = writeManualTokenMarkerLocked
 	profilesWriteMarkerGen    = writeTokenMarkerGeneration
 	profilesBumpMarker        = bumpTokenMarkerGeneration
 	profilesDeleteLegacy      = DeleteTokenDataKeychain
-	profilesDeleteMarker      = DeleteTokenMarker
+	profilesDeleteMarker      = deleteTokenMarkerLocked
 )
 
 // withProfilesLock runs fn while holding the auth dual-layer lock (process +

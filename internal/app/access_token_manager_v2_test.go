@@ -138,6 +138,116 @@ func TestTokenManagerMarkerChangeInvalidatesLongRunningSnapshot(t *testing.T) {
 	}
 }
 
+func TestTokenManagerDeleteReloginCannotReuseMissedGeneration(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv(keychain.DisableKeychainEnv, "1")
+	t.Setenv("DWS_CONFIG_DIR", configDir)
+	previousHooks := edition.Get()
+	previousProfile := authpkg.RuntimeProfile()
+	edition.Override(&edition.Hooks{})
+	authpkg.SetRuntimeProfile("")
+	t.Cleanup(func() {
+		edition.Override(previousHooks)
+		authpkg.SetRuntimeProfile(previousProfile)
+		ResetRuntimeTokenCache()
+	})
+
+	newToken := func(accessToken string) *authpkg.TokenData {
+		return &authpkg.TokenData{
+			AccessToken:  accessToken,
+			RefreshToken: "refresh-" + accessToken,
+			ExpiresAt:    time.Now().Add(time.Hour),
+			RefreshExpAt: time.Now().Add(24 * time.Hour),
+			CorpID:       "corp-aba",
+			UserID:       "user-aba",
+			ClientID:     "client-aba",
+		}
+	}
+
+	firstData := newToken("token-before-logout")
+	if err := authpkg.SaveTokenData(configDir, firstData); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewTokenManager()
+	first, err := manager.Get(context.Background(), configDir, "")
+	if err != nil || first.AccessToken != firstData.AccessToken {
+		t.Fatalf("first Get = %#v, %v", first, err)
+	}
+
+	// Simulate another process logging out and back in while this long-running
+	// manager is idle. It deliberately never observes token.json being absent.
+	if err := authpkg.DeleteAllTokenData(configDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, present, err := authpkg.ReadTokenMarkerGeneration(configDir); err != nil || present {
+		t.Fatalf("marker after logout = present %v, err %v", present, err)
+	}
+	secondData := newToken("token-after-relogin")
+	if err := authpkg.SaveTokenData(configDir, secondData); err != nil {
+		t.Fatal(err)
+	}
+	if secondData.Generation <= first.ObservedGeneration {
+		t.Fatalf("re-login generation = %d, want > cached generation %d", secondData.Generation, first.ObservedGeneration)
+	}
+
+	second, err := manager.Get(context.Background(), configDir, "")
+	if err != nil || second.AccessToken != secondData.AccessToken {
+		t.Fatalf("Get after missed logout/re-login = %#v, %v", second, err)
+	}
+	if second.AccessToken == first.AccessToken {
+		t.Fatal("long-running manager reused the pre-logout token")
+	}
+}
+
+func TestTokenManagerMixedVersionLogoutCannotReuseGeneration(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv(keychain.DisableKeychainEnv, "1")
+	t.Setenv("DWS_CONFIG_DIR", configDir)
+	writeTokenManagerMarker(t, configDir, 1)
+	current := managerToken("legacy-token", time.Now().Add(time.Hour), 1)
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
+		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
+			copy := *current
+			return &copy, nil
+		}}
+	})
+
+	manager := NewTokenManager()
+	first, err := manager.Get(context.Background(), configDir, "")
+	if err != nil || first.AccessToken != "legacy-token" || first.ObservedGeneration != 1 {
+		t.Fatalf("legacy Get = %#v, %v", first, err)
+	}
+
+	// An older binary removes token.json and has no allocator to preserve. The
+	// fixed binary's first login must seed a new publication epoch instead of
+	// restarting the old 1, even though this manager never saw the absence.
+	if err := os.Remove(filepath.Join(configDir, "token.json")); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(filepath.Join(configDir, ".token-generation.json"))
+	relogin := &authpkg.TokenData{
+		AccessToken:  "fixed-token",
+		RefreshToken: "fixed-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		RefreshExpAt: time.Now().Add(24 * time.Hour),
+		CorpID:       "corp-mixed-version",
+		UserID:       "user-mixed-version",
+		ClientID:     "client-mixed-version",
+	}
+	if err := authpkg.SaveTokenData(configDir, relogin); err != nil {
+		t.Fatal(err)
+	}
+	if relogin.Generation == first.ObservedGeneration {
+		t.Fatalf("mixed-version re-login reused generation %d", relogin.Generation)
+	}
+	current = managerToken(relogin.AccessToken, relogin.ExpiresAt, relogin.Generation)
+
+	second, err := manager.Get(context.Background(), configDir, "")
+	if err != nil || second.AccessToken != relogin.AccessToken {
+		t.Fatalf("Get after mixed-version logout/re-login = %#v, %v", second, err)
+	}
+}
+
 func TestTokenManagerRetriesWhenMarkerChangesDuringBlobRead(t *testing.T) {
 	configDir := t.TempDir()
 	writeTokenManagerMarker(t, configDir, 1)
