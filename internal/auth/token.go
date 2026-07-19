@@ -69,6 +69,7 @@ var (
 	tokenSaveProfiles           = SaveProfiles
 	tokenWriteMarker            = WriteTokenMarker
 	tokenWriteManualMarker      = WriteManualTokenMarker
+	tokenWriteMarkerGeneration  = writeTokenMarkerGeneration
 	tokenDeleteMarker           = DeleteTokenMarker
 	tokenParseURL               = url.Parse
 	tokenNewRequest             = http.NewRequestWithContext
@@ -96,6 +97,7 @@ type TokenData struct {
 	ClientID       string    `json:"client_id,omitempty"` // Associated app client ID for refresh
 	UpdatedAt      string    `json:"updated_at,omitempty"`
 	Source         string    `json:"source,omitempty"`
+	Generation     uint64    `json:"generation,omitempty"`
 }
 
 // IsAccessTokenValid returns true if the access token has not expired.
@@ -127,28 +129,41 @@ const tokenJSONFile = "token.json"
 type TokenMarker struct {
 	UpdatedAt   string `json:"updated_at"`
 	ManualToken bool   `json:"manual_token,omitempty"`
+	Generation  uint64 `json:"generation,omitempty"`
 }
 
 // WriteTokenMarker writes a token.json marker containing only an updated_at
 // timestamp. The host application uses this file's presence and mtime to
 // decide whether it needs to trigger a new auth exchange.
 func WriteTokenMarker(configDir string) error {
-	return writeTokenMarker(configDir, false)
+	generation, _, err := ReadTokenMarkerGeneration(configDir)
+	if err != nil {
+		return err
+	}
+	return writeTokenMarker(configDir, false, generation)
 }
 
 // WriteManualTokenMarker marks the legacy global keychain slot as an explicit
 // `auth login --token` credential. The additive field keeps older hosts, which
 // only inspect token.json presence and mtime, fully compatible.
 func WriteManualTokenMarker(configDir string) error {
-	return writeTokenMarker(configDir, true)
+	generation, _, err := ReadTokenMarkerGeneration(configDir)
+	if err != nil {
+		return err
+	}
+	return writeTokenMarker(configDir, true, generation)
 }
 
-func writeTokenMarker(configDir string, manual bool) error {
+func writeTokenMarker(configDir string, manual bool, generation uint64) error {
 	marker := TokenMarker{
 		UpdatedAt:   time.Now().Format(time.RFC3339),
 		ManualToken: manual,
+		Generation:  generation,
 	}
-	data, _ := tokenJSONMarshalIndent(marker, "", "  ")
+	data, err := tokenJSONMarshalIndent(marker, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal token publication marker: %w", err)
+	}
 	if err := tokenMkdirAll(configDir, 0o700); err != nil {
 		return err
 	}
@@ -157,6 +172,28 @@ func writeTokenMarker(configDir string, manual bool) error {
 		return err
 	}
 	return tokenRename(tmp, filepath.Join(configDir, tokenJSONFile))
+}
+
+// ReadTokenMarkerGeneration reads the lightweight publication marker without
+// opening Keychain. present=false represents logout/deletion and invalidates
+// every in-memory snapshot, including legacy generation-zero entries.
+func ReadTokenMarkerGeneration(configDir string) (generation uint64, present bool, err error) {
+	data, err := tokenReadFile(filepath.Join(configDir, tokenJSONFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	var marker TokenMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return 0, true, fmt.Errorf("parse token publication marker: %w", err)
+	}
+	return marker.Generation, true, nil
+}
+
+func writeTokenMarkerGeneration(configDir string, manual bool, generation uint64) error {
+	return writeTokenMarker(configDir, manual, generation)
 }
 
 func manualTokenMarkerActive(configDir string) (bool, error) {
@@ -188,9 +225,6 @@ func DeleteTokenMarker(configDir string) error {
 // registered, it delegates entirely to the hook; otherwise it falls back
 // to the default keychain-based storage.
 func SaveTokenData(configDir string, data *TokenData) error {
-	if h := edition.Get(); h.SaveToken != nil {
-		return saveTokenViaHook(h, configDir, data)
-	}
 	return withProfilesLock(configDir, func() error {
 		return saveTokenDataLocked(configDir, data)
 	})
@@ -201,9 +235,23 @@ func SaveTokenData(configDir string, data *TokenData) error {
 // already hold the lock (OAuthProvider refresh path, the legacy secure->keychain
 // migration in LoadTokenDataForProfile) must use this instead of SaveTokenData
 // to avoid deadlocking on the non-reentrant lock.
-func saveTokenDataLocked(configDir string, data *TokenData) error {
+func saveTokenDataLocked(configDir string, data *TokenData) (retErr error) {
+	if data == nil {
+		return fmt.Errorf("token data is nil")
+	}
+	original := data
+	working := *data
+	data = &working
+	if err := assignNextTokenGeneration(configDir, data); err != nil {
+		return fmt.Errorf("prepare token generation: %w", err)
+	}
+	defer func() {
+		if retErr == nil {
+			*original = *data
+		}
+	}()
 	if h := edition.Get(); h.SaveToken != nil {
-		return saveTokenViaHook(h, configDir, data)
+		return saveTokenViaHookTransaction(h, configDir, data)
 	}
 	if data != nil && strings.TrimSpace(data.CorpID) != "" {
 		corpID := strings.TrimSpace(data.CorpID)
@@ -279,10 +327,10 @@ func saveTokenDataLocked(configDir string, data *TokenData) error {
 			}
 		}
 		if preserveManualDefault {
-			if err := tokenWriteManualMarker(configDir); err != nil {
+			if err := tokenWriteMarkerGeneration(configDir, true, data.Generation); err != nil {
 				return rollback(err)
 			}
-		} else if err := tokenWriteMarker(configDir); err != nil {
+		} else if err := tokenWriteMarkerGeneration(configDir, false, data.Generation); err != nil {
 			return rollback(err)
 		}
 		logging.AuthDebug(
@@ -308,7 +356,7 @@ func saveTokenDataLocked(configDir string, data *TokenData) error {
 	if err := tokenSaveKeychain(data); err != nil {
 		return err
 	}
-	if err := tokenWriteManualMarker(configDir); err != nil {
+	if err := tokenWriteMarkerGeneration(configDir, true, data.Generation); err != nil {
 		var rollbackErr error
 		if restoreErr := restoreTokenSlot(
 			legacySnapshot,
@@ -325,6 +373,60 @@ func saveTokenDataLocked(configDir string, data *TokenData) error {
 		}
 		return err
 	}
+	return nil
+}
+
+func saveTokenViaHookTransaction(h *edition.Hooks, configDir string, data *TokenData) error {
+	markerSnapshot, err := snapshotTokenMarker(configDir)
+	if err != nil {
+		return err
+	}
+	var previous []byte
+	previousExists := false
+	if h.LoadToken != nil {
+		if loaded, loadErr := h.LoadToken(configDir); loadErr == nil {
+			previous = append([]byte(nil), loaded...)
+			previousExists = true
+		} else if !errors.Is(loadErr, ErrTokenDataNotFound) && !errors.Is(loadErr, os.ErrNotExist) {
+			return fmt.Errorf("snapshot hook token: %w", loadErr)
+		}
+	}
+	if err := saveTokenViaHook(h, configDir, data); err != nil {
+		return err
+	}
+	if err := tokenWriteMarkerGeneration(configDir, false, data.Generation); err == nil {
+		return nil
+	} else {
+		rollbackErr := restoreTokenMarker(configDir, markerSnapshot)
+		if previousExists {
+			if restoreErr := h.SaveToken(configDir, previous); restoreErr != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore hook token: %w", restoreErr))
+			}
+		} else if h.DeleteToken != nil {
+			if restoreErr := h.DeleteToken(configDir); restoreErr != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove unpublished hook token: %w", restoreErr))
+			}
+		}
+		if rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("rollback unpublished hook token: %w", rollbackErr))
+		}
+		return err
+	}
+}
+
+func assignNextTokenGeneration(configDir string, data *TokenData) error {
+	markerGeneration, _, err := ReadTokenMarkerGeneration(configDir)
+	if err != nil {
+		return err
+	}
+	base := markerGeneration
+	if data.Generation > base {
+		base = data.Generation
+	}
+	if base == ^uint64(0) {
+		return fmt.Errorf("token generation overflow")
+	}
+	data.Generation = base + 1
 	return nil
 }
 
@@ -643,9 +745,10 @@ type tokenSlotSnapshot struct {
 }
 
 type tokenMarkerSnapshot struct {
-	known  bool
-	exists bool
-	manual bool
+	known      bool
+	exists     bool
+	manual     bool
+	generation uint64
 }
 
 type tokenPersistenceSnapshot struct {
@@ -743,7 +846,7 @@ func snapshotTokenMarker(configDir string) (tokenMarkerSnapshot, error) {
 	if err := json.Unmarshal(data, &marker); err != nil {
 		return tokenMarkerSnapshot{known: true, exists: true}, nil
 	}
-	return tokenMarkerSnapshot{known: true, exists: true, manual: marker.ManualToken}, nil
+	return tokenMarkerSnapshot{known: true, exists: true, manual: marker.ManualToken, generation: marker.Generation}, nil
 }
 
 func snapshotTokenMarkerForDeletion(configDir string) tokenMarkerSnapshot {
@@ -904,9 +1007,9 @@ func restoreTokenMarker(configDir string, marker tokenMarkerSnapshot) error {
 	case !marker.exists:
 		return tokenDeleteMarker(configDir)
 	case marker.manual:
-		return tokenWriteManualMarker(configDir)
+		return tokenWriteMarkerGeneration(configDir, true, marker.generation)
 	default:
-		return tokenWriteMarker(configDir)
+		return tokenWriteMarkerGeneration(configDir, false, marker.generation)
 	}
 }
 

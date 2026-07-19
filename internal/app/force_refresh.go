@@ -27,9 +27,19 @@ type accessTokenGetter interface {
 	GetAccessToken(context.Context) (string, error)
 }
 
+type rejectedTokenRefresher interface {
+	ForceRefreshRejectedToken(context.Context, string, ...uint64) (string, error)
+}
+
 var (
 	markAccessTokenStale = authpkg.MarkAccessTokenStale
 	newRefreshProvider   = func(configDir string) accessTokenGetter {
+		disc := slog.New(slog.NewTextHandler(io.Discard, nil))
+		provider := authpkg.NewOAuthProvider(configDir, disc)
+		configureOAuthProviderCompatibility(provider, configDir)
+		return provider
+	}
+	newRejectedTokenRefresher = func(configDir string) rejectedTokenRefresher {
 		disc := slog.New(slog.NewTextHandler(io.Discard, nil))
 		provider := authpkg.NewOAuthProvider(configDir, disc)
 		configureOAuthProviderCompatibility(provider, configDir)
@@ -57,11 +67,21 @@ func ForceRefreshAccessToken(ctx context.Context, configDir string) (string, err
 	if strings.TrimSpace(configDir) == "" {
 		return "", fmt.Errorf("config directory is empty")
 	}
-	if err := markAccessTokenStale(configDir); err != nil {
-		return "", fmt.Errorf("mark access token stale: %w", err)
+	data, err := authpkg.LoadTokenData(configDir)
+	if err != nil {
+		return "", err
 	}
-	provider := newRefreshProvider(configDir)
-	tok, err := provider.GetAccessToken(ctx)
+	return ForceRefreshRejectedToken(ctx, configDir, data.AccessToken, data.Generation)
+}
+
+// ForceRefreshRejectedToken refreshes only if the rejected token/generation is
+// still current; concurrent rotations are reused.
+func ForceRefreshRejectedToken(ctx context.Context, configDir, rejectedAccessToken string, generation ...uint64) (string, error) {
+	if strings.TrimSpace(configDir) == "" {
+		return "", fmt.Errorf("config directory is empty")
+	}
+	provider := newRejectedTokenRefresher(configDir)
+	tok, err := provider.ForceRefreshRejectedToken(ctx, rejectedAccessToken, generation...)
 	if err != nil {
 		return "", err
 	}

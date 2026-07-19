@@ -14,6 +14,7 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/i18n"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/config"
@@ -48,7 +49,10 @@ func (m *Manager) GetToken() (string, string, error) {
 		return token, "file", nil
 	}
 
-	return "", "", fmt.Errorf("%s", i18n.T("未找到认证信息，请运行 dws auth login"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", "", fmt.Errorf("读取 legacy token 失败: %w", err)
+	}
+	return "", "", fmt.Errorf("%s: %w", i18n.T("未找到认证信息，请运行 dws auth login"), os.ErrNotExist)
 }
 
 func (m *Manager) GetMCPURL() (string, error) {

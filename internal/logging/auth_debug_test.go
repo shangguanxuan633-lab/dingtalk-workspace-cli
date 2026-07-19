@@ -58,7 +58,7 @@ func TestAuthDebugEnabledOnlyByExplicitOne(t *testing.T) {
 
 		AuthDebug("auth.test", "user_id", "user")
 		got := output.String()
-		if !strings.Contains(got, `"msg":"auth.test"`) || !strings.Contains(got, `"user_id":"user"`) {
+		if !strings.Contains(got, `"msg":"auth.test"`) || !strings.Contains(got, `"user_id_hash":`) || strings.Contains(got, `"user_id":"user"`) {
 			t.Fatalf("AuthDebug() output = %s", got)
 		}
 	})

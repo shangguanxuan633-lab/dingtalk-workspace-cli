@@ -242,7 +242,7 @@ func (p *OAuthProvider) postJSON(ctx context.Context, endpoint string, body any)
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateBody(data, 200))
+		return nil, oauthEndpointError(resp.StatusCode, data)
 	}
 	return data, nil
 }
@@ -254,9 +254,16 @@ func (p *OAuthProvider) parseTokenResponse(body []byte) (*TokenData, error) {
 		PersistentCode string `json:"persistentCode"`
 		ExpiresIn      int64  `json:"expiresIn"`
 		CorpID         string `json:"corpId"`
+		ErrorCode      string `json:"errorCode,omitempty"`
+		ErrorMsg       string `json:"errorMsg,omitempty"`
+		Code           string `json:"code,omitempty"`
+		Message        string `json:"message,omitempty"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("parsing token response: %w", err)
+	}
+	if code := firstNonEmpty(resp.ErrorCode, resp.Code); code != "" || firstNonEmpty(resp.ErrorMsg, resp.Message) != "" {
+		return nil, &OAuthEndpointError{Code: code, Message: firstNonEmpty(resp.ErrorMsg, resp.Message)}
 	}
 	if resp.AccessToken == "" {
 		return nil, fmt.Errorf("token response missing accessToken")
@@ -300,14 +307,14 @@ func (p *OAuthProvider) parseMCPTokenResponse(body []byte) (*TokenData, error) {
 		ErrorMsg  string `json:"errorMsg,omitempty"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("parsing MCP token response: %w (body: %s)", err, string(body))
+		return nil, fmt.Errorf("parsing MCP token response: %w", err)
 	}
 	// Check for error response
 	if resp.ErrorCode != "" || resp.ErrorMsg != "" {
-		return nil, fmt.Errorf("MCP token exchange failed: %s - %s", resp.ErrorCode, resp.ErrorMsg)
+		return nil, &OAuthEndpointError{Code: resp.ErrorCode, Message: resp.ErrorMsg}
 	}
 	if resp.AccessToken == "" {
-		return nil, fmt.Errorf("MCP token response missing accessToken (body: %s)", string(body))
+		return nil, fmt.Errorf("MCP token response missing accessToken")
 	}
 
 	now := time.Now()
@@ -329,6 +336,21 @@ func (p *OAuthProvider) parseMCPTokenResponse(body []byte) (*TokenData, error) {
 		data.PersistentCode = resp.PersistentCode
 	}
 	return data, nil
+}
+
+func oauthEndpointError(status int, body []byte) error {
+	var payload struct {
+		ErrorCode string `json:"errorCode"`
+		ErrorMsg  string `json:"errorMsg"`
+		Code      string `json:"code"`
+		Message   string `json:"message"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return &OAuthEndpointError{
+		StatusCode: status,
+		Code:       firstNonEmpty(payload.ErrorCode, payload.Code),
+		Message:    firstNonEmpty(payload.ErrorMsg, payload.Message),
+	}
 }
 
 func firstNonEmpty(values ...string) string {

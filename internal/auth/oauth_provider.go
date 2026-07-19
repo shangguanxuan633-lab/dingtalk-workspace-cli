@@ -636,36 +636,59 @@ continueLogin:
 	return tokenData, nil
 }
 
-// GetAccessToken returns a valid access token, auto-refreshing if needed.
-// Uses a file lock with double-check pattern to prevent concurrent refresh
-// from multiple CLI processes.
-func (p *OAuthProvider) GetAccessToken(ctx context.Context) (string, error) {
+// GetTokenSnapshot returns the current token data, auto-refreshing when the
+// access token is expired or inside the refresh safety window. Unlike the old
+// string-only path it preserves storage, lock, and refresh errors so callers
+// can distinguish "not logged in" from a broken credential store.
+func (p *OAuthProvider) GetTokenSnapshot(ctx context.Context) (*TokenData, error) {
 	data, err := oauthLoadToken(p.configDir)
 	if err != nil {
-		return "", errors.New(i18n.T("未登录，请运行 dws auth login"))
+		if errors.Is(err, ErrTokenDataNotFound) {
+			return nil, fmt.Errorf("%s: %w", i18n.T("未登录，请运行 dws auth login"), err)
+		}
+		return nil, fmt.Errorf("%s: %w", i18n.T("读取本地登录态失败"), err)
 	}
 
 	// Fast path: access_token still valid — no lock needed.
 	if data.IsAccessTokenValid() {
-		return data.AccessToken, nil
+		return data, nil
 	}
 
 	// Slow path: token expired — try locked refresh.
 	if data.IsRefreshTokenValid() {
 		refreshed, rErr := p.lockedRefresh(ctx)
 		if rErr == nil {
-			return refreshed.AccessToken, nil
+			return refreshed, nil
 		}
-		_ = oauthMarkProfile(p.configDir, TokenProfileSelector(data), ProfileStatusExpired)
+		failureClass := ClassifyRefreshFailure(rErr)
+		if failureClass == RefreshFailureTerminal {
+			_ = oauthMarkProfile(p.configDir, TokenProfileSelector(data), ProfileStatusExpired)
+		}
 		if p.logger != nil {
-			p.logger.Warn(i18n.T("refresh_token 刷新失败"), "error", rErr)
+			p.logger.Warn("auth.token.refresh_failed",
+				"failure_class", string(failureClass),
+				"error_type", fmt.Sprintf("%T", rErr),
+			)
 		}
-		return "", fmt.Errorf("%s: %w", i18n.T("refresh_token 刷新失败"), rErr)
+		return nil, fmt.Errorf("%s: %w", i18n.T("refresh_token 刷新失败"), rErr)
 	} else {
 		_ = oauthMarkProfile(p.configDir, TokenProfileSelector(data), ProfileStatusExpired)
 	}
 
-	return "", errors.New(i18n.T("所有凭证已失效，请运行 dws auth login 重新登录"))
+	return nil, fmt.Errorf("%s: %w", i18n.T("所有凭证已失效，请运行 dws auth login 重新登录"), ErrRefreshTokenExpired)
+}
+
+// GetAccessToken preserves the established API while delegating all lifetime
+// and error semantics to GetTokenSnapshot.
+func (p *OAuthProvider) GetAccessToken(ctx context.Context) (string, error) {
+	data, err := p.GetTokenSnapshot(ctx)
+	if err != nil {
+		return "", err
+	}
+	if data == nil || strings.TrimSpace(data.AccessToken) == "" {
+		return "", errors.New("OAuth token snapshot has an empty access token")
+	}
+	return strings.TrimSpace(data.AccessToken), nil
 }
 
 // lockedRefresh attempts to refresh the token while holding dual-layer locks.
@@ -714,7 +737,7 @@ func (p *OAuthProvider) lockedRefresh(ctx context.Context) (*TokenData, error) {
 
 	// Still expired — we need to actually refresh.
 	if !data.IsRefreshTokenValid() {
-		return nil, fmt.Errorf("refresh_token 已过期")
+		return nil, fmt.Errorf("refresh_token 已过期: %w", ErrRefreshTokenExpired)
 	}
 	if err := preflightTokenRefreshPersistence(p.configDir, data); err != nil {
 		return nil, fmt.Errorf("%s: %w", i18n.T("本地登录态无法安全更新"), err)
