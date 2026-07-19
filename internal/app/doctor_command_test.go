@@ -139,9 +139,11 @@ func TestDoctorCheckAuthReportsKeychainUnavailable(t *testing.T) {
 
 	prev := edition.Get()
 	edition.Override(&edition.Hooks{
+		SaveToken: func(string, []byte) error { return nil },
 		LoadToken: func(configDir string) ([]byte, error) {
 			return nil, keychain.NewUnavailableError("read DEK from macOS Keychain", errors.New("default keychain missing"))
 		},
+		DeleteToken: func(string) error { return nil },
 	})
 	t.Cleanup(func() {
 		edition.Override(prev)
@@ -169,9 +171,11 @@ func TestDoctorCheckAuthReportsDEKMissing(t *testing.T) {
 
 	prev := edition.Get()
 	edition.Override(&edition.Hooks{
+		SaveToken: func(string, []byte) error { return nil },
 		LoadToken: func(configDir string) ([]byte, error) {
 			return nil, fmt.Errorf("load from keychain: %w", keychain.ErrDEKMissing)
 		},
+		DeleteToken: func(string) error { return nil },
 	})
 	t.Cleanup(func() {
 		edition.Override(prev)

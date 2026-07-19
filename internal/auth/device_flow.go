@@ -677,7 +677,35 @@ func safeDeviceEndpointError(status int, body []byte) error {
 	if code == "" {
 		code = strings.TrimSpace(envelope.Code)
 	}
+	if code == "" {
+		// Some gateways return OAuth failures as text/plain (for example,
+		// "invalid_grant code expired"). Extract only a known machine code;
+		// never retain or surface the remaining untrusted response body.
+		code = safeOAuthResponseCode(string(body))
+	} else {
+		code = safeOAuthResponseCode(code)
+	}
 	return &OAuthEndpointError{StatusCode: status, Code: code}
+}
+
+func safeOAuthResponseCode(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if safe := SafeOAuthDiagnosticCode(trimmed); safe != "" && safe != "other" {
+		return safe
+	}
+	fields := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '.' || r == '-')
+	})
+	// For text/plain compatibility, accept only the leading machine token.
+	// Searching later words would misclassify arbitrary prose such as
+	// "please not invalid_grant" as a terminal credential rejection.
+	if len(fields) > 0 {
+		if safe := SafeOAuthDiagnosticCode(fields[0]); safe != "" && safe != "other" {
+			return safe
+		}
+	}
+	return ""
 }
 
 // truncateBody returns a string of at most maxLen bytes from body, appending

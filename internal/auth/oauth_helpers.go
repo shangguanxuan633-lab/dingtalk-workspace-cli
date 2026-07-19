@@ -353,9 +353,13 @@ func oauthEndpointError(status int, body []byte) error {
 		Message   string `json:"message"`
 	}
 	_ = json.Unmarshal(body, &payload)
+	code := firstNonEmpty(payload.ErrorCode, payload.Code)
+	if code == "" {
+		code = string(body)
+	}
 	return &OAuthEndpointError{
 		StatusCode: status,
-		Code:       firstNonEmpty(payload.ErrorCode, payload.Code),
+		Code:       safeOAuthResponseCode(code),
 		Message:    firstNonEmpty(payload.ErrorMsg, payload.Message),
 	}
 }

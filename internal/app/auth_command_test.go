@@ -388,9 +388,11 @@ func TestAuthStatusJSONReportsKeychainUnavailable(t *testing.T) {
 
 	prev := edition.Get()
 	edition.Override(&edition.Hooks{
+		SaveToken: func(string, []byte) error { return nil },
 		LoadToken: func(configDir string) ([]byte, error) {
 			return nil, keychain.NewUnavailableError("read DEK from macOS Keychain", errors.New("default keychain missing"))
 		},
+		DeleteToken: func(string) error { return nil },
 	})
 	t.Cleanup(func() {
 		edition.Override(prev)
@@ -473,9 +475,11 @@ func TestAuthStatusJSONReportsDEKMissing(t *testing.T) {
 
 	prev := edition.Get()
 	edition.Override(&edition.Hooks{
+		SaveToken: func(string, []byte) error { return nil },
 		LoadToken: func(configDir string) ([]byte, error) {
 			return nil, fmt.Errorf("load from keychain: %w", keychain.ErrDEKMissing)
 		},
+		DeleteToken: func(string) error { return nil },
 	})
 	t.Cleanup(func() {
 		edition.Override(prev)
@@ -591,11 +595,11 @@ func TestAuthStatusRefreshFailureReportsUnauthenticatedDiagnostic(t *testing.T) 
 	if resp.Authenticated {
 		t.Fatalf("authenticated = true after refresh failure: %+v", resp)
 	}
-	if resp.Reason != "token_refresh_failed" {
-		t.Fatalf("reason = %q, want token_refresh_failed: %+v", resp.Reason, resp)
+	if resp.Reason != "token_refresh_transient" {
+		t.Fatalf("reason = %q, want token_refresh_transient: %+v", resp.Reason, resp)
 	}
-	if !strings.Contains(resp.Message, "refresh failed") {
-		t.Fatalf("message = %q, want original refresh failure", resp.Message)
+	if !strings.Contains(resp.Message, "暂时") || strings.Contains(resp.Message, "refresh failed") {
+		t.Fatalf("message = %q, want safe transient refresh diagnostic", resp.Message)
 	}
 }
 

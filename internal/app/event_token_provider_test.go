@@ -203,22 +203,22 @@ func TestPersonalSourceProductionProviderFailureStopsBeforeTicketHTTP(t *testing
 }
 
 func TestResolvePersonalEventIdentityPropagatesMetadataLoadFailure(t *testing.T) {
-	oldResolve := personalResolveAuxiliaryAccessToken
+	oldResolve := personalResolveAuxiliaryForProfile
 	oldLoad := personalLoadTokenData
 	t.Cleanup(func() {
-		personalResolveAuxiliaryAccessToken = oldResolve
+		personalResolveAuxiliaryForProfile = oldResolve
 		personalLoadTokenData = oldLoad
 	})
 
 	wantErr := errors.New("token store corrupt")
-	personalResolveAuxiliaryAccessToken = func(context.Context, string, string) (string, error) {
+	personalResolveAuxiliaryForProfile = func(context.Context, string, string, string) (string, error) {
 		return "fresh-token", nil
 	}
 	personalLoadTokenData = func(string) (*authpkg.TokenData, error) {
 		return nil, wantErr
 	}
 
-	_, err := resolvePersonalEventIdentity(t.Context(), "/config/profile-a", "open")
+	_, err := resolvePersonalEventIdentity(t.Context(), t.TempDir(), "open")
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("resolvePersonalEventIdentity() error = %v, want cause %v", err, wantErr)
 	}

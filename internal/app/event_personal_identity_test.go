@@ -193,18 +193,23 @@ func TestPersonalEventSourceIDPrefersEditionOverride(t *testing.T) {
 func setupPersonalIdentityToken(t *testing.T, data *authpkg.TokenData) string {
 	t.Helper()
 	configDir := t.TempDir()
+	if err := authpkg.WriteTokenMarker(configDir); err != nil {
+		t.Fatalf("write token publication marker: %v", err)
+	}
 	raw, err := json.Marshal(data)
 	if err != nil {
 		t.Fatalf("marshal token data: %v", err)
 	}
 	prev := edition.Get()
 	edition.Override(&edition.Hooks{
+		SaveToken: func(string, []byte) error { return nil },
 		LoadToken: func(dir string) ([]byte, error) {
 			if filepath.Clean(dir) != filepath.Clean(configDir) {
 				t.Fatalf("LoadToken dir = %q, want %q", dir, configDir)
 			}
 			return raw, nil
 		},
+		DeleteToken: func(string) error { return nil },
 	})
 	t.Cleanup(func() { edition.Override(prev) })
 	return configDir

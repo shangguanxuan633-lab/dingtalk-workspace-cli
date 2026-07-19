@@ -220,6 +220,11 @@ func TestPatScopeError_Error(t *testing.T) {
 func setupPollServer(t *testing.T, statuses []authpkg.DevicePollResponse) (*httptest.Server, string) {
 	t.Helper()
 	var callCount atomic.Int32
+	oldResolve := patResolveAccessToken
+	patResolveAccessToken = func(context.Context, string) (string, error) {
+		return "", authpkg.ErrTokenDataNotFound
+	}
+	t.Cleanup(func() { patResolveAccessToken = oldResolve })
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		idx := int(callCount.Add(1)) - 1

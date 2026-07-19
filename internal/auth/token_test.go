@@ -611,7 +611,7 @@ func TestSaveTokenDataRollsBackPartialProfilePersistence(t *testing.T) {
 			failure := errors.New("persist " + failurePoint)
 			originalSaveOrg := tokenSaveKeychainForCorpID
 			originalSaveLegacy := tokenSaveKeychain
-			originalWriteMarker := tokenWriteMarker
+			originalWriteMarkerGeneration := tokenWriteMarkerGeneration
 			switch failurePoint {
 			case "organization":
 				tokenSaveKeychainForCorpID = func(corpID string, data *TokenData) error {
@@ -628,13 +628,13 @@ func TestSaveTokenDataRollsBackPartialProfilePersistence(t *testing.T) {
 					return originalSaveLegacy(data)
 				}
 			case "marker":
-				tokenWriteMarker = func(string) error { return failure }
+				tokenWriteMarkerGeneration = func(string, bool, uint64) error { return failure }
 			}
 
 			err = SaveTokenData(configDir, incoming)
 			tokenSaveKeychainForCorpID = originalSaveOrg
 			tokenSaveKeychain = originalSaveLegacy
-			tokenWriteMarker = originalWriteMarker
+			tokenWriteMarkerGeneration = originalWriteMarkerGeneration
 			if !errors.Is(err, failure) {
 				t.Fatalf("SaveTokenData() error = %v, want %v", err, failure)
 			}
@@ -960,9 +960,9 @@ func TestSaveTokenDataLogsIdentitySlotDecisionWithoutCredentials(t *testing.T) {
 	for _, want := range []string{
 		`"msg":"auth.token.persist.plan"`,
 		`"msg":"auth.token.persist.done"`,
-		`"corp_id":"corp_same"`,
-		`"user_id":"user_two"`,
-		`"identity_selector":"corp_same:user_two"`,
+		`"corp_id_hash":`,
+		`"user_id_hash":`,
+		`"identity_selector_hash":`,
 		`"write_identity_slot":true`,
 		`"write_org_mirror":true`,
 		`"write_global_mirror":true`,
@@ -971,7 +971,7 @@ func TestSaveTokenDataLogsIdentitySlotDecisionWithoutCredentials(t *testing.T) {
 			t.Fatalf("diagnostic logs missing %q:\n%s", want, got)
 		}
 	}
-	for _, secret := range []string{"secret-access-token", "secret-refresh-token"} {
+	for _, secret := range []string{"secret-access-token", "secret-refresh-token", "corp_same", "user_two", "corp_same:user_two"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("diagnostic logs exposed credential %q:\n%s", secret, got)
 		}
@@ -1153,6 +1153,8 @@ func TestProfileSelectorRejectsDuplicateAccountName(t *testing.T) {
 }
 
 func TestProfileSelectorRejectsDuplicateOrganizationName(t *testing.T) {
+	t.Setenv(keychain.DisableKeychainEnv, "1")
+	t.Setenv(keychain.StorageDirEnv, t.TempDir())
 	cleanupKeychain(t)
 	configDir := t.TempDir()
 

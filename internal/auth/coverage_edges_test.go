@@ -328,9 +328,26 @@ func TestCrossPlatformCoverageDeviceFlowRequestAndOutputEdges(t *testing.T) {
 	dfPrintPollResult(&buf, "pending", "wait")
 	dfPrintPollResult(&buf, "unknown", "bad")
 	dfPrintWarning(&buf, "warning")
-	if isInvalidGrantError(nil) || !isInvalidGrantError(errors.New("invalid_grant")) ||
-		!isInvalidGrantError(errors.New("code expired")) || isInvalidGrantError(errors.New("other")) {
+	if isInvalidGrantError(nil) || isInvalidGrantError(errors.New("invalid_grant")) ||
+		!isInvalidGrantError(&OAuthEndpointError{Code: "invalid_grant"}) ||
+		isInvalidGrantError(&OAuthEndpointError{Code: "invalid_grant_suffix"}) {
 		t.Fatal("invalid grant detection failed")
+	}
+	for _, tc := range []struct {
+		body string
+		want string
+	}{
+		{body: `{"error":"invalid_grant"}`, want: "invalid_grant"},
+		{body: "invalid_grant code expired", want: "invalid_grant"},
+		{body: "please not invalid_grant", want: ""},
+		{body: "token-secret-for-uid-4496576595", want: ""},
+	} {
+		var endpointErr *OAuthEndpointError
+		if err := safeDeviceEndpointError(http.StatusBadRequest, []byte(tc.body)); !errors.As(err, &endpointErr) || endpointErr.Code != tc.want {
+			t.Fatalf("safe device endpoint code for %q = %#v", tc.body, endpointErr)
+		} else if strings.Contains(err.Error(), "4496576595") || strings.Contains(err.Error(), "token-secret") {
+			t.Fatalf("safe device endpoint error leaked response body: %v", err)
+		}
 	}
 }
 
@@ -674,11 +691,19 @@ func TestCrossPlatformCoverageTokenEditionHooksAndCleanup(t *testing.T) {
 	if err := DeleteAllTokenData(dir); err != nil || !deleted {
 		t.Fatalf("hook delete all = %v, deleted=%v", err, deleted)
 	}
-	edition.Override(&edition.Hooks{LoadToken: func(string) ([]byte, error) { return []byte("{"), nil }})
+	edition.Override(&edition.Hooks{
+		SaveToken:   func(string, []byte) error { return nil },
+		LoadToken:   func(string) ([]byte, error) { return []byte("{"), nil },
+		DeleteToken: func(string) error { return nil },
+	})
 	if _, err := LoadTokenData(dir); err == nil {
 		t.Fatal("malformed hook token succeeded")
 	}
-	edition.Override(&edition.Hooks{LoadToken: func(string) ([]byte, error) { return nil, errors.New("load") }})
+	edition.Override(&edition.Hooks{
+		SaveToken:   func(string, []byte) error { return nil },
+		LoadToken:   func(string) ([]byte, error) { return nil, errors.New("load") },
+		DeleteToken: func(string) error { return nil },
+	})
 	if _, err := LoadTokenData(dir); err == nil {
 		t.Fatal("hook token read error succeeded")
 	}
@@ -1480,11 +1505,13 @@ func TestCrossPlatformCoverageTokenStorageAndRevocationCoverageEdges(t *testing.
 	oldUpsert := tokenUpsertProfile
 	oldRemoveProfile := tokenRemoveProfile
 	oldSync := tokenSyncLegacyMirror
+	oldSyncSelected := tokenSyncSelectedMirror
 	oldSyncOrganization := tokenSyncOrganizationMirror
 	oldLoadProfiles := tokenLoadProfiles
 	oldSaveProfiles := tokenSaveProfiles
 	oldWriteMarker := tokenWriteMarker
 	oldWriteManualMarker := tokenWriteManualMarker
+	oldWriteMarkerGeneration := tokenWriteMarkerGeneration
 	oldDeleteMarker := tokenDeleteMarker
 	oldParseURL := tokenParseURL
 	oldNewRequest := tokenNewRequest
@@ -1526,11 +1553,13 @@ func TestCrossPlatformCoverageTokenStorageAndRevocationCoverageEdges(t *testing.
 		tokenUpsertProfile = oldUpsert
 		tokenRemoveProfile = oldRemoveProfile
 		tokenSyncLegacyMirror = oldSync
+		tokenSyncSelectedMirror = oldSyncSelected
 		tokenSyncOrganizationMirror = oldSyncOrganization
 		tokenLoadProfiles = oldLoadProfiles
 		tokenSaveProfiles = oldSaveProfiles
 		tokenWriteMarker = oldWriteMarker
 		tokenWriteManualMarker = oldWriteManualMarker
+		tokenWriteMarkerGeneration = oldWriteMarkerGeneration
 		tokenDeleteMarker = oldDeleteMarker
 		tokenParseURL = oldParseURL
 		tokenNewRequest = oldNewRequest
@@ -1597,19 +1626,22 @@ func TestCrossPlatformCoverageTokenStorageAndRevocationCoverageEdges(t *testing.
 			t.Fatalf("legacy mirror error = %v", err)
 		}
 		tokenSyncLegacyMirror = oldSync
-		tokenWriteMarker = func(string) error { return fail }
+		tokenWriteMarkerGeneration = func(string, bool, uint64) error { return fail }
 		if err := saveTokenDataLocked(dir, data); !errors.Is(err, fail) {
 			t.Fatalf("corp marker error = %v", err)
 		}
 		SetRuntimeProfile("")
-		tokenWriteManualMarker = func(string) error { return fail }
 		if err := saveTokenDataLocked(dir, &TokenData{}); !errors.Is(err, fail) {
 			t.Fatalf("legacy marker error = %v", err)
 		}
-		tokenWriteMarker = oldWriteMarker
-		tokenWriteManualMarker = oldWriteManualMarker
+		tokenWriteMarkerGeneration = oldWriteMarkerGeneration
 
-		edition.Override(&edition.Hooks{Name: "coverage", SaveToken: func(string, []byte) error { return nil }})
+		edition.Override(&edition.Hooks{
+			Name:        "coverage",
+			SaveToken:   func(string, []byte) error { return nil },
+			LoadToken:   func(string) ([]byte, error) { return nil, ErrTokenDataNotFound },
+			DeleteToken: func(string) error { return nil },
+		})
 		if err := saveTokenDataLocked(dir, data); err != nil {
 			t.Fatal(err)
 		}
@@ -1671,14 +1703,24 @@ func TestCrossPlatformCoverageTokenStorageAndRevocationCoverageEdges(t *testing.
 			t.Fatal("successful secure migration did not clean up")
 		}
 
-		edition.Override(&edition.Hooks{Name: "coverage", LoadToken: func(string) ([]byte, error) { return nil, fail }})
+		edition.Override(&edition.Hooks{
+			Name:        "coverage",
+			SaveToken:   func(string, []byte) error { return nil },
+			LoadToken:   func(string) ([]byte, error) { return nil, fail },
+			DeleteToken: func(string) error { return nil },
+		})
 		if _, err := LoadTokenDataForProfile(dir, "selected"); err == nil {
 			t.Fatal("hook profile selection succeeded")
 		}
 		if _, err := LoadTokenDataForProfile(dir, ""); !errors.Is(err, fail) {
 			t.Fatalf("hook load error = %v", err)
 		}
-		edition.Override(&edition.Hooks{Name: "coverage", LoadToken: func(string) ([]byte, error) { return []byte("{"), nil }})
+		edition.Override(&edition.Hooks{
+			Name:        "coverage",
+			SaveToken:   func(string, []byte) error { return nil },
+			LoadToken:   func(string) ([]byte, error) { return []byte("{"), nil },
+			DeleteToken: func(string) error { return nil },
+		})
 		if _, err := LoadTokenDataForProfile(dir, ""); err == nil {
 			t.Fatal("malformed hook token succeeded")
 		}
@@ -1752,11 +1794,11 @@ func TestCrossPlatformCoverageTokenStorageAndRevocationCoverageEdges(t *testing.
 		}
 		tokenRemoveProfile = func(string, string) (*Profile, error) { return selected, nil }
 		cfg.OrgCurrentProfiles = nil
-		tokenSyncLegacyMirror = func(string) error { return fail }
+		tokenSyncSelectedMirror = func(string) error { return fail }
 		if err := deleteTokenDataForProfileLocked(dir, ""); !errors.Is(err, fail) {
 			t.Fatalf("sync mirror error = %v", err)
 		}
-		tokenSyncLegacyMirror = func(string) error { return nil }
+		tokenSyncSelectedMirror = func(string) error { return nil }
 		tokenDeleteSecure = func(string) error { return fail }
 		if err := deleteTokenDataForProfileLocked(dir, ""); !errors.Is(err, fail) {
 			t.Fatalf("secure cleanup error = %v", err)
@@ -1775,7 +1817,12 @@ func TestCrossPlatformCoverageTokenStorageAndRevocationCoverageEdges(t *testing.
 			t.Fatalf("legacy secure delete error = %v", err)
 		}
 
-		edition.Override(&edition.Hooks{Name: "coverage", DeleteToken: func(string) error { return fail }})
+		edition.Override(&edition.Hooks{
+			Name:        "coverage",
+			SaveToken:   func(string, []byte) error { return nil },
+			LoadToken:   func(string) ([]byte, error) { return nil, ErrTokenDataNotFound },
+			DeleteToken: func(string) error { return fail },
+		})
 		if err := DeleteTokenDataForProfile(dir, "selected"); err == nil {
 			t.Fatal("hook profile deletion succeeded")
 		}
@@ -2775,6 +2822,8 @@ func TestCrossPlatformCoverageDeviceFlowHighLevelCoverageEdges(t *testing.T) {
 	oldSaveToken := deviceSaveToken
 	oldHasApp := deviceHasAppConfig
 	oldSaveApp := deviceSaveAppConfig
+	oldOAuthHasApp := oauthHasAppConfig
+	oldOAuthSaveApp := oauthSaveAppConfig
 	oldPollStatus := devicePollStatus
 	oldPollToken := devicePollToken
 	oldAfter := deviceFlowAfter
@@ -2790,6 +2839,8 @@ func TestCrossPlatformCoverageDeviceFlowHighLevelCoverageEdges(t *testing.T) {
 		deviceSaveToken = oldSaveToken
 		deviceHasAppConfig = oldHasApp
 		deviceSaveAppConfig = oldSaveApp
+		oauthHasAppConfig = oldOAuthHasApp
+		oauthSaveAppConfig = oldOAuthSaveApp
 		devicePollStatus = oldPollStatus
 		devicePollToken = oldPollToken
 		deviceFlowAfter = oldAfter
@@ -2894,9 +2945,14 @@ func TestCrossPlatformCoverageDeviceFlowHighLevelCoverageEdges(t *testing.T) {
 		t.Fatalf("device token save error = %v", err)
 	}
 	deviceSaveToken = func(string, *TokenData) error { return nil }
-	deviceHasAppConfig = func(string) bool { return false }
+	oauthHasAppConfig = func(string) bool { return false }
 	appSaved := false
-	deviceSaveAppConfig = func(string, *AppConfig) error { appSaved = true; return fail }
+	oauthSaveAppConfig = func(string, *AppConfig) error { appSaved = true; return fail }
+	if _, err := p.loginOnce(context.Background(), 1); !errors.Is(err, fail) || !appSaved {
+		t.Fatalf("device app-config save error = %v appSaved=%v", err, appSaved)
+	}
+	appSaved = false
+	oauthSaveAppConfig = func(string, *AppConfig) error { appSaved = true; return nil }
 	if _, err := p.loginOnce(context.Background(), 1); err != nil || !appSaved {
 		t.Fatalf("successful device login = %v appSaved=%v", err, appSaved)
 	}
