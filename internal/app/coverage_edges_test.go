@@ -554,7 +554,10 @@ func TestCrossPlatformCoverageRecoveryRuntimeHTTP(t *testing.T) {
 	defer server.Close()
 	SetDynamicServers([]mcptypes.ServerDescriptor{{Endpoint: server.URL, CLI: mcptypes.CLIOverlay{ID: "devdoc", Tools: []mcptypes.CLITool{{Name: "search_open_platform_docs_rag"}}}}})
 	t.Cleanup(func() { SetDynamicServers(nil) })
-	runtime := &recoveryRuntime{transport: transport.NewClient(server.Client())}
+	runtime := &recoveryRuntime{
+		transport: transport.NewClient(server.Client()),
+		flags:     &GlobalFlags{Token: "test-token"},
+	}
 	got, err := runtime.Search(context.Background(), "query", recovery.RecoveryContext{ToolName: "search"})
 	if err != nil || got.DocSearch.Status != "success" || len(got.KBHits) == 0 {
 		t.Fatalf("recovery search = %#v %v", got, err)

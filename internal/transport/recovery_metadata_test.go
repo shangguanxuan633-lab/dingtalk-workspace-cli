@@ -106,7 +106,7 @@ func TestCallToolRetryCancellationUsesAPIClassification(t *testing.T) {
 	client.MaxRetries = 1
 	client.sleep = func(context.Context, time.Duration) error { return context.Canceled }
 
-	_, err := client.CallTool(context.Background(), "https://mcp.dingtalk.com/server", "search_messages", nil)
+	_, err := client.CallTool(context.Background(), "https://mcp.dingtalk.com/server", "send_personal_message", map[string]any{"uuid": "stable-id"})
 	if err == nil {
 		t.Fatal("CallTool() error = nil, want retry cancellation")
 	}

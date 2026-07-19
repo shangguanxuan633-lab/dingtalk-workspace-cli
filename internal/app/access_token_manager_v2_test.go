@@ -33,7 +33,7 @@ func (p fakeSnapshotProvider) GetAccessToken(ctx context.Context) (string, error
 	return data.AccessToken, nil
 }
 
-func installTokenManagerProvider(t *testing.T, factory func(string) accessTokenGetter) {
+func installTokenManagerProvider(t *testing.T, factory func(string, string) accessTokenGetter) {
 	t.Helper()
 	originalProvider := newAccessTokenProvider
 	originalHooks := edition.Get()
@@ -71,7 +71,7 @@ func TestTokenManagerCachesOnlyFreshSnapshotsAndDoesNotRepeatProviderCalls(t *te
 	configDir := t.TempDir()
 	writeTokenManagerMarker(t, configDir, 1)
 	var calls atomic.Int32
-	installTokenManagerProvider(t, func(string) accessTokenGetter {
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
 		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
 			calls.Add(1)
 			return managerToken("fresh", time.Now().Add(time.Hour), 1), nil
@@ -93,7 +93,7 @@ func TestTokenManagerDoesNotCacheInsideRefreshWindow(t *testing.T) {
 	configDir := t.TempDir()
 	writeTokenManagerMarker(t, configDir, 1)
 	var calls atomic.Int32
-	installTokenManagerProvider(t, func(string) accessTokenGetter {
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
 		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
 			calls.Add(1)
 			return managerToken("near-expiry", time.Now().Add(4*time.Minute), 1), nil
@@ -115,7 +115,7 @@ func TestTokenManagerMarkerChangeInvalidatesLongRunningSnapshot(t *testing.T) {
 	configDir := t.TempDir()
 	writeTokenManagerMarker(t, configDir, 1)
 	var calls atomic.Int32
-	installTokenManagerProvider(t, func(string) accessTokenGetter {
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
 		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
 			call := calls.Add(1)
 			return managerToken(fmt.Sprintf("token-%d", call), time.Now().Add(time.Hour), uint64(call)), nil
@@ -140,7 +140,7 @@ func TestTokenManagerRetriesWhenMarkerChangesDuringBlobRead(t *testing.T) {
 	configDir := t.TempDir()
 	writeTokenManagerMarker(t, configDir, 1)
 	var calls atomic.Int32
-	installTokenManagerProvider(t, func(string) accessTokenGetter {
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
 		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
 			if calls.Add(1) == 1 {
 				writeTokenManagerMarker(t, configDir, 2)
@@ -162,7 +162,7 @@ func TestTokenManagerSerializesConcurrentResolutionPerConfigAndProfile(t *testin
 	configDir := t.TempDir()
 	writeTokenManagerMarker(t, configDir, 1)
 	var calls atomic.Int32
-	installTokenManagerProvider(t, func(string) accessTokenGetter {
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
 		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
 			calls.Add(1)
 			time.Sleep(15 * time.Millisecond)
@@ -205,8 +205,7 @@ func TestTokenManagerIsolatesConfigDirectoryAndProfile(t *testing.T) {
 	writeTokenManagerMarker(t, dirB, 1)
 	counts := map[string]int{}
 	var countsMu sync.Mutex
-	installTokenManagerProvider(t, func(configDir string) accessTokenGetter {
-		profile := authpkg.RuntimeProfile()
+	installTokenManagerProvider(t, func(configDir, profile string) accessTokenGetter {
 		key := filepath.Clean(configDir) + "|" + profile
 		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
 			countsMu.Lock()
@@ -251,7 +250,7 @@ func TestTokenManagerPreservesProviderErrorCause(t *testing.T) {
 	configDir := t.TempDir()
 	writeTokenManagerMarker(t, configDir, 1)
 	sentinel := errors.New("key store unavailable")
-	installTokenManagerProvider(t, func(string) accessTokenGetter {
+	installTokenManagerProvider(t, func(string, string) accessTokenGetter {
 		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
 			return nil, &os.PathError{Op: "read", Path: "credential", Err: sentinel}
 		}}
@@ -301,6 +300,9 @@ func TestTokenManagerDefaultProfileObservesCrossProcessSelectionPublication(t *t
 	if err != nil || first.AccessToken != "token-a" {
 		t.Fatalf("default profile before switch = %#v, %v", first, err)
 	}
+	if first.profile != "corp-switch-a:user-a" || !first.profilePinned {
+		t.Fatalf("default profile lease = %q pinned=%v", first.profile, first.profilePinned)
+	}
 	beforeGeneration, present, err := authpkg.ReadTokenMarkerGeneration(configDir)
 	if err != nil || !present {
 		t.Fatalf("marker before switch = (%d, %v, %v)", beforeGeneration, present, err)
@@ -315,5 +317,75 @@ func TestTokenManagerDefaultProfileObservesCrossProcessSelectionPublication(t *t
 	second, err := manager.Get(context.Background(), configDir, "")
 	if err != nil || second.AccessToken != "token-b" {
 		t.Fatalf("long-running manager after switch = %#v, %v", second, err)
+	}
+}
+
+func TestTokenManagerPinsLoaderToKeyAcrossConcurrentRuntimeProfileSwitch(t *testing.T) {
+	configDir := t.TempDir()
+	writeTokenManagerMarker(t, configDir, 1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	installTokenManagerProvider(t, func(_ string, profile string) accessTokenGetter {
+		return fakeSnapshotProvider{get: func(context.Context) (*authpkg.TokenData, error) {
+			calls.Add(1)
+			close(started)
+			<-release
+			return managerToken("token-for-"+profile, time.Now().Add(time.Hour), 1), nil
+		}}
+	})
+	authpkg.SetRuntimeProfile("profile-a")
+	manager := NewTokenManager()
+	type result struct {
+		snapshot AccessTokenSnapshot
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		snapshot, err := manager.Get(context.Background(), configDir, "")
+		done <- result{snapshot: snapshot, err: err}
+	}()
+	<-started
+	authpkg.SetRuntimeProfile("profile-b")
+	close(release)
+	first := <-done
+	if first.err != nil || first.snapshot.AccessToken != "token-for-profile-a" {
+		t.Fatalf("in-flight profile-a resolution = %#v, %v", first.snapshot, first.err)
+	}
+	authpkg.SetRuntimeProfile("profile-a")
+	again, err := manager.Get(context.Background(), configDir, "")
+	if err != nil || again.AccessToken != "token-for-profile-a" {
+		t.Fatalf("cached profile-a resolution = %#v, %v", again, err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestPassiveRefreshUsesSnapshotProfileAfterRuntimeSwitch(t *testing.T) {
+	originalFactory := newRejectedTokenRefresher
+	originalProfile := authpkg.RuntimeProfile()
+	t.Cleanup(func() {
+		newRejectedTokenRefresher = originalFactory
+		authpkg.SetRuntimeProfile(originalProfile)
+	})
+	gotProfile := ""
+	newRejectedTokenRefresher = func(_ string, profile string) rejectedTokenRefresher {
+		gotProfile = profile
+		return fakeRejectedTokenRefresher{token: "rotated"}
+	}
+	authpkg.SetRuntimeProfile("profile-b")
+	rejected := AccessTokenSnapshot{
+		AccessToken:   "rejected",
+		Generation:    9,
+		profile:       "profile-a",
+		profilePinned: true,
+	}
+	got, err := forceRefreshRejectedTokenForSnapshot(context.Background(), t.TempDir(), rejected)
+	if err != nil || got != "rotated" {
+		t.Fatalf("profile-pinned refresh = %q, %v", got, err)
+	}
+	if gotProfile != "profile-a" {
+		t.Fatalf("refresh factory profile = %q, want profile-a", gotProfile)
 	}
 }

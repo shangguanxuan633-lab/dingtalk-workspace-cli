@@ -217,11 +217,11 @@ func TestCrossPlatformCoverageConfigAndTokenSeamsCoverage(t *testing.T) {
 
 	oldProvider, oldManager := newAccessTokenProvider, newLegacyTokenManager
 	t.Cleanup(func() { newAccessTokenProvider, newLegacyTokenManager = oldProvider, oldManager })
-	newAccessTokenProvider = func(string) accessTokenGetter { return fakeAccessTokenGetter{err: authpkg.ErrTokenDecryption} }
+	newAccessTokenProvider = func(string, string) accessTokenGetter { return fakeAccessTokenGetter{err: authpkg.ErrTokenDecryption} }
 	if _, err := resolveAccessTokenFromDir(context.Background(), "unused"); !errors.Is(err, authpkg.ErrTokenDecryption) {
 		t.Fatalf("decryption error = %v", err)
 	}
-	newAccessTokenProvider = func(string) accessTokenGetter { return fakeAccessTokenGetter{err: errors.New("missing")} }
+	newAccessTokenProvider = func(string, string) accessTokenGetter { return fakeAccessTokenGetter{err: errors.New("missing")} }
 	newLegacyTokenManager = func(string) legacyTokenGetter { return fakeLegacyTokenGetter{token: " legacy "} }
 	if got, err := resolveAccessTokenFromDir(context.Background(), "unused"); err != nil || got != "legacy" {
 		t.Fatalf("legacy token = %q, %v", got, err)
@@ -232,14 +232,14 @@ func TestCrossPlatformCoverageConfigAndTokenSeamsCoverage(t *testing.T) {
 		t.Fatalf("explicit profile fallback = token %q error %v, want profile error", got, err)
 	}
 	authpkg.SetRuntimeProfile("")
-	newAccessTokenProvider = func(string) accessTokenGetter { return fakeAccessTokenGetter{err: errors.New("load")} }
+	newAccessTokenProvider = func(string, string) accessTokenGetter { return fakeAccessTokenGetter{err: errors.New("load")} }
 	newLegacyTokenManager = func(string) legacyTokenGetter { return fakeLegacyTokenGetter{err: errors.New("missing")} }
 	edition.Override(&edition.Hooks{})
 	other := filepath.Join(t.TempDir(), "other")
 	if _, err := ResolveAuxiliaryAccessToken(context.Background(), other, ""); err == nil {
 		t.Fatal("auxiliary provider failure succeeded")
 	}
-	newAccessTokenProvider = func(string) accessTokenGetter { return fakeAccessTokenGetter{err: authpkg.ErrTokenDecryption} }
+	newAccessTokenProvider = func(string, string) accessTokenGetter { return fakeAccessTokenGetter{err: authpkg.ErrTokenDecryption} }
 	if _, err := ResolveAuxiliaryAccessToken(context.Background(), other, ""); !errors.Is(err, authpkg.ErrTokenDecryption) {
 		t.Fatalf("auxiliary decryption error = %v", err)
 	}
@@ -265,7 +265,7 @@ func TestCrossPlatformCoverageForceRefreshAndStdioFailureCoverage(t *testing.T) 
 		stdioMu.Unlock()
 	})
 	fail := errors.New("failure")
-	_ = oldFactory(t.TempDir())
+	_ = oldFactory(t.TempDir(), "")
 	for _, tc := range []struct {
 		getter fakeRejectedTokenRefresher
 		want   string
@@ -274,7 +274,7 @@ func TestCrossPlatformCoverageForceRefreshAndStdioFailureCoverage(t *testing.T) 
 		{getter: fakeRejectedTokenRefresher{token: "  "}, want: "empty"},
 		{getter: fakeRejectedTokenRefresher{token: " refreshed "}},
 	} {
-		newRejectedTokenRefresher = func(string) rejectedTokenRefresher { return tc.getter }
+		newRejectedTokenRefresher = func(string, string) rejectedTokenRefresher { return tc.getter }
 		got, err := ForceRefreshRejectedToken(context.Background(), "config", "rejected", 7)
 		if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
 			t.Fatalf("refresh error = %v, want %q", err, tc.want)

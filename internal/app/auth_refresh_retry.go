@@ -64,7 +64,7 @@ func (r *runtimeRunner) maybeAuthRefreshRetry(
 	originalErr error,
 ) (executor.Result, error) {
 	if IsAuthRetrying(ctx) {
-		logAuthRefreshRecovery("retry_exhausted", invocation, authpkg.RefreshFailureUnknown, originalErr, false, false)
+		logAuthRefreshRecovery(ctx, "retry_exhausted", invocation, rejected, authpkg.RefreshFailureUnknown, originalErr, false, false)
 		return executor.Result{}, apperrors.NewAuth(
 			"access token was rejected after one refresh retry",
 			apperrors.WithOperation("tools/call"),
@@ -73,22 +73,43 @@ func (r *runtimeRunner) maybeAuthRefreshRetry(
 			apperrors.WithCause(originalErr),
 		)
 	}
-	_, refreshErr := forceRefreshRejectedTokenFunc(ctx, defaultConfigDir(), rejected.AccessToken, rejected.Generation)
+	_, refreshErr := forceRefreshRejectedTokenForSnapshot(ctx, defaultConfigDir(), rejected)
 	if refreshErr != nil {
 		failureClass := authpkg.ClassifyRefreshFailure(refreshErr)
 		deleted, cleanupFailed := false, false
 		if failureClass == authpkg.RefreshFailureTerminal {
 			var deleteErr error
-			deleted, deleteErr = authpkg.DeleteTokenDataIfAccessTokenMatches(ctx, defaultConfigDir(), rejected.AccessToken, rejected.Generation)
+			deleted, deleteErr = deleteRejectedTokenForSnapshot(ctx, defaultConfigDir(), rejected)
 			cleanupFailed = deleteErr != nil
 		}
 		ResetRuntimeTokenCache()
-		logAuthRefreshRecovery("refresh_failed", invocation, failureClass, refreshErr, deleted, cleanupFailed)
+		logAuthRefreshRecovery(ctx, "refresh_failed", invocation, rejected, failureClass, refreshErr, deleted, cleanupFailed)
 		return executor.Result{}, authRefreshFailureError(originalErr, refreshErr, failureClass)
 	}
 	ResetRuntimeTokenCache()
-	logAuthRefreshRecovery("refresh_succeeded", invocation, authpkg.RefreshFailureUnknown, nil, false, false)
-	return r.executeInvocation(withAuthRetrying(ctx), endpoint, invocation)
+	logAuthRefreshRecovery(ctx, "refresh_succeeded", invocation, rejected, authpkg.RefreshFailureUnknown, nil, false, false)
+	retryCtx := withAuthRetrying(ctx)
+	if rejected.profilePinned {
+		retryCtx = withLogicalProfile(retryCtx, rejected.profile)
+	}
+	return r.executeInvocation(retryCtx, endpoint, invocation)
+}
+
+func forceRefreshRejectedTokenForSnapshot(ctx context.Context, configDir string, rejected AccessTokenSnapshot) (string, error) {
+	// Keep the test seam and backwards-compatible public function for snapshots
+	// synthesized by tests/hosts. Real TokenManager snapshots always carry the
+	// pinned selector chosen with their cache key.
+	if !rejected.profilePinned {
+		return forceRefreshRejectedTokenFunc(ctx, configDir, rejected.AccessToken, rejected.Generation)
+	}
+	return forceRefreshRejectedTokenForProfile(ctx, configDir, rejected.profile, rejected.AccessToken, rejected.Generation)
+}
+
+func deleteRejectedTokenForSnapshot(ctx context.Context, configDir string, rejected AccessTokenSnapshot) (bool, error) {
+	if !rejected.profilePinned {
+		return authpkg.DeleteTokenDataIfAccessTokenMatches(ctx, configDir, rejected.AccessToken, rejected.Generation)
+	}
+	return authpkg.DeleteTokenDataIfAccessTokenMatchesForProfile(ctx, configDir, rejected.profile, rejected.AccessToken, rejected.Generation)
 }
 
 func coreAuthRejectionFromError(err error) (*authretry.AuthRefreshRequired, bool) {
@@ -233,7 +254,7 @@ func authRefreshFailureError(originalErr, refreshErr error, class authpkg.Refres
 	)
 }
 
-func logAuthRefreshRecovery(outcome string, invocation executor.Invocation, class authpkg.RefreshFailureClass, cause error, credentialDeleted, cleanupFailed bool) {
+func logAuthRefreshRecovery(ctx context.Context, outcome string, invocation executor.Invocation, rejected AccessTokenSnapshot, class authpkg.RefreshFailureClass, cause error, credentialDeleted, cleanupFailed bool) {
 	reason, oauthCode, causeCategory := "", "", ""
 	var typed *apperrors.Error
 	if errors.As(cause, &typed) {
@@ -242,9 +263,10 @@ func logAuthRefreshRecovery(outcome string, invocation executor.Invocation, clas
 	}
 	var endpointErr *authpkg.OAuthEndpointError
 	if errors.As(cause, &endpointErr) {
-		oauthCode = strings.TrimSpace(endpointErr.Code)
+		oauthCode = authpkg.SafeOAuthDiagnosticCode(endpointErr.Code)
 		causeCategory = "oauth_endpoint"
 	}
+	execID, _ := logicalExecutionID(ctx)
 	slog.Warn("runtime.auth_refresh_recovery",
 		"stage", "runtime_retry",
 		"outcome", outcome,
@@ -255,10 +277,33 @@ func logAuthRefreshRecovery(outcome string, invocation executor.Invocation, clas
 		"error_type", fmtType(cause),
 		"product", invocation.CanonicalProduct,
 		"tool", invocation.Tool,
-		"profile_selected", strings.TrimSpace(authpkg.RuntimeProfile()) != "",
+		"exec_id", execID,
+		"profile_hash", rejected.ProfileFingerprint,
+		"credential_generation", rejected.Generation,
+		"observed_generation", rejected.ObservedGeneration,
+		"credential_source", rejected.Source,
+		"expires_bucket", tokenExpiryBucket(rejected.ExpiresAt, time.Now()),
+		"retry_count", 1,
 		"credential_deleted", credentialDeleted,
 		"credential_cleanup_failed", cleanupFailed,
 	)
+}
+
+func tokenExpiryBucket(expiresAt, now time.Time) string {
+	if expiresAt.IsZero() {
+		return "unknown"
+	}
+	remaining := expiresAt.Sub(now)
+	switch {
+	case remaining <= 0:
+		return "expired"
+	case remaining <= 5*time.Minute:
+		return "le_5m"
+	case remaining <= time.Hour:
+		return "le_1h"
+	default:
+		return "gt_1h"
+	}
 }
 
 func fmtType(err error) string {
@@ -276,7 +321,7 @@ func (r *runtimeRunner) recoverAuthError(
 	hasPluginAuth bool,
 	sourceErr error,
 ) (bool, executor.Result, error) {
-	if sourceErr == nil || !r.canAutoRefreshAuth(hasPluginAuth) || !authRefreshAllowed(sourceErr, sourceErr) {
+	if sourceErr == nil || !r.canAutoRefreshAuth(hasPluginAuth, rejected) || !authRefreshAllowed(sourceErr, sourceErr) {
 		return false, executor.Result{}, nil
 	}
 
@@ -320,11 +365,18 @@ func (r *runtimeRunner) recoverAuthError(
 	return true, result, err
 }
 
-func (r *runtimeRunner) canAutoRefreshAuth(hasPluginAuth bool) bool {
+func (r *runtimeRunner) canAutoRefreshAuth(hasPluginAuth bool, snapshot AccessTokenSnapshot) bool {
 	if r == nil || hasPluginAuth {
 		return false
 	}
-	return r.globalFlags == nil || strings.TrimSpace(r.globalFlags.Token) == ""
+	if r.globalFlags != nil && strings.TrimSpace(r.globalFlags.Token) != "" {
+		return false
+	}
+	// Only a TokenManager-owned OAuth snapshot has the refresh credential,
+	// generation, and immutable profile lease required for safe CAS recovery.
+	// Legacy file strings, explicit tokens, and arbitrary edition tokens must
+	// preserve the original rejection without attempting OAuth.
+	return snapshot.profilePinned && snapshot.Source == "oauth" && strings.TrimSpace(snapshot.AccessToken) != ""
 }
 
 func editionAuthRejection(err error, fallback *authretry.AuthRefreshRequired) (*authretry.AuthRefreshRequired, error) {

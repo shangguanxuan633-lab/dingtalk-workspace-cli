@@ -53,7 +53,7 @@ func auxiliaryAuthDiagnosticAttrs(stage string, err error) []any {
 	if errors.As(err, &endpointErr) {
 		attrs = append(attrs,
 			"http_status", endpointErr.StatusCode,
-			"oauth_code", strings.TrimSpace(endpointErr.Code),
+			"oauth_code", authpkg.SafeOAuthDiagnosticCode(endpointErr.Code),
 		)
 	}
 	return attrs

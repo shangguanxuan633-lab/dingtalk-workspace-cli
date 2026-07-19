@@ -228,6 +228,55 @@ func TestMemoryEditionStoreBlobCarriesGeneration(t *testing.T) {
 	}
 }
 
+func TestProfilePinnedProviderSavesRefreshToOriginalProfileAfterRuntimeSwitch(t *testing.T) {
+	cleanupKeychain(t)
+	configDir := t.TempDir()
+	previousHooks := edition.Get()
+	edition.Override(&edition.Hooks{})
+	t.Cleanup(func() { edition.Override(previousHooks) })
+
+	profileToken := func(corpID, userID, access string) *TokenData {
+		return &TokenData{
+			AccessToken:  access,
+			RefreshToken: "refresh-" + access,
+			ExpiresAt:    time.Now().Add(time.Hour),
+			RefreshExpAt: time.Now().Add(24 * time.Hour),
+			CorpID:       corpID,
+			UserID:       userID,
+			ClientID:     "client",
+		}
+	}
+	SetRuntimeProfile("")
+	if err := SaveTokenData(configDir, profileToken("corp-a", "user-a", "token-a")); err != nil {
+		t.Fatal(err)
+	}
+	SetRuntimeProfile("corp-b:user-b")
+	if err := SaveTokenData(configDir, profileToken("corp-b", "user-b", "token-b")); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := NewOAuthProviderForProfile(configDir, nil, "corp-a:user-a")
+	SetRuntimeProfile("corp-b:user-b")
+	lock, err := AcquireDualLock(context.Background(), configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedA := profileToken("corp-a", "user-a", "token-a-rotated")
+	err = provider.saveRefreshedTokenLocked(updatedA)
+	lock.Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedA, err := LoadTokenDataForProfile(configDir, "corp-a:user-a")
+	if err != nil || storedA.AccessToken != "token-a-rotated" {
+		t.Fatalf("profile A after refresh = %#v, %v", storedA, err)
+	}
+	storedB, err := LoadTokenDataForProfile(configDir, "corp-b:user-b")
+	if err != nil || storedB.AccessToken != "token-b" {
+		t.Fatalf("profile B after profile-A refresh = %#v, %v", storedB, err)
+	}
+}
+
 func TestForceRefreshPreflightFailureMakesZeroOAuthCalls(t *testing.T) {
 	store, configDir := installMemoryEditionTokenStore(t)
 	data := rejectedTokenData("old-access")

@@ -55,7 +55,7 @@ func (p *OAuthProvider) ForceRefreshRejectedToken(ctx context.Context, rejectedA
 	if !data.IsRefreshTokenValid() {
 		return "", fmt.Errorf("refresh_token 已过期: %w", ErrRefreshTokenExpired)
 	}
-	if err := preflightTokenRefreshPersistence(p.configDir, data); err != nil {
+	if err := preflightTokenRefreshPersistenceForProfile(p.configDir, p.runtimeProfile(), data); err != nil {
 		return "", fmt.Errorf("本地登录态无法安全更新: %w", err)
 	}
 	refreshed, err := oauthRefreshToken(p, ctx, data)
@@ -107,10 +107,7 @@ func DeleteTokenDataIfAccessTokenMatchesForProfile(ctx context.Context, configDi
 		if err := validateEditionTokenStore(hooks); err != nil {
 			return false, err
 		}
-		if profile != "" {
-			return false, fmt.Errorf("profile selection is not supported by the current auth backend")
-		}
-		if err := deleteTokenViaHookTransaction(hooks, configDir); err != nil {
+		if err := deleteTokenViaHookTransaction(hooks, configDir, profile, !editionTokenStoreSupportsProfiles(hooks)); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -151,7 +148,7 @@ func MarkProfileExpiredIfAccessTokenMatches(ctx context.Context, configDir, expe
 		return false, nil
 	}
 	selector := strings.TrimSpace(TokenProfileSelector(data))
-	if selector == "" || edition.Get().LoadToken != nil {
+	if selector == "" || editionTokenStoreConfigured(edition.Get()) {
 		return false, nil
 	}
 	if err := markProfileStatusLocked(configDir, selector, ProfileStatusExpired); err != nil {
@@ -166,10 +163,7 @@ func loadTokenDataUnderHeldLock(configDir, profile string) (*TokenData, error) {
 		if err := validateEditionTokenStore(hooks); err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(profile) != "" {
-			return nil, fmt.Errorf("profile selection is not supported by the current auth backend")
-		}
-		blob, err := hooks.LoadToken(configDir)
+		blob, err := loadEditionToken(hooks, configDir, profile)
 		if err != nil {
 			return nil, err
 		}

@@ -54,7 +54,8 @@ type AccessTokenSnapshot struct {
 	// chosen. It is intentionally unexported: callers receive only the
 	// non-reversible ProfileFingerprint, while auth recovery can keep its CAS
 	// refresh bound to the original request profile.
-	profile string
+	profile       string
+	profilePinned bool
 }
 
 const accessTokenRefreshWindow = 5 * time.Minute
@@ -188,10 +189,30 @@ func (m *TokenManager) Get(ctx context.Context, configDir, explicitToken string)
 	if token := strings.TrimSpace(explicitToken); token != "" {
 		return AccessTokenSnapshot{AccessToken: token, Source: "explicit"}, nil
 	}
+	profile := strings.TrimSpace(authpkg.RuntimeProfile())
+	if profile == "" {
+		// Empty means "the currently selected default" only at this instant.
+		// Convert it to an exact identity lease before choosing the cache key so
+		// a later A->B default switch cannot make A's 401 recovery adopt B.
+		selected, err := authpkg.ResolveProfile(configDir, "")
+		if err != nil {
+			return AccessTokenSnapshot{}, fmt.Errorf("resolve default token profile: %w", err)
+		}
+		if selected != nil {
+			profile = authpkg.ProfileSelector(*selected)
+		}
+	}
+	return m.getForProfile(ctx, configDir, "", profile)
+}
+
+func (m *TokenManager) getForProfile(ctx context.Context, configDir, explicitToken, profile string) (AccessTokenSnapshot, error) {
+	if token := strings.TrimSpace(explicitToken); token != "" {
+		return AccessTokenSnapshot{AccessToken: token, Source: "explicit"}, nil
+	}
 	if strings.TrimSpace(configDir) == "" {
 		return AccessTokenSnapshot{}, fmt.Errorf("config directory is empty")
 	}
-	key := tokenManagerKey{configDir: canonicalTokenConfigDir(configDir), profile: strings.TrimSpace(authpkg.RuntimeProfile())}
+	key := tokenManagerKey{configDir: canonicalTokenConfigDir(configDir), profile: strings.TrimSpace(profile)}
 	entry := m.entry(key)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
@@ -232,6 +253,7 @@ func (m *TokenManager) Get(ctx context.Context, configDir, explicitToken string)
 		}
 		snapshot.ProfileFingerprint = tokenProfileFingerprint(key)
 		snapshot.profile = key.profile
+		snapshot.profilePinned = true
 		if !tokenSnapshotUsable(snapshot, now) {
 			entry.snapshot = AccessTokenSnapshot{}
 			slog.Debug("auth.token.resolve", "outcome", "resolved", "source", snapshot.Source, "cacheable", false, "profile_selected", key.profile != "")
@@ -258,6 +280,21 @@ func (m *TokenManager) Get(ctx context.Context, configDir, explicitToken string)
 		return snapshot, nil
 	}
 	return AccessTokenSnapshot{}, fmt.Errorf("token publication changed repeatedly while resolving credentials")
+}
+
+// RefreshRejectedAccessTokenSnapshot performs a profile-pinned CAS refresh for
+// a snapshot returned by TokenManager, then resolves the committed replacement
+// under the same opaque profile. This is used by runtimes that bypass the MCP
+// runner without exposing the raw profile selector across package boundaries.
+func RefreshRejectedAccessTokenSnapshot(ctx context.Context, configDir string, rejected AccessTokenSnapshot) (AccessTokenSnapshot, error) {
+	if !rejected.profilePinned || strings.TrimSpace(rejected.AccessToken) == "" {
+		return AccessTokenSnapshot{}, fmt.Errorf("rejected token snapshot is not managed by TokenManager")
+	}
+	if _, err := forceRefreshRejectedTokenForProfile(ctx, configDir, rejected.profile, rejected.AccessToken, rejected.Generation); err != nil {
+		return AccessTokenSnapshot{}, err
+	}
+	runtimeTokenManager.Invalidate()
+	return runtimeTokenManager.getForProfile(ctx, configDir, "", rejected.profile)
 }
 
 func (m *TokenManager) entry(key tokenManagerKey) *tokenManagerEntry {

@@ -22,8 +22,6 @@ import (
 )
 
 const (
-	// maxBodyLogSize is the maximum bytes of request/response body to log.
-	maxBodyLogSize = 4096
 	// maxArgLogSize is the maximum bytes for sanitized argument summaries.
 	maxArgLogSize = 1024
 )

@@ -499,8 +499,16 @@ func (c *Client) doWithRetry(ctx context.Context, endpoint string, body []byte, 
 	if operation == "" {
 		operation = "jsonrpc"
 	}
+	maxRetries := c.MaxRetries
+	if operation == "tools/call" && !verifiedIdempotentToolCall(body) {
+		// A lost POST response does not prove the mutation was not committed.
+		// Unknown tool calls therefore get no transparent transport replay.
+		// send_personal_message is the only currently verified business
+		// idempotency contract and is retryable only with a non-empty uuid.
+		maxRetries = 0
+	}
 	var lastErr error
-	for attempt := 0; attempt <= c.MaxRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return nil, apperrors.NewDiscovery(
@@ -548,14 +556,14 @@ func (c *Client) doWithRetry(ctx context.Context, endpoint string, body []byte, 
 			if isTimeoutError(err) {
 				break
 			}
-		} else if !retryable(resp.StatusCode) || attempt == c.MaxRetries {
+		} else if !retryable(resp.StatusCode) || attempt == maxRetries {
 			return resp, nil
 		} else {
 			lastErr = fmt.Errorf("retryable HTTP %d", resp.StatusCode)
 			resp.Body.Close()
 		}
 
-		if attempt < c.MaxRetries {
+		if attempt < maxRetries {
 			retryAfter := ""
 			statusForLog := 0
 			if resp != nil {
@@ -563,7 +571,7 @@ func (c *Client) doWithRetry(ctx context.Context, endpoint string, body []byte, 
 				statusForLog = resp.StatusCode
 			}
 			delay := c.retryDelayForAttempt(attempt, retryAfter)
-			logging.LogRetryAttempt(c.FileLogger, operation, c.ExecutionId, attempt, c.MaxRetries, statusForLog, delay, lastErr)
+			logging.LogRetryAttempt(c.FileLogger, operation, c.ExecutionId, attempt, maxRetries, statusForLog, delay, lastErr)
 			if err := c.sleepForRetry(ctx, delay); err != nil {
 				opts := []apperrors.Option{
 					apperrors.WithOperation(operation),
@@ -604,11 +612,29 @@ func (c *Client) doWithRetry(ctx context.Context, endpoint string, body []byte, 
 			Cause: lastErr,
 		}),
 	}
-	message := fmt.Sprintf("request to %s failed: %v", RedactURL(endpoint), lastErr)
+	// Keep the user-visible envelope stable and safe. The concrete network error
+	// remains available through the cause chain for errors.Is/errors.As, but it
+	// must not be rendered into logs or JSON where proxy credentials, local
+	// paths, or resolver details could leak.
+	message := fmt.Sprintf("request to %s failed", RedactURL(endpoint))
 	if category == apperrors.CategoryAPI {
 		return nil, apperrors.NewAPI(message, opts...)
 	}
 	return nil, apperrors.NewDiscovery(message, opts...)
+}
+
+func verifiedIdempotentToolCall(body []byte) bool {
+	var request struct {
+		Params struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(body, &request) != nil || strings.TrimSpace(request.Params.Name) != "send_personal_message" {
+		return false
+	}
+	value, ok := request.Params.Arguments["uuid"].(string)
+	return ok && strings.TrimSpace(value) != ""
 }
 
 func sanitizeJSONRPCEndpoint(endpoint string) string {

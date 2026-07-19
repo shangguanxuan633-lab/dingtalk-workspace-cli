@@ -149,7 +149,9 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 				// Even on early return, persist custom app credentials if provided
 				// via --client-id/--client-secret flags. Without this, the flags
 				// are only in runtime globals and lost when the process exits.
-				p.persistAppConfigIfNeeded()
+				if err := p.persistResolvedAppCredentials(); err != nil {
+					return nil, fmt.Errorf("%s: %w", i18n.T("保存应用凭证失败"), err)
+				}
 				return data, nil
 			}
 			// Case 2: refresh using refresh_token (with lock to prevent concurrent refresh).
@@ -159,7 +161,9 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 				}
 				refreshed, rErr := p.lockedRefresh(ctx)
 				if rErr == nil {
-					p.persistAppConfigIfNeeded()
+					if err := p.persistResolvedAppCredentials(); err != nil {
+						return nil, fmt.Errorf("%s: %w", i18n.T("保存应用凭证失败"), err)
+					}
 					return refreshed, nil
 				}
 				if p.logger != nil {
@@ -199,6 +203,9 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		if p.logger != nil {
 			p.logger.Debug("fetched client ID from MCP server", "clientID", mcpClientID)
 		}
+	}
+	if err := p.persistResolvedAppCredentials(); err != nil {
+		return nil, fmt.Errorf("%s: %w", i18n.T("本地应用凭证无法安全更新"), err)
 	}
 
 	// Find a free port for the callback server.
@@ -650,15 +657,8 @@ continueLogin:
 
 	// Persist app credentials (with secret) if using custom client credentials.
 	// MUST run BEFORE os.Setenv below to avoid env-matching short circuit.
-	p.persistAppConfigIfNeeded()
-
-	// Always persist clientId to app.json so future process startups
-	// can load it via ResolveAppCredentials and populate DWS_CLIENT_ID env.
-	if p.clientID != "" {
-		_ = os.Setenv("DWS_CLIENT_ID", p.clientID)
-		if !oauthHasAppConfig(p.configDir) {
-			_ = oauthSaveAppConfig(p.configDir, &AppConfig{ClientID: p.clientID})
-		}
+	if err := p.persistResolvedAppCredentials(); err != nil {
+		return nil, fmt.Errorf("%s: %w", i18n.T("保存应用凭证失败"), err)
 	}
 
 	return tokenData, nil
@@ -800,7 +800,7 @@ func (p *OAuthProvider) lockedRefresh(ctx context.Context) (*TokenData, error) {
 	if !data.IsRefreshTokenValid() {
 		return nil, fmt.Errorf("refresh_token 已过期: %w", ErrRefreshTokenExpired)
 	}
-	if err := preflightTokenRefreshPersistence(p.configDir, data); err != nil {
+	if err := preflightTokenRefreshPersistenceForProfile(p.configDir, p.runtimeProfile(), data); err != nil {
 		return nil, fmt.Errorf("%s: %w", i18n.T("本地登录态无法安全更新"), err)
 	}
 
@@ -895,16 +895,16 @@ func (p *OAuthProvider) Status() (*TokenData, error) {
 
 // persistAppConfigIfNeeded saves app credentials if custom ones were used.
 // This ensures the client secret is available for future token refreshes.
-func (p *OAuthProvider) persistAppConfigIfNeeded() {
+func (p *OAuthProvider) persistAppConfigIfNeeded() error {
 	// Check if custom credentials were provided via runtime flags
 	clientID, clientSecret := getRuntimeCredentials()
 	if clientID == "" || clientSecret == "" {
-		return
+		return nil
 	}
 
 	// Skip if using default placeholder credentials
 	if clientID == DefaultClientID {
-		return
+		return nil
 	}
 
 	// Save app config with secret stored in keychain
@@ -912,9 +912,30 @@ func (p *OAuthProvider) persistAppConfigIfNeeded() {
 		ClientID:     clientID,
 		ClientSecret: PlainSecret(clientSecret),
 	}
-	if err := SaveAppConfig(p.configDir, config); err != nil {
-		if p.logger != nil {
-			p.logger.Warn("failed to persist app credentials", "error", err)
+	if err := oauthSaveAppConfig(p.configDir, config); err != nil {
+		return fmt.Errorf("persist app credentials: %w", err)
+	}
+	return nil
+}
+
+func (p *OAuthProvider) persistResolvedAppCredentials() error {
+	if p == nil {
+		return fmt.Errorf("OAuth provider is nil")
+	}
+	// This must run before setting DWS_CLIENT_ID: runtime credential detection
+	// distinguishes a complete flag/env pair from a client-id-only fallback.
+	if err := p.persistAppConfigIfNeeded(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.clientID) != "" && !oauthHasAppConfig(p.configDir) {
+		if err := oauthSaveAppConfig(p.configDir, &AppConfig{ClientID: p.clientID}); err != nil {
+			return fmt.Errorf("persist OAuth client ID: %w", err)
 		}
 	}
+	if strings.TrimSpace(p.clientID) != "" {
+		if err := os.Setenv("DWS_CLIENT_ID", p.clientID); err != nil {
+			return fmt.Errorf("publish OAuth client ID to process environment: %w", err)
+		}
+	}
+	return nil
 }

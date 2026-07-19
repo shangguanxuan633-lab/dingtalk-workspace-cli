@@ -53,13 +53,37 @@ func (e *OAuthEndpointError) Error() string {
 	if e.StatusCode != 0 {
 		parts = append(parts, http.StatusText(e.StatusCode))
 	}
-	if strings.TrimSpace(e.Code) != "" {
-		parts = append(parts, strings.TrimSpace(e.Code))
+	if code := SafeOAuthDiagnosticCode(e.Code); code != "" {
+		parts = append(parts, code)
 	}
 	if len(parts) == 0 {
 		return "OAuth endpoint error"
 	}
 	return "OAuth endpoint error: " + strings.Join(parts, ": ")
+}
+
+// SafeOAuthDiagnosticCode returns a bounded code suitable for logs and user
+// diagnostics. OAuth servers and gateways are not trusted to keep their code
+// field machine-only; an unknown value may contain echoed identity or token
+// material, so it is collapsed to "other". Classification continues to use
+// the raw in-memory code.
+func SafeOAuthDiagnosticCode(code string) string {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "invalid_grant":
+		return "invalid_grant"
+	case "invalid_refresh_token":
+		return "invalid_refresh_token"
+	case "refresh_token_expired":
+		return "refresh_token_expired"
+	case "refresh_token_revoked":
+		return "refresh_token_revoked"
+	case "invalidparameter.authcode.notfound":
+		return "invalidParameter.authCode.notFound"
+	case "":
+		return ""
+	default:
+		return "other"
+	}
 }
 
 // ClassifyRefreshFailure separates retryable infrastructure failures from

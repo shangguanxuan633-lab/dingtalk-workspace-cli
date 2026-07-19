@@ -42,3 +42,14 @@ func TestOAuthEndpointErrorDoesNotExposeServerMessage(t *testing.T) {
 		t.Fatalf("OAuthEndpointError omitted stable code: %q", err)
 	}
 }
+
+func TestOAuthEndpointErrorCollapsesUntrustedCode(t *testing.T) {
+	secret := "uid-4496576595 raw-access-token"
+	err := (&OAuthEndpointError{StatusCode: http.StatusBadRequest, Code: secret}).Error()
+	if strings.Contains(err, secret) || !strings.Contains(err, "other") {
+		t.Fatalf("OAuthEndpointError unsafe unknown code = %q", err)
+	}
+	if got := SafeOAuthDiagnosticCode("invalid_grant"); got != "invalid_grant" {
+		t.Fatalf("safe stable code = %q", got)
+	}
+}

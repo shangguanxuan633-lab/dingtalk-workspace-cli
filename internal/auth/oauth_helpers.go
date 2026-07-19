@@ -42,6 +42,12 @@ func (p *OAuthProvider) exchangeCode(ctx context.Context, code string) (*TokenDa
 	if err := preflightTokenPersistence(p.configDir); err != nil {
 		return nil, fmt.Errorf("%s: %w", i18n.T("本地登录态无法安全更新"), err)
 	}
+	// Persist the app/client-id store before consuming the one-time auth code.
+	// A local write failure after a successful remote exchange can invalidate
+	// the code while leaving no refreshable login state.
+	if err := p.persistResolvedAppCredentials(); err != nil {
+		return nil, fmt.Errorf("%s: %w", i18n.T("本地应用凭证无法安全更新"), err)
+	}
 
 	// Use MCP mode if clientID is from MCP server
 	if IsClientIDFromMCP() {
@@ -50,6 +56,12 @@ func (p *OAuthProvider) exchangeCode(ctx context.Context, code string) (*TokenDa
 	// Direct mode with client secret
 	clientID := ClientID()
 	clientSecret := ClientSecret()
+	// Save the exact secret used by refresh before the remote exchange. This is
+	// intentionally fail-closed; warning-and-continue creates a login that works
+	// only until the first access-token expiry.
+	if err := oauthSaveClientSecret(clientID, clientSecret); err != nil {
+		return nil, fmt.Errorf("persist client secret before token exchange: %w", err)
+	}
 	body := map[string]string{
 		"clientId":     clientID,
 		"clientSecret": clientSecret,
@@ -67,11 +79,6 @@ func (p *OAuthProvider) exchangeCode(ctx context.Context, code string) (*TokenDa
 	// Snapshot credentials used for this token (for refresh)
 	data.ClientID = clientID
 	data.Source = resolveCredentialSource()
-	// Save clientSecret for future refresh (even if env changes)
-	if err := oauthSaveClientSecret(clientID, clientSecret); err != nil {
-		// Log warning but don't fail login
-		fmt.Fprintf(p.Output, "Warning: failed to save client secret: %v\n", err)
-	}
 	return data, nil
 }
 

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cli"
-	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/output"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/recovery"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/transport"
@@ -333,24 +333,24 @@ func (r *recoveryRuntime) CallToolDirect(ctx context.Context, serverID, toolName
 	if err != nil {
 		return nil, err
 	}
-	token, err := resolveRuntimeAuthToken(ctx, recoveryRuntimeToken(r.flags))
-	if err != nil {
-		return nil, authResolutionError(err)
-	}
-	tc := r.transport.WithAuth(token, resolveIdentityHeaders())
-	result, err := tc.CallTool(ctx, endpoint, toolName, args)
+	// Recovery probes bypass endpoint discovery but must not bypass the unified
+	// TokenManager and passive 401/token-rejection recovery contract. Reuse the
+	// normal execution boundary so provider errors remain visible, profile
+	// snapshots stay pinned, and the retry budget remains exactly one.
+	runner := &runtimeRunner{transport: r.transport, globalFlags: r.flags}
+	result, err := runner.executeInvocation(ctx, endpoint, executor.Invocation{
+		CanonicalProduct: serverID,
+		Tool:             toolName,
+		Params:           cloneRecoveryArgs(args),
+	})
 	if err != nil {
 		return nil, err
 	}
-	if result.IsError {
-		return &result, apperrors.NewAPI(
-			extractMCPErrorMessage(result),
-			apperrors.WithOperation("tools/call"),
-			apperrors.WithReason("mcp_tool_error"),
-			apperrors.WithServerKey(serverID),
-		)
+	content, _ := result.Response["content"].(map[string]any)
+	if content == nil {
+		content = map[string]any{}
 	}
-	return &result, nil
+	return &transport.ToolCallResult{Content: content}, nil
 }
 
 func (r *recoveryRuntime) resolveEndpoint(ctx context.Context, productID, toolName string) (string, error) {

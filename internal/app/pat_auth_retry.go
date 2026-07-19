@@ -419,13 +419,12 @@ func printPATPollDebugResponse(output io.Writer, statusCode int, body []byte) {
 	if os.Getenv("DWS_DEBUG_PAT_POLL") == "" {
 		return
 	}
-	trimmed := strings.TrimSpace(string(body))
-	if trimmed == "" {
-		trimmed = "<empty body>"
-	}
 	fmt.Fprintln(output)
-	fmt.Fprintf(output, "  ℹ PAT 轮询接口返回原文 (HTTP %d):\n", statusCode)
-	fmt.Fprintf(output, "    %s\n", trimmed)
+	// Never print the upstream envelope, even in explicit debug mode. PAT poll
+	// responses may contain authCode, access tokens, or user/organization
+	// identity fields. Status and size are enough to correlate the structured
+	// auth-stage log without leaking credential material.
+	fmt.Fprintf(output, "  ℹ PAT 轮询接口响应元数据 (HTTP %d, body_bytes=%d)\n", statusCode, len(body))
 }
 
 func runDirectPATAuthCheck(

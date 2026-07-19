@@ -417,7 +417,7 @@ func TestPollPatDeviceFlow_RedirectSkipped(t *testing.T) {
 	}
 }
 
-func TestPollPatDeviceFlow_UnknownStatusPrintsRawResponse(t *testing.T) {
+func TestPollPatDeviceFlow_UnknownStatusPrintsOnlySafeMetadata(t *testing.T) {
 	t.Setenv("DWS_DEBUG_PAT_POLL", "1")
 	server, configDir := setupPollServer(t, []authpkg.DevicePollResponse{
 		{Success: true, Data: authpkg.DevicePollData{Status: ""}},
@@ -439,11 +439,11 @@ func TestPollPatDeviceFlow_UnknownStatusPrintsRawResponse(t *testing.T) {
 		t.Fatalf("expected empty authCode for unknown status, got %q", authCode)
 	}
 	output := buf.String()
-	if !strings.Contains(output, "PAT 轮询接口返回原文") {
-		t.Fatalf("expected raw poll response to be printed, got %q", output)
+	if !strings.Contains(output, "PAT 轮询接口响应元数据") || !strings.Contains(output, "body_bytes=") {
+		t.Fatalf("expected safe poll metadata to be printed, got %q", output)
 	}
-	if !strings.Contains(output, `"status":""`) {
-		t.Fatalf("expected raw poll body in output, got %q", output)
+	if strings.Contains(output, `"status":""`) {
+		t.Fatalf("raw poll body leaked in output: %q", output)
 	}
 }
 
@@ -468,7 +468,7 @@ func TestPollPatDeviceFlow_UnknownStatusHidesRawResponseByDefault(t *testing.T) 
 		t.Fatalf("expected empty authCode for unknown status, got %q", authCode)
 	}
 	output := buf.String()
-	if strings.Contains(output, "PAT 轮询接口返回原文") {
+	if strings.Contains(output, "PAT 轮询接口响应元数据") {
 		t.Fatalf("expected raw poll response to stay hidden by default, got %q", output)
 	}
 }

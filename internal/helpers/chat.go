@@ -17,6 +17,7 @@ import (
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cli"
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
 
@@ -1454,6 +1455,13 @@ func newChatCommand() *cobra.Command {
 			userID, _ := cmd.Flags().GetString("user")
 			openDingTalkID, _ := cmd.Flags().GetString("open-dingtalk-id")
 			msgUuid, _ := cmd.Flags().GetString("uuid")
+			msgUuid = strings.TrimSpace(msgUuid)
+			if msgUuid == "" {
+				// Generate the business idempotency key before entering the runner.
+				// The same invocation map is replayed after a one-shot auth refresh,
+				// so response loss or owner-ack recovery cannot create a new message.
+				msgUuid = uuid.NewString()
+			}
 			specified := 0
 			if groupID != "" {
 				specified++
@@ -1480,17 +1488,21 @@ func newChatCommand() *cobra.Command {
 			if userID != "" {
 				resolved, err := resolveOpenDingTalkID(cmd.Context(), userID)
 				if err != nil {
-					return fmt.Errorf("cannot resolve --user %q to openDingTalkId: %w; pass --open-dingtalk-id instead", userID, err)
+					return fmt.Errorf("cannot resolve --user to openDingTalkId: %w; pass --open-dingtalk-id instead", err)
 				} else {
 					if commandBoolFlag(cmd, "debug") || commandBoolFlag(cmd, "verbose") {
-						fmt.Fprintf(os.Stderr, "[debug] resolved userID=%q to openDingTalkId=%q\n", userID, resolved)
+						fmt.Fprintln(os.Stderr, "[debug] resolved user target to openDingTalkId (identifiers redacted)")
 					}
 					openDingTalkID = resolved
 					userID = ""
 				}
 			}
 			if commandBoolFlag(cmd, "debug") || commandBoolFlag(cmd, "verbose") {
-				fmt.Fprintf(os.Stderr, "[debug] message send after normalization: groupID=%q userID=%q openDingTalkID=%q\n", groupID, userID, openDingTalkID)
+				targetKind := "direct"
+				if groupID != "" {
+					targetKind = "group"
+				}
+				fmt.Fprintf(os.Stderr, "[debug] message send after normalization: target_kind=%s identifiers=redacted\n", targetKind)
 			}
 
 			mediaId, _ := cmd.Flags().GetString("media-id")
@@ -1575,9 +1587,7 @@ func newChatCommand() *cobra.Command {
 				} else {
 					params["receiverOpenDingTalkId"] = openDingTalkID
 				}
-				if msgUuid != "" {
-					params["uuid"] = msgUuid
-				}
+				params["uuid"] = msgUuid
 				return callMCPTool("send_personal_message", params)
 			}
 
@@ -1619,9 +1629,7 @@ func newChatCommand() *cobra.Command {
 				if len(atOpenIds) > 0 {
 					newParams["atOpenDingTalkIds"] = atOpenIds
 				}
-				if msgUuid != "" {
-					newParams["uuid"] = msgUuid
-				}
+				newParams["uuid"] = msgUuid
 				return callMCPTool("send_personal_message", newParams)
 			}
 			// 单聊：统一走 openDingTalkId
@@ -1632,9 +1640,7 @@ func newChatCommand() *cobra.Command {
 				"content":                string(directContentJSON),
 				"clawType":               clawType,
 			}
-			if msgUuid != "" {
-				newDirectParams["uuid"] = msgUuid
-			}
+			newDirectParams["uuid"] = msgUuid
 			return callMCPTool("send_personal_message", newDirectParams)
 		},
 	}
@@ -2414,7 +2420,7 @@ func newChatCommand() *cobra.Command {
 	_ = chatMessageSendCmd.Flags().MarkHidden("file-type")
 	_ = chatMessageSendCmd.Flags().MarkHidden("file-size")
 	chatMessageSendCmd.Flags().Bool("ai-tag", true, "消息是否带 AI 发送角标（默认 true）")
-	chatMessageSendCmd.Flags().String("uuid", "", "幂等 UUID，相同 uuid 在 24h 内不会重复发送（可选）")
+	chatMessageSendCmd.Flags().String("uuid", "", "幂等 UUID，相同 uuid 在 24h 内不会重复发送（未传时自动生成）")
 	cli.AttachRuntimeSchema(chatMessageSendCmd, "chat", "send_personal_message", "hardcoded:chat")
 	cli.AnnotateRuntimeConstraints(chatMessageSendCmd, cli.RuntimeSchemaConstraints{
 		MutuallyExclusive: [][]string{{"group", "user", "open-dingtalk-id"}},
@@ -3465,9 +3471,12 @@ flow-status 取值：1=处理中(PROCESSING)，2=输入中(INPUTTING)，3=完成
 				"content":            string(contentJSON),
 				"clawType":           clawType,
 			}
-			if v, _ := cmd.Flags().GetString("uuid"); v != "" {
-				toolArgs["uuid"] = v
+			idempotencyKey, _ := cmd.Flags().GetString("uuid")
+			idempotencyKey = strings.TrimSpace(idempotencyKey)
+			if idempotencyKey == "" {
+				idempotencyKey = uuid.NewString()
 			}
+			toolArgs["uuid"] = idempotencyKey
 			return callMCPTool("send_personal_message", toolArgs)
 		},
 	}
@@ -3479,7 +3488,7 @@ flow-status 取值：1=处理中(PROCESSING)，2=输入中(INPUTTING)，3=完成
 	_ = chatMessageReplyCmd.MarkFlagRequired("ref-sender")
 	chatMessageReplyCmd.Flags().String("text", "", "回复内容 (必填)")
 	_ = chatMessageReplyCmd.MarkFlagRequired("text")
-	chatMessageReplyCmd.Flags().String("uuid", "", "幂等键（可选）")
+	chatMessageReplyCmd.Flags().String("uuid", "", "幂等键（未传时自动生成）")
 	chatMessageReplyCmd.Flags().Bool("ai-tag", true, "消息是否带 AI 发送角标（默认 true）")
 	cli.AttachRuntimeSchema(chatMessageReplyCmd, "chat", "reply_personal_message", "hardcoded:chat")
 

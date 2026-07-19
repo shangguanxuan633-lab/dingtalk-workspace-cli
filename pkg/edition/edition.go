@@ -65,6 +65,18 @@ type ToolCaller interface {
 // to the next-lower default source.
 type RuntimeDefaultFn func(ctx context.Context) (string, bool)
 
+// TokenStoreV2Hooks is the profile-aware transactional credential-store
+// contract. profile is a logical selector captured by Core for the complete
+// read/refresh/write transaction; implementations that use it in a filesystem
+// path must first map it to a fixed-width hash or another traversal-safe key.
+// Core remains the sole owner of token publication markers and generations.
+type TokenStoreV2Hooks struct {
+	Preflight func(configDir, profile string) error
+	Save      func(configDir, profile string, data []byte) error
+	Load      func(configDir, profile string) ([]byte, error)
+	Delete    func(configDir, profile string) error
+}
+
 // Hooks groups all edition-specific behavioural overrides. Zero values
 // fall back to open-source defaults so the struct is safe to use as-is.
 type Hooks struct {
@@ -94,6 +106,9 @@ type Hooks struct {
 
 	// --- HTTP headers ---
 	MergeHeaders func(base map[string]string) map[string]string
+	// MergeHeadersForProfile is the request-scoped variant used with an
+	// immutable exact profile lease. It is preferred over MergeHeaders.
+	MergeHeadersForProfile func(base map[string]string, profile string) map[string]string
 
 	// --- EnterpriseCredential HTTP headers ---
 	EnterpriseCredentialHeaders func(base map[string]string) map[string]string
@@ -116,6 +131,10 @@ type Hooks struct {
 	// availability check before an OAuth exchange can rotate one-time refresh
 	// credentials. nil keeps the complete Save/Load/Delete hook compatible.
 	PreflightTokenStore func(configDir string) error
+	// TokenStoreV2 is preferred over the legacy single-slot hooks above and
+	// supports explicit profile isolation. A non-nil V2 store must provide the
+	// complete Save/Load/Delete transaction trio; Preflight is optional.
+	TokenStoreV2 *TokenStoreV2Hooks
 
 	// --- MCP result classification ---
 	// ClassifyToolResult inspects raw MCP tool-call content and returns a typed

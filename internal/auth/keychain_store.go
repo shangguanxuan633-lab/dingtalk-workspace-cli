@@ -144,11 +144,19 @@ func loadTokenDataKeychainAccount(account string) (*TokenData, error) {
 // stops the remote operation when existing ciphertext is already known to be
 // unreadable and therefore unsafe to update.
 func preflightTokenPersistence(configDir string) error {
+	profile := strings.TrimSpace(RuntimeProfile())
 	if h := edition.Get(); editionTokenStoreConfigured(h) {
 		if err := validateEditionTokenStore(h); err != nil {
 			return fmt.Errorf("unsafe edition token store: %w", err)
 		}
-		if h.PreflightTokenStore != nil {
+		if h.TokenStoreV2 == nil && profile != "" {
+			return fmt.Errorf("legacy edition token store does not support an explicitly selected profile")
+		}
+		if h.TokenStoreV2 != nil && h.TokenStoreV2.Preflight != nil {
+			if err := h.TokenStoreV2.Preflight(configDir, profile); err != nil {
+				return fmt.Errorf("edition TokenStoreV2 preflight: %w", err)
+			}
+		} else if h.TokenStoreV2 == nil && h.PreflightTokenStore != nil {
 			if err := h.PreflightTokenStore(configDir); err != nil {
 				return fmt.Errorf("edition token store preflight: %w", err)
 			}
@@ -203,11 +211,23 @@ func preflightTokenPersistence(configDir string) error {
 // An unrelated broken profile must not prevent the current profile from using
 // its still-valid credentials.
 func preflightTokenRefreshPersistence(configDir string, data *TokenData) error {
+	return preflightTokenRefreshPersistenceForProfile(configDir, RuntimeProfile(), data)
+}
+
+func preflightTokenRefreshPersistenceForProfile(configDir, profile string, data *TokenData) error {
+	profile = strings.TrimSpace(profile)
 	if h := edition.Get(); editionTokenStoreConfigured(h) {
 		if err := validateEditionTokenStore(h); err != nil {
 			return fmt.Errorf("unsafe edition token store: %w", err)
 		}
-		if h.PreflightTokenStore != nil {
+		if h.TokenStoreV2 == nil && profile != "" {
+			return fmt.Errorf("legacy edition token store does not support an explicitly selected profile")
+		}
+		if h.TokenStoreV2 != nil && h.TokenStoreV2.Preflight != nil {
+			if err := h.TokenStoreV2.Preflight(configDir, profile); err != nil {
+				return fmt.Errorf("edition TokenStoreV2 preflight: %w", err)
+			}
+		} else if h.TokenStoreV2 == nil && h.PreflightTokenStore != nil {
 			if err := h.PreflightTokenStore(configDir); err != nil {
 				return fmt.Errorf("edition token store preflight: %w", err)
 			}
@@ -236,7 +256,7 @@ func preflightTokenRefreshPersistence(configDir string, data *TokenData) error {
 		}
 	}
 	checkOrganizationMirror := true
-	if _, _, exact := ParseIdentitySelector(RuntimeProfile()); exact {
+	if _, _, exact := ParseIdentitySelector(profile); exact {
 		checkOrganizationMirror =
 			exactProfileSelectorForCorp(cfg, corpID, cfg.OrgCurrentProfiles[corpID]) ==
 				profileSelector(corpID, userID)

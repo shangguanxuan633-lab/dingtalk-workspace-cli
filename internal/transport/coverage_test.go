@@ -257,7 +257,7 @@ func TestReasonForMethod(t *testing.T) {
 
 // ─── doWithRetry (via CallTool) ────────────────────────────────────────
 
-func TestCallTool_RetriesOn502(t *testing.T) {
+func TestCallToolVerifiedIdempotencyRetriesOn502(t *testing.T) {
 	attempts := 0
 	srv := newMockMCPServer(t, func(w http.ResponseWriter, r *http.Request) {
 		attempts++
@@ -277,7 +277,7 @@ func TestCallTool_RetriesOn502(t *testing.T) {
 	c.RetryMaxDelay = 10 * time.Millisecond
 	c.sleep = func(ctx context.Context, d time.Duration) error { return nil }
 
-	result, err := c.CallTool(context.Background(), srv.URL, "test", nil)
+	result, err := c.CallTool(context.Background(), srv.URL, "send_personal_message", map[string]any{"uuid": "stable-id"})
 	if err != nil {
 		t.Fatalf("expected success after retries, got: %v", err)
 	}
@@ -286,6 +286,23 @@ func TestCallTool_RetriesOn502(t *testing.T) {
 	}
 	if attempts <= 2 {
 		t.Fatalf("expected at least 3 attempts, got %d", attempts)
+	}
+}
+
+func TestCallToolUnknownWriteDoesNotRetryOn502(t *testing.T) {
+	attempts := 0
+	srv := newMockMCPServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	c := NewClient(srv.Client())
+	c.MaxRetries = 3
+	_, err := c.CallTool(context.Background(), srv.URL, "unknown_mutation", nil)
+	if err == nil {
+		t.Fatal("unknown mutation unexpectedly succeeded")
+	}
+	if attempts != 1 {
+		t.Fatalf("unknown mutation attempts = %d, want 1", attempts)
 	}
 }
 

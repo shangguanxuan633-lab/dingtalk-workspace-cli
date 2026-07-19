@@ -366,13 +366,19 @@ func TestCrossPlatformCoverageOAuthPersistConfigEdges(t *testing.T) {
 	p := &OAuthProvider{configDir: t.TempDir(), logger: slog.Default()}
 	SetClientID("")
 	SetClientSecret("")
-	p.persistAppConfigIfNeeded()
+	if err := p.persistAppConfigIfNeeded(); err != nil {
+		t.Fatal(err)
+	}
 	SetClientID(DefaultClientID)
 	SetClientSecret("secret")
-	p.persistAppConfigIfNeeded()
+	if err := p.persistAppConfigIfNeeded(); err != nil {
+		t.Fatal(err)
+	}
 	SetClientID("custom-client")
 	SetClientSecret("custom-secret")
-	p.persistAppConfigIfNeeded()
+	if err := p.persistAppConfigIfNeeded(); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := LoadAppConfig(p.configDir)
 	if err != nil || cfg.ClientID != "custom-client" {
 		t.Fatalf("persisted config = %#v, %v", cfg, err)
@@ -382,7 +388,9 @@ func TestCrossPlatformCoverageOAuthPersistConfigEdges(t *testing.T) {
 	if err := os.WriteFile(badDir, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	(&OAuthProvider{configDir: badDir, logger: slog.Default()}).persistAppConfigIfNeeded()
+	if err := (&OAuthProvider{configDir: badDir, logger: slog.Default()}).persistAppConfigIfNeeded(); err == nil {
+		t.Fatal("persistAppConfigIfNeeded accepted an unwritable config path")
+	}
 	SetClientID("")
 	SetClientSecret("")
 }
@@ -771,10 +779,13 @@ func TestCrossPlatformCoverageOAuthProviderHighLevelEdges(t *testing.T) {
 	p.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"accessToken":"access","refreshToken":"refresh"}`)), Header: make(http.Header)}, nil
 	})}
-	var warnings bytes.Buffer
-	p.Output = &warnings
-	if _, err := p.exchangeCode(context.Background(), "code"); err != nil || !strings.Contains(warnings.String(), "Warning") {
-		t.Fatalf("direct exchange secret warning = %v %q", err, warnings.String())
+	var exchangeCalls atomic.Int32
+	p.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		exchangeCalls.Add(1)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"accessToken":"access","refreshToken":"refresh"}`)), Header: make(http.Header)}, nil
+	})}
+	if _, err := p.exchangeCode(context.Background(), "code"); !errors.Is(err, fail) || exchangeCalls.Load() != 0 {
+		t.Fatalf("direct exchange secret persistence = %v, HTTP calls=%d", err, exchangeCalls.Load())
 	}
 	oauthSaveTokenLocked = func(string, *TokenData) error { return fail }
 	if _, err := p.refreshWithRefreshToken(context.Background(), &TokenData{ClientID: "direct", RefreshToken: "refresh"}); !errors.Is(err, fail) {

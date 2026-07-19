@@ -212,6 +212,9 @@ func TestCrossPlatformCoverageChatSendResolvesUserBeforeDispatch(t *testing.T) {
 	if _, leaked := caller.calls[1].args["receiverUid"]; leaked {
 		t.Fatalf("resolved send must not include receiverUid: %#v", caller.calls[1].args)
 	}
+	if generated, ok := caller.calls[1].args["uuid"].(string); !ok || strings.TrimSpace(generated) == "" {
+		t.Fatalf("send must generate a stable business idempotency uuid: %#v", caller.calls[1].args)
+	}
 }
 
 func TestCrossPlatformCoverageChatSendFailsClosedWhenUserCannotResolve(t *testing.T) {

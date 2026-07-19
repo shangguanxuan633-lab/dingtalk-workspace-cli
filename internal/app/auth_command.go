@@ -551,7 +551,7 @@ func newAuthStatusCommand() *cobra.Command {
 						oauthCode := ""
 						var endpointErr *authpkg.OAuthEndpointError
 						if errors.As(refreshErr, &endpointErr) {
-							oauthCode = strings.TrimSpace(endpointErr.Code)
+							oauthCode = authpkg.SafeOAuthDiagnosticCode(endpointErr.Code)
 						}
 						slog.Warn("auth.status.refresh_failed",
 							"stage", "auth_status",
@@ -1545,8 +1545,10 @@ func authStatusRefreshDiagnostic(err error) *authStatusDiagnostic {
 		diagnostic.Hint = "请重新运行 dws auth login 完成授权。"
 	}
 	var endpointErr *authpkg.OAuthEndpointError
-	if errors.As(err, &endpointErr) && strings.TrimSpace(endpointErr.Code) != "" {
-		diagnostic.Message += "（OAuth code: " + strings.TrimSpace(endpointErr.Code) + "）"
+	if errors.As(err, &endpointErr); endpointErr != nil {
+		if code := authpkg.SafeOAuthDiagnosticCode(endpointErr.Code); code != "" {
+			diagnostic.Message += "（OAuth code: " + code + "）"
+		}
 	}
 	return diagnostic
 }

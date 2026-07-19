@@ -269,7 +269,7 @@ func TestCrossPlatformCoveragePATRetryRemainingPollAndBrowserCoverage(t *testing
 	var out bytes.Buffer
 	t.Setenv("DWS_DEBUG_PAT_POLL", "1")
 	printPATPollDebugResponse(&out, 500, nil)
-	if !strings.Contains(out.String(), "empty body") {
+	if !strings.Contains(out.String(), "body_bytes=0") {
 		t.Fatalf("empty debug response = %q", out.String())
 	}
 	for _, goos := range []string{"darwin", "linux", "windows", "plan9"} {

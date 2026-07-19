@@ -39,6 +39,7 @@ import (
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/authretry"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/configmeta"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
+	"github.com/google/uuid"
 )
 
 func init() {
@@ -201,6 +202,7 @@ func (r *runtimeRunner) Run(ctx context.Context, invocation executor.Invocation)
 	if multi {
 		return r.runMultiProfile(ctx, invocation, selections)
 	}
+	requestProfile := ""
 	if strings.TrimSpace(rawProfile) != "" {
 		profile, err := authpkg.ResolveProfile(defaultConfigDir(), rawProfile)
 		if err != nil {
@@ -209,18 +211,24 @@ func (r *runtimeRunner) Run(ctx context.Context, invocation executor.Invocation)
 		if profile == nil {
 			return executor.Result{}, apperrors.NewValidation(fmt.Sprintf("profile %q not found", rawProfile))
 		}
-		authpkg.SetRuntimeProfile(authpkg.ProfileSelector(*profile))
-		defer authpkg.SetRuntimeProfile(rawProfile)
+		requestProfile = authpkg.ProfileSelector(*profile)
+	} else {
+		profile, err := authpkg.ResolveProfile(defaultConfigDir(), "")
+		if err != nil {
+			return executor.Result{}, apperrors.NewValidation(err.Error())
+		}
+		if profile != nil {
+			requestProfile = authpkg.ProfileSelector(*profile)
+		}
 	}
 
-	return r.runSingle(ctx, invocation, true)
+	return r.runSingle(withLogicalProfile(ctx, requestProfile), invocation, true)
 }
 
 func (r *runtimeRunner) runSingle(ctx context.Context, invocation executor.Invocation, _ bool) (executor.Result, error) {
 	if r.loader == nil || r.transport == nil {
 		return r.fallback.Run(ctx, invocation)
 	}
-	r.transport.ExtraHeaders = resolveIdentityHeaders()
 
 	// Mock mode: skip catalog validation, use a placeholder endpoint.
 	if r.globalFlags != nil && r.globalFlags.Mock {
@@ -230,6 +238,8 @@ func (r *runtimeRunner) runSingle(ctx context.Context, invocation executor.Invoc
 		}
 		return r.executeInvocation(ctx, endpoint, invocation)
 	}
+
+	invocation = attachVerifiedToolIdempotency(invocation)
 
 	if shouldUseDirectRuntime(invocation) {
 		if endpoint, ok := directRuntimeEndpoint(invocation.CanonicalProduct, invocation.Tool); ok {
@@ -289,6 +299,25 @@ func (r *runtimeRunner) runSingle(ctx context.Context, invocation executor.Invoc
 	return r.executeInvocation(ctx, endpoint, invocation)
 }
 
+// attachVerifiedToolIdempotency adds the documented business idempotency key
+// centrally, covering hardcoded helpers, shortcuts, editions, and direct
+// ToolCaller users. It runs once before the first HTTP request; auth recovery
+// reuses the same invocation map and therefore the same UUID.
+func attachVerifiedToolIdempotency(invocation executor.Invocation) executor.Invocation {
+	if strings.TrimSpace(invocation.Tool) != "send_personal_message" {
+		return invocation
+	}
+	if existing, ok := invocation.Params["uuid"].(string); ok && strings.TrimSpace(existing) != "" {
+		return invocation
+	}
+	invocation = cloneInvocation(invocation)
+	if invocation.Params == nil {
+		invocation.Params = make(map[string]any)
+	}
+	invocation.Params["uuid"] = uuid.NewString()
+	return invocation
+}
+
 type multiProfileSelection struct {
 	Selector string
 	Profile  authpkg.Profile
@@ -332,17 +361,13 @@ func resolveMultiProfileSelections(configDir, rawSelector string) ([]multiProfil
 }
 
 func (r *runtimeRunner) runMultiProfile(ctx context.Context, invocation executor.Invocation, selections []multiProfileSelection) (executor.Result, error) {
-	previousProfile := authpkg.RuntimeProfile()
-	defer authpkg.SetRuntimeProfile(previousProfile)
-
 	entries := make([]any, 0, len(selections))
 	succeeded := 0
 	failed := 0
 
 	for _, selection := range selections {
 		resolvedSelector := authpkg.ProfileSelector(selection.Profile)
-		authpkg.SetRuntimeProfile(resolvedSelector)
-		result, err := r.runSingle(ctx, cloneInvocation(invocation), false)
+		result, err := r.runSingle(withLogicalProfile(ctx, resolvedSelector), cloneInvocation(invocation), false)
 
 		entry := map[string]any{
 			"selector": selection.Selector,
@@ -499,15 +524,15 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 		execID = generateExecutionID()
 		ctx = context.WithValue(ctx, logicalExecutionIDKey{}, execID)
 	}
-	r.transport.ExecutionId = execID
-
-	// Lazy bind FileLogger: it may be nil at construction time because
-	// configureLogLevel runs later in PersistentPreRunE.
-	if r.transport.FileLogger == nil {
-		r.transport.FileLogger = FileLoggerInstance()
+	// Never mutate the shared base client. Concurrent invocations must not race
+	// on ExecutionId/FileLogger and accidentally send another command's
+	// execution or idempotency correlation headers.
+	baseTransport := r.transport.WithExecutionId(execID)
+	if baseTransport.FileLogger == nil {
+		baseTransport.FileLogger = FileLoggerInstance()
 	}
 
-	fl := r.transport.FileLogger
+	fl := baseTransport.FileLogger
 
 	if logicalAttempt {
 		defer func() {
@@ -572,6 +597,10 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 		}, nil
 	}
 
+	// Keep this at the final HTTP boundary as well as runSingle so editions and
+	// recovery/direct callers cannot bypass the verified business key.
+	invocation = attachVerifiedToolIdempotency(invocation)
+
 	// Check if this product has plugin-level auth credentials registered.
 	// If so, use the plugin's token instead of the default DingTalk OAuth token.
 	// This allows third-party MCP servers (e.g. Bailian) to use their own API keys.
@@ -609,11 +638,15 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 	var tc *transport.Client
 	if hasPluginAuth {
 		// Use plugin-level auth: inject the plugin's token and trust its domains.
-		tc = r.transport.WithAuth(authToken, pluginAuth.ExtraHeaders)
+		tc = baseTransport.WithAuth(authToken, pluginAuth.ExtraHeaders)
 		tc.TrustedDomains = pluginAuth.TrustedDomains
 	} else {
 		// Default path: use DingTalk OAuth token with identity headers.
-		headers := resolveIdentityHeaders()
+		requestProfile, _ := logicalProfile(ctx)
+		if authSnapshot.profilePinned {
+			requestProfile = authSnapshot.profile
+		}
+		headers := resolveIdentityHeadersForProfile(requestProfile)
 		// Every logical invocation gets a stable idempotency identifier even
 		// when the caller did not supply one. executeInvocation carries execID in
 		// the context, so transport retries and the one auth-refresh retry reuse
@@ -621,7 +654,7 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 		if strings.TrimSpace(headers["x-dingtalk-message-id"]) == "" {
 			headers["x-dingtalk-message-id"] = execID
 		}
-		tc = r.transport.WithAuth(authToken, headers)
+		tc = baseTransport.WithAuth(authToken, headers)
 	}
 
 	callCtx := ctx
@@ -684,7 +717,7 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 				if cause == nil {
 					cause = editionErr
 				}
-				if r.canAutoRefreshAuth(hasPluginAuth) && authRefreshAllowed(editionErr, cause) {
+				if r.canAutoRefreshAuth(hasPluginAuth, authSnapshot) && authRefreshAllowed(editionErr, cause) {
 					result, retryErr := r.maybeAuthRefreshRetry(ctx, endpoint, invocation, authSnapshot, cause)
 					if retryErr != nil {
 						runnerCaptureRuntimeFailure(invocation, editionErr, retryErr)
@@ -696,7 +729,7 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 			return executor.Result{}, editionErr
 		}
 	}
-	if coreRejected && r.canAutoRefreshAuth(hasPluginAuth) && authRefreshAllowed(coreRefresh.Cause, coreRefresh.Cause) {
+	if coreRejected && r.canAutoRefreshAuth(hasPluginAuth, authSnapshot) && authRefreshAllowed(coreRefresh.Cause, coreRefresh.Cause) {
 		result, retryErr := r.maybeAuthRefreshRetry(ctx, endpoint, invocation, authSnapshot, coreRefresh.Cause)
 		if retryErr != nil {
 			runnerCaptureRuntimeFailure(invocation, coreRefresh.Cause, retryErr)
@@ -714,7 +747,7 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 
 	if callResult.IsError {
 		diag := transport.ExtractServerDiagnosticsFromMap(callResult.Content)
-		logBusinessError(r.transport.FileLogger, "mcp_tool_error", invocation, callResult.Content, diag)
+		logBusinessError(fl, "mcp_tool_error", invocation, callResult.Content, diag)
 
 		mcpErr := apperrors.NewAPI(
 			extractMCPErrorMessage(callResult),
@@ -741,7 +774,7 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 
 	if bizErr := detectBusinessError(callResult.Content); bizErr != "" {
 		diag := transport.ExtractServerDiagnosticsFromMap(callResult.Content)
-		logBusinessError(r.transport.FileLogger, "business_error", invocation, callResult.Content, diag)
+		logBusinessError(fl, "business_error", invocation, callResult.Content, diag)
 		return executor.Result{}, apperrors.NewAPI(bizErr,
 			apperrors.WithOperation("tools/call"),
 			apperrors.WithReason("business_error"),
@@ -772,6 +805,23 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 }
 
 type logicalExecutionIDKey struct{}
+
+type logicalProfileKey struct{}
+
+func withLogicalProfile(ctx context.Context, profile string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, logicalProfileKey{}, strings.TrimSpace(profile))
+}
+
+func logicalProfile(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	value, ok := ctx.Value(logicalProfileKey{}).(string)
+	return strings.TrimSpace(value), ok
+}
 
 func logicalExecutionID(ctx context.Context) (string, bool) {
 	if ctx == nil {
@@ -871,6 +921,9 @@ func resolveRuntimeAuthToken(ctx context.Context, explicitToken string) (string,
 func getRuntimeTokenSnapshot(ctx context.Context) (AccessTokenSnapshot, error) {
 	loadStart := time.Now()
 	defer func() { RecordTiming(ctx, "auth_keychain", time.Since(loadStart)) }()
+	if profile, ok := logicalProfile(ctx); ok {
+		return runtimeTokenManager.getForProfile(ctx, defaultConfigDir(), "", profile)
+	}
 	return runtimeTokenManager.Get(ctx, defaultConfigDir(), "")
 }
 
@@ -923,8 +976,10 @@ func authResolutionError(err error) error {
 		}
 	}
 	var endpointErr *authpkg.OAuthEndpointError
-	if errors.As(err, &endpointErr) && strings.TrimSpace(endpointErr.Code) != "" {
-		message += "（OAuth code: " + strings.TrimSpace(endpointErr.Code) + "）"
+	if errors.As(err, &endpointErr); endpointErr != nil {
+		if code := authpkg.SafeOAuthDiagnosticCode(endpointErr.Code); code != "" {
+			message += "（OAuth code: " + code + "）"
+		}
 	}
 	return apperrors.NewAuth(
 		message,
@@ -986,6 +1041,10 @@ func productEndpointOverride(productID string) (string, bool) {
 // resolveIdentityHeaders loads or creates agent identity and returns HTTP
 // headers to inject into MCP requests. Best-effort: returns nil on failure.
 func resolveIdentityHeaders() map[string]string {
+	return resolveIdentityHeadersForProfile(strings.TrimSpace(authpkg.RuntimeProfile()))
+}
+
+func resolveIdentityHeadersForProfile(profile string) map[string]string {
 	id := authpkg.EnsureExists(defaultConfigDir())
 	headers := id.Headers()
 
@@ -1043,7 +1102,9 @@ func resolveIdentityHeaders() map[string]string {
 		headers["x-dws-channel"] = v
 	}
 
-	if fn := edition.Get().MergeHeaders; fn != nil {
+	if fn := edition.Get().MergeHeadersForProfile; fn != nil {
+		headers = fn(headers, strings.TrimSpace(profile))
+	} else if fn := edition.Get().MergeHeaders; fn != nil {
 		headers = fn(headers)
 	}
 	if fn := edition.Get().EnterpriseCredentialHeaders; fn != nil {
@@ -1141,7 +1202,9 @@ func logBusinessError(logger *slog.Logger, reason string, inv executor.Invocatio
 		attrs = append(attrs, "trace_id", diag.TraceID)
 	}
 	if diag.ServerErrorCode != "" {
-		attrs = append(attrs, "server_error_code", diag.ServerErrorCode)
+		// Arbitrary upstream codes are not trusted diagnostic text; some
+		// gateways echo request identifiers in this field.
+		attrs = append(attrs, "server_error_code_present", true)
 	}
 	// Never log free-form upstream detail or the response envelope. Error
 	// messages frequently echo request arguments, identities, and credentials.

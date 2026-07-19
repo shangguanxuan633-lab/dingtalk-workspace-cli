@@ -32,9 +32,9 @@ type rejectedTokenRefresher interface {
 }
 
 var (
-	newRejectedTokenRefresher = func(configDir string) rejectedTokenRefresher {
+	newRejectedTokenRefresher = func(configDir, profile string) rejectedTokenRefresher {
 		disc := slog.New(slog.NewTextHandler(io.Discard, nil))
-		provider := authpkg.NewOAuthProvider(configDir, disc)
+		provider := authpkg.NewOAuthProviderForProfile(configDir, disc, profile)
 		configureOAuthProviderCompatibility(provider, configDir)
 		return provider
 	}
@@ -52,20 +52,25 @@ func ForceRefreshAccessToken(ctx context.Context, configDir string) (string, err
 	if strings.TrimSpace(configDir) == "" {
 		return "", fmt.Errorf("config directory is empty")
 	}
-	data, err := authpkg.LoadTokenData(configDir)
+	profile := strings.TrimSpace(authpkg.RuntimeProfile())
+	data, err := authpkg.LoadTokenDataForProfile(configDir, profile)
 	if err != nil {
 		return "", err
 	}
-	return ForceRefreshRejectedToken(ctx, configDir, data.AccessToken, data.Generation)
+	return forceRefreshRejectedTokenForProfile(ctx, configDir, profile, data.AccessToken, data.Generation)
 }
 
 // ForceRefreshRejectedToken refreshes only if the rejected token/generation is
 // still current; concurrent rotations are reused.
 func ForceRefreshRejectedToken(ctx context.Context, configDir, rejectedAccessToken string, generation ...uint64) (string, error) {
+	return forceRefreshRejectedTokenForProfile(ctx, configDir, strings.TrimSpace(authpkg.RuntimeProfile()), rejectedAccessToken, generation...)
+}
+
+func forceRefreshRejectedTokenForProfile(ctx context.Context, configDir, profile, rejectedAccessToken string, generation ...uint64) (string, error) {
 	if strings.TrimSpace(configDir) == "" {
 		return "", fmt.Errorf("config directory is empty")
 	}
-	provider := newRejectedTokenRefresher(configDir)
+	provider := newRejectedTokenRefresher(configDir, strings.TrimSpace(profile))
 	tok, err := provider.ForceRefreshRejectedToken(ctx, rejectedAccessToken, generation...)
 	if err != nil {
 		return "", err

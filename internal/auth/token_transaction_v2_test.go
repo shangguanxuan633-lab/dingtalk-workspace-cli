@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -11,6 +12,41 @@ import (
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 )
+
+type memoryProfileTokenStoreV2 struct {
+	mu    sync.Mutex
+	blobs map[string][]byte
+}
+
+func (s *memoryProfileTokenStoreV2) hooks(preflight func(string, string) error) *edition.Hooks {
+	if s.blobs == nil {
+		s.blobs = make(map[string][]byte)
+	}
+	return &edition.Hooks{TokenStoreV2: &edition.TokenStoreV2Hooks{
+		Preflight: preflight,
+		Save: func(_, profile string, data []byte) error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.blobs[profile] = append([]byte(nil), data...)
+			return nil
+		},
+		Load: func(_, profile string) ([]byte, error) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			blob, ok := s.blobs[profile]
+			if !ok {
+				return nil, ErrTokenDataNotFound
+			}
+			return append([]byte(nil), blob...), nil
+		},
+		Delete: func(_, profile string) error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			delete(s.blobs, profile)
+			return nil
+		},
+	}}
+}
 
 func TestEditionTokenStorePreflightRequiresCompleteTransactionHooks(t *testing.T) {
 	previous := edition.Get()
@@ -29,6 +65,119 @@ func TestEditionTokenStorePreflightRequiresCompleteTransactionHooks(t *testing.T
 	}
 	if data.Generation != 0 {
 		t.Fatalf("failed SaveTokenData mutated caller generation to %d", data.Generation)
+	}
+}
+
+func TestEditionTokenStoreV2RequiresCompleteTransactionHooks(t *testing.T) {
+	previous := edition.Get()
+	edition.Override(&edition.Hooks{TokenStoreV2: &edition.TokenStoreV2Hooks{
+		Save: func(string, string, []byte) error { return nil },
+	}})
+	t.Cleanup(func() { edition.Override(previous) })
+	if err := preflightTokenPersistence(t.TempDir()); err == nil || !strings.Contains(err.Error(), "TokenStoreV2 must provide Save, Load, and Delete") {
+		t.Fatalf("incomplete TokenStoreV2 preflight error = %v", err)
+	}
+}
+
+func TestEditionTokenStoreV2IsolatesProfilesAndPublishesDeletion(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	store := &memoryProfileTokenStoreV2{}
+	var preflightProfile string
+	edition.Override(store.hooks(func(_, profile string) error {
+		preflightProfile = profile
+		return nil
+	}))
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+	})
+	configDir := t.TempDir()
+
+	SetRuntimeProfile("profile-a")
+	dataA := rejectedTokenData("token-a")
+	if err := SaveTokenData(configDir, dataA); err != nil {
+		t.Fatal(err)
+	}
+	SetRuntimeProfile("profile-b")
+	dataB := rejectedTokenData("token-b")
+	if err := SaveTokenData(configDir, dataB); err != nil {
+		t.Fatal(err)
+	}
+	if dataB.Generation <= dataA.Generation {
+		t.Fatalf("generations A=%d B=%d", dataA.Generation, dataB.Generation)
+	}
+
+	loadedA, err := LoadTokenDataForProfile(configDir, "profile-a")
+	if err != nil || loadedA.AccessToken != "token-a" {
+		t.Fatalf("profile A = %#v, %v", loadedA, err)
+	}
+	loadedB, err := LoadTokenDataForProfile(configDir, "profile-b")
+	if err != nil || loadedB.AccessToken != "token-b" {
+		t.Fatalf("profile B = %#v, %v", loadedB, err)
+	}
+	if err := preflightTokenRefreshPersistenceForProfile(configDir, "profile-a", loadedA); err != nil {
+		t.Fatal(err)
+	}
+	if preflightProfile != "profile-a" {
+		t.Fatalf("preflight profile = %q", preflightProfile)
+	}
+
+	beforeDelete, present, err := ReadTokenMarkerGeneration(configDir)
+	if err != nil || !present {
+		t.Fatalf("marker before delete = (%d, %v, %v)", beforeDelete, present, err)
+	}
+	if err := DeleteTokenDataForProfile(configDir, "profile-a"); err != nil {
+		t.Fatal(err)
+	}
+	afterDelete, present, err := ReadTokenMarkerGeneration(configDir)
+	if err != nil || !present || afterDelete <= beforeDelete {
+		t.Fatalf("marker after delete = (%d, %v, %v), want > %d", afterDelete, present, err, beforeDelete)
+	}
+	if _, err := LoadTokenDataForProfile(configDir, "profile-a"); !errors.Is(err, ErrTokenDataNotFound) {
+		t.Fatalf("deleted profile A load error = %v", err)
+	}
+	loadedB, err = LoadTokenDataForProfile(configDir, "profile-b")
+	if err != nil || loadedB.AccessToken != "token-b" {
+		t.Fatalf("profile B after deleting A = %#v, %v", loadedB, err)
+	}
+}
+
+func TestEditionTokenStoreV2PreflightBlocksRejectedRefreshBeforeOAuth(t *testing.T) {
+	previous := edition.Get()
+	previousProfile := RuntimeProfile()
+	previousRefresh := oauthRefreshToken
+	store := &memoryProfileTokenStoreV2{}
+	edition.Override(store.hooks(nil))
+	t.Cleanup(func() {
+		edition.Override(previous)
+		SetRuntimeProfile(previousProfile)
+		oauthRefreshToken = previousRefresh
+	})
+	configDir := t.TempDir()
+	SetRuntimeProfile("profile-a")
+	data := rejectedTokenData("rejected")
+	if err := SaveTokenData(configDir, data); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("profile store preflight failed")
+	edition.Override(store.hooks(func(_, profile string) error {
+		if profile != "profile-a" {
+			t.Fatalf("preflight profile = %q", profile)
+		}
+		return sentinel
+	}))
+	var exchanges atomic.Int32
+	oauthRefreshToken = func(*OAuthProvider, context.Context, *TokenData) (*TokenData, error) {
+		exchanges.Add(1)
+		return nil, errors.New("unexpected OAuth refresh")
+	}
+	provider := NewOAuthProviderForProfile(configDir, nil, "profile-a")
+	if _, err := provider.ForceRefreshRejectedToken(context.Background(), data.AccessToken, data.Generation); !errors.Is(err, sentinel) {
+		t.Fatalf("ForceRefreshRejectedToken() error = %v", err)
+	}
+	if got := exchanges.Load(); got != 0 {
+		t.Fatalf("OAuth refresh exchanges = %d, want 0", got)
 	}
 }
 

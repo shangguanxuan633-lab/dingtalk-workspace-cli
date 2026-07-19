@@ -1614,7 +1614,7 @@ func TestCrossPlatformCoverageTokenStorageAndRevocationCoverageEdges(t *testing.
 			t.Fatal(err)
 		}
 		tokenJSONMarshalIndent = func(any, string, string) ([]byte, error) { return nil, fail }
-		if err := saveTokenViaHook(edition.Get(), dir, data); err == nil {
+		if err := saveTokenViaHook(edition.Get(), dir, "", data); err == nil {
 			t.Fatal("hook marshal failure succeeded")
 		}
 		tokenJSONMarshalIndent = oldMarshalIndent

@@ -157,12 +157,12 @@ func TestCrossPlatformCoverageRawAPIAndTokenCoverage(t *testing.T) {
 		t.Fatalf("explicit auxiliary token = %q, %v", got, err)
 	}
 	dir := t.TempDir()
-	newAccessTokenProvider = func(string) accessTokenGetter { return fakeAccessTokenGetter{token: "saved"} }
+	newAccessTokenProvider = func(string, string) accessTokenGetter { return fakeAccessTokenGetter{token: "saved"} }
 	newLegacyTokenManager = func(string) legacyTokenGetter { return fakeLegacyTokenGetter{} }
 	if got, err := resolveAccessTokenFromDir(context.Background(), dir); err != nil || got != "saved" {
 		t.Fatalf("saved access token = %q, %v", got, err)
 	}
-	newAccessTokenProvider = func(string) accessTokenGetter { return fakeAccessTokenGetter{} }
+	newAccessTokenProvider = func(string, string) accessTokenGetter { return fakeAccessTokenGetter{} }
 	missing := t.TempDir()
 	if got, err := resolveAccessTokenFromDir(context.Background(), missing); err != nil || got != "" {
 		t.Fatalf("missing access token = %q, %v", got, err)

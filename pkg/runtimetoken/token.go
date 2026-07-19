@@ -33,6 +33,7 @@ type TokenSnapshot struct {
 	Source             string
 	ProfileFingerprint string
 	UpdatedAt          string
+	opaque             app.AccessTokenSnapshot
 }
 
 // ResolveAccessToken returns a non-empty bearer token using the same sources
@@ -54,6 +55,21 @@ func ResolveSnapshot(ctx context.Context, configDir, explicitToken string) (Toke
 	if err != nil {
 		return TokenSnapshot{}, err
 	}
+	return tokenSnapshotFromApp(snapshot), nil
+}
+
+// RefreshRejected performs a one-shot, compare-and-swap refresh using the
+// opaque profile identity captured by ResolveSnapshot. The raw selector is
+// never exposed to callers, and a concurrent rotation is reused.
+func RefreshRejected(ctx context.Context, configDir string, rejected TokenSnapshot) (TokenSnapshot, error) {
+	refreshed, err := app.RefreshRejectedAccessTokenSnapshot(ctx, configDir, rejected.opaque)
+	if err != nil {
+		return TokenSnapshot{}, err
+	}
+	return tokenSnapshotFromApp(refreshed), nil
+}
+
+func tokenSnapshotFromApp(snapshot app.AccessTokenSnapshot) TokenSnapshot {
 	return TokenSnapshot{
 		AccessToken:        snapshot.AccessToken,
 		ExpiresAt:          snapshot.ExpiresAt,
@@ -62,5 +78,6 @@ func ResolveSnapshot(ctx context.Context, configDir, explicitToken string) (Toke
 		Source:             snapshot.Source,
 		ProfileFingerprint: snapshot.ProfileFingerprint,
 		UpdatedAt:          snapshot.UpdatedAt,
-	}, nil
+		opaque:             snapshot,
+	}
 }

@@ -223,6 +223,11 @@ func (p *DeviceFlowProvider) Login(ctx context.Context) (*TokenData, error) {
 			p.logger.Debug("fetched client ID from MCP server", "clientID", mcpClientID)
 		}
 	}
+	preflightProvider := NewOAuthProvider(p.configDir, p.logger)
+	preflightProvider.clientID = p.clientID
+	if err := preflightProvider.persistResolvedAppCredentials(); err != nil {
+		return nil, fmt.Errorf("%s: %w", i18n.T("本地应用凭证无法安全更新"), err)
+	}
 
 	const maxAttempts = 3
 	for attempt := 1; ; attempt++ {
@@ -363,15 +368,8 @@ func (p *DeviceFlowProvider) loginOnce(ctx context.Context, attempt int) (*Token
 
 	// Persist app credentials (with secret) if using custom client credentials.
 	// MUST run BEFORE os.Setenv below to avoid env-matching short circuit.
-	oauthProvider.persistAppConfigIfNeeded()
-
-	// Always persist clientId to app.json so future process startups
-	// can load it via ResolveAppCredentials and populate DWS_CLIENT_ID env.
-	if p.clientID != "" {
-		_ = os.Setenv("DWS_CLIENT_ID", p.clientID)
-		if !deviceHasAppConfig(p.configDir) {
-			_ = deviceSaveAppConfig(p.configDir, &AppConfig{ClientID: p.clientID})
-		}
+	if err := oauthProvider.persistResolvedAppCredentials(); err != nil {
+		return nil, fmt.Errorf("%s: %w", i18n.T("保存应用凭证失败"), err)
 	}
 
 	return tokenData, nil
