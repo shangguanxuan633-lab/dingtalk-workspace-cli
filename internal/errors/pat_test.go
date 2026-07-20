@@ -227,6 +227,31 @@ func TestClassifyToolResultContent_GatewayAuth(t *testing.T) {
 	}
 }
 
+func TestClassifyToolResultContentNestedPATAndScopeVetoWinOverGatewayAuth(t *testing.T) {
+	t.Parallel()
+
+	nestedPAT := ClassifyToolResultContent(map[string]any{
+		"errorCode": "DWS_SERVICE_UNAUTHORIZED",
+		"details": map[string]any{
+			"error_code": "PAT_SCOPE_AUTH_REQUIRED",
+			"data":       map[string]any{"missingScope": "mail:send"},
+		},
+	})
+	var patErr *PATError
+	if !stderrors.As(nestedPAT, &patErr) || !strings.Contains(patErr.RawStderr(), "mail:send") {
+		t.Fatalf("nested PAT did not retain precedence: %T %v", nestedPAT, nestedPAT)
+	}
+
+	scopeVeto := ClassifyToolResultContent(map[string]any{
+		"errorCode": "DWS_SERVICE_UNAUTHORIZED",
+		"details":   map[string]any{"requiredScopes": []any{"mail:send"}},
+	})
+	var typed *Error
+	if !stderrors.As(scopeVeto, &typed) || typed.Reason != "permission_denied" || typed.ServerDiag.ServerErrorCode != "scope_required" {
+		t.Fatalf("requiredScopes did not veto gateway refresh: %#v", scopeVeto)
+	}
+}
+
 func TestClassifyToolResultContent_PATPermission(t *testing.T) {
 	t.Parallel()
 	content := map[string]any{
@@ -333,6 +358,52 @@ func TestClassifyToolResultContent_NoError(t *testing.T) {
 	content := map[string]any{"success": true, "data": "ok"}
 	if err := ClassifyToolResultContent(content); err != nil {
 		t.Fatalf("expected nil error, got %v", err)
+	}
+}
+
+func TestClassifiersDoNotTreatSuccessfulPermissionMetadataAsErrors(t *testing.T) {
+	t.Parallel()
+	for _, content := range []map[string]any{
+		{"success": true, "data": map[string]any{"requiredScopes": []any{"mail:send"}, "status": 403}},
+		{"ok": true, "data": map[string]any{"status": "FORBIDDEN", "errorCode": "PAT_SCOPE_AUTH_REQUIRED"}},
+		{"success": "true", "details": map[string]any{"missingScope": "chat.message:write"}},
+	} {
+		if err := ClassifyToolResultContent(content); err != nil {
+			t.Fatalf("successful payload classified as error: %#v -> %v", content, err)
+		}
+		if patErr := ClassifyPatAuthCheck(content); patErr != nil {
+			t.Fatalf("successful payload classified as PAT: %#v -> %v", content, patErr)
+		}
+	}
+}
+
+func TestPermissionMetadataRequiresAnErrorEnvelope(t *testing.T) {
+	t.Parallel()
+	for _, content := range []map[string]any{
+		{"data": map[string]any{"requiredScopes": []any{"mail:send"}}},
+		{"data": map[string]any{"status": 403}},
+		{"data": map[string]any{"state": "FORBIDDEN"}},
+	} {
+		if err := ClassifyToolResultContent(content); err != nil {
+			t.Fatalf("metadata-only payload classified as error: %#v -> %v", content, err)
+		}
+	}
+}
+
+func TestExactTokenEvidenceMakesMixedPermissionPayloadAnError(t *testing.T) {
+	t.Parallel()
+	for _, content := range []map[string]any{
+		{"code": 40014, "data": map[string]any{"requiredScopes": []any{"mail:send"}}},
+		{"errorCode": "TOKEN_VERIFIED_FAILED", "details": map[string]any{"status": 403}},
+	} {
+		if !IsExplicitErrorEnvelope(content) {
+			t.Fatalf("exact token evidence did not establish error envelope: %#v", content)
+		}
+		err := ClassifyToolResultContent(content)
+		var typed *Error
+		if !stderrors.As(err, &typed) || typed.Reason != "permission_denied" {
+			t.Fatalf("mixed permission payload = %T %#v", err, err)
+		}
 	}
 }
 
@@ -461,8 +532,8 @@ func TestCrossPlatformCoverageClassifyMCPResponseTextPATOrgPolicyDenied(t *testi
 	if !ok {
 		t.Fatalf("parsed.data missing or wrong type: %#v", parsed["data"])
 	}
-	if got, _ := data["message"].(string); got != "business error: code PAT_ORG_POLICY_DENIED" {
-		t.Fatalf("data.message = %q, want original server message", got)
+	if _, ok := data["message"]; ok {
+		t.Fatalf("data.message must not preserve raw server text: %#v", data["message"])
 	}
 	if got, _ := data["hint"].(string); !strings.Contains(got, "组织策略") {
 		t.Fatalf("data.hint = %q, want explicit org policy hint", got)
@@ -664,12 +735,108 @@ func TestCleanPATJSON_WithoutData(t *testing.T) {
 		"extra":   "value",
 	}
 	result := cleanPATJSON(body, "PAT_NO_PERMISSION")
-	if !strings.Contains(result, "extra") {
-		t.Errorf("expected extra field in fallback data, got: %s", result)
+	if strings.Contains(result, "extra") || strings.Contains(result, "value") {
+		t.Errorf("unexpected unallowlisted fallback data in stderr: %s", result)
 	}
 	// Top-level stripped fields should not appear
 	if strings.Contains(result, `"message"`) {
 		t.Errorf("expected message to be stripped from top level, got: %s", result)
+	}
+}
+
+func TestPATErrorRawStderrUsesStrictAllowlistButKeepsPrivateFlowData(t *testing.T) {
+	t.Parallel()
+	const (
+		uid          = "4496576595"
+		accessSecret = "access-secret"
+		clientSecret = "client-secret"
+	)
+	body := map[string]any{
+		"code": "PAT_HIGH_RISK_NO_PERMISSION",
+		"data": map[string]any{
+			"flowId":         "flow-safe",
+			"requiredScopes": []any{"chat.message:write"},
+			"grantOptions":   []any{"session"},
+			"identity":       uid,
+			"requestId":      "accessToken:" + accessSecret,
+			"clientId":       "uid_" + uid,
+			"clientSecret":   clientSecret,
+			"accessToken":    accessSecret,
+			"uid":            uid,
+			"message":        "raw server message for " + uid,
+			"uri":            "https://example.invalid/auth?access_token=" + accessSecret,
+			"nested":         map[string]any{"refreshToken": "refresh-secret"},
+		},
+	}
+	patErr := newPATError(body, "PAT_HIGH_RISK_NO_PERMISSION")
+	if strings.ContainsAny(patErr.RawStderr(), "\r\n") {
+		t.Fatalf("RawStderr must be single-line: %q", patErr.RawStderr())
+	}
+	for _, forbidden := range []string{uid, accessSecret, clientSecret, "refresh-secret", "raw server message", "https://"} {
+		if strings.Contains(patErr.RawStderr(), forbidden) {
+			t.Fatalf("RawStderr leaked %q: %s", forbidden, patErr.RawStderr())
+		}
+	}
+	for _, required := range []string{"flow-safe", "chat.message:write", "grantOptions"} {
+		if !strings.Contains(patErr.RawStderr(), required) {
+			t.Fatalf("RawStderr dropped allowlisted field %q: %s", required, patErr.RawStderr())
+		}
+	}
+	flow, ok := patErr.AuthorizationFlow()
+	if !ok || flow.ClientSecret != clientSecret || flow.FlowID != "flow-safe" {
+		t.Fatalf("private authorization capability = %#v, %v", flow, ok)
+	}
+}
+
+func TestPATErrorAuthorizationFlowIsNarrowAndCanonical(t *testing.T) {
+	t.Parallel()
+	const secret = "client-secret"
+	err := ClassifyToolResultContent(map[string]any{
+		"error_code": "AGENT_CODE_NOT_EXISTS",
+		"data": map[string]any{
+			"flowId":       "flow-1",
+			"clientId":     "client-1",
+			"clientSecret": secret,
+			"desc":         "raw uid 4496576595 access_token=leak",
+			"extra":        map[string]any{"refreshToken": "refresh-secret"},
+			"uri":          "https://evil.example/auth?flowId=flow-1",
+		},
+	})
+	patErr := AsPatAuthCheckError(err)
+	if patErr == nil || patErr.CanonicalCode() != "AGENT_CODE_NOT_EXISTS" {
+		t.Fatalf("classified PAT error = %T %#v", err, err)
+	}
+	flow, ok := patErr.AuthorizationFlow()
+	if !ok || flow.CanonicalCode != "AGENT_CODE_NOT_EXISTS" || flow.FlowID != "flow-1" || flow.ClientID != "client-1" || flow.ClientSecret != secret {
+		t.Fatalf("authorization flow = %#v, %v", flow, ok)
+	}
+	if flow.AuthorizationURI != "" {
+		t.Fatalf("untrusted authorization URI survived: %q", flow.AuthorizationURI)
+	}
+	for _, leaked := range []string{"4496576595", "access_token", "refresh-secret", secret, "evil.example"} {
+		if strings.Contains(patErr.RawStderr(), leaked) {
+			t.Fatalf("public PAT stderr leaked %q: %s", leaked, patErr.RawStderr())
+		}
+	}
+}
+
+func TestGatewayAuthClassificationDropsRawServerPayload(t *testing.T) {
+	t.Parallel()
+	const secret = "access-token-secret"
+	err := ClassifyToolResultContent(map[string]any{
+		"errorCode": "DWS_SERVICE_UNAUTHORIZED",
+		"message":   "expired token=" + secret,
+		"uid":       "4496576595",
+	})
+	if err == nil {
+		t.Fatal("expected gateway auth error")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "4496576595") {
+		t.Fatalf("gateway auth error leaked server payload: %v", err)
+	}
+	var typed *Error
+	if !stderrors.As(err, &typed) || typed.ServerDiag.ServerErrorCode != "DWS_SERVICE_UNAUTHORIZED" {
+		t.Fatalf("safe gateway diagnostic missing: %#v", err)
 	}
 }
 
@@ -889,6 +1056,26 @@ func TestPATAuthorizationURL_NormalizesLegacyHashRoute(t *testing.T) {
 
 	if got := PATAuthorizationURL(rawURI); got != want {
 		t.Fatalf("PATAuthorizationURL() = %q, want %q", got, want)
+	}
+}
+
+func TestTrustedPATAuthorizationURLRejectsUntrustedOrCredentialBearingURLs(t *testing.T) {
+	t.Parallel()
+	valid := "https://open-dev.dingtalk.com/personalAuthorization?flowId=flow&userCode=CODE"
+	if got := TrustedPATAuthorizationURL(valid); got != valid {
+		t.Fatalf("trusted URL = %q, want %q", got, valid)
+	}
+	for _, raw := range []string{
+		"http://open-dev.dingtalk.com/auth",
+		"https://evil.example/auth",
+		"https://dingtalk.com.evil.example/auth",
+		"https://open-dev.dingtalk.com/auth?access_token=secret",
+		"https://user:pass@open-dev.dingtalk.com/auth",
+		"https://open-dev.dingtalk.com:444/auth",
+	} {
+		if got := TrustedPATAuthorizationURL(raw); got != "" {
+			t.Fatalf("untrusted URL %q survived as %q", raw, got)
+		}
 	}
 }
 

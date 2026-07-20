@@ -135,6 +135,9 @@ func TestRecoverAuthErrorVetoesPermissionAndPATMarkers(t *testing.T) {
 		cause error
 	}{
 		{name: "http 403", cause: apperrors.NewAuth("forbidden", apperrors.WithReason("http_403"))},
+		{name: "permission reason", cause: apperrors.NewAuth("permission required", apperrors.WithReason("permission_denied"))},
+		{name: "scope diagnostic", cause: apperrors.NewAuth("scope required", apperrors.WithServerDiag(apperrors.ServerDiagnostics{ServerErrorCode: "scope_required"}))},
+		{name: "403 diagnostic", cause: apperrors.NewAuth("forbidden", apperrors.WithServerDiag(apperrors.ServerDiagnostics{ServerErrorCode: "http_403"}))},
 		{name: "PAT scope", cause: &PatScopeError{ErrorType: "missing_scope", MissingScope: "mail:send"}},
 	}
 	for _, tt := range tests {
@@ -196,11 +199,37 @@ func TestCoreAuthRejectionAcceptsExact40014RepresentationsOnly(t *testing.T) {
 func TestCoreAuthRejectionMixedPermissionSignalVetoesRefresh(t *testing.T) {
 	for _, content := range []map[string]any{
 		{"code": 40014, "details": map[string]any{"errorCode": "PERMISSION_DENIED"}},
+		{"code": 40014, "details": map[string]any{"errorCode": "FORBIDDEN"}},
+		{"code": 40014, "details": map[string]any{"errorCode": "ORG_DOC_TOKEN_MISMATCH"}},
+		{"code": 40014, "details": map[string]any{"code": 403}},
 		{"errorCode": "TOKEN_VERIFIED_FAILED", "data": map[string]any{"httpStatus": 403}},
 		{"code": 40014, "data": map[string]any{"missingScope": "mail:send"}},
+		{"code": 40014, "data": map[string]any{"requiredScope": "mail:send"}},
+		{"code": 40014, "data": map[string]any{"requiredScopes": []any{"mail:send"}}},
 	} {
 		if _, ok := coreAuthRejectionFromContent(content); ok {
 			t.Fatalf("mixed permission payload triggered refresh: %#v", content)
+		}
+	}
+	for _, content := range []map[string]any{
+		{"code": 40014, "data": map[string]any{"missingScopes": []any{}}},
+		{"code": 40014, "data": map[string]any{"requiredScopes": nil}},
+	} {
+		if _, ok := coreAuthRejectionFromContent(content); !ok {
+			t.Fatalf("empty scope metadata incorrectly vetoed token rejection: %#v", content)
+		}
+	}
+}
+
+func TestCoreAuthRejectionExplicitSuccessEnvelopeNeverRefreshes(t *testing.T) {
+	for _, content := range []map[string]any{
+		{"success": true, "code": 40014},
+		{"ok": true, "errorCode": "TOKEN_VERIFIED_FAILED"},
+		{"success": true, "code": 40014, "data": map[string]any{"missingScope": "mail:send"}},
+		{"ok": true, "data": map[string]any{"errorCode": "TOKEN_VERIFIED_FAILED", "requiredScope": "mail:send"}},
+	} {
+		if _, ok := coreAuthRejectionFromContent(content); ok {
+			t.Fatalf("explicit success payload triggered refresh: %#v", content)
 		}
 	}
 }
@@ -236,6 +265,108 @@ func TestCoreAuthRejectionDropsFreeTextAndCredentialURLs(t *testing.T) {
 	}
 	if strings.Contains(out.String(), secret) || strings.Contains(out.String(), uid) || strings.Contains(out.String(), "action_url") {
 		t.Fatalf("credential diagnostics leaked: %s", out.String())
+	}
+}
+
+func TestCoreAuthRejectionDropsCredentialLookingBodyTraceIDs(t *testing.T) {
+	for _, traceID := range []string{
+		"4496576595",
+		"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0NDk2NTc2NTk1In0.signature1",
+		"access-token-secret",
+		"opaque0123456789abcdef0123456789",
+		"trace-4496576595",
+	} {
+		marker, ok := coreAuthRejectionFromContent(map[string]any{
+			"code":     40014,
+			"trace_id": traceID,
+		})
+		if !ok {
+			t.Fatalf("allowlisted rejection with trace %q not recognized", traceID)
+		}
+		var typed *apperrors.Error
+		if !errors.As(marker, &typed) || typed.ServerDiag.TraceID != "" {
+			t.Fatalf("trace %q survived in diagnostics: %#v", traceID, typed)
+		}
+		var out bytes.Buffer
+		if err := apperrors.PrintJSON(&out, marker); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out.String(), traceID) {
+			t.Fatalf("trace %q leaked in output: %s", traceID, out.String())
+		}
+	}
+}
+
+func TestCoreAuthRejectionSanitizesTypedAndCallErrorTraceMetadata(t *testing.T) {
+	const (
+		uid          = "4496576595"
+		jwt          = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0NDk2NTc2NTk1In0.signature1"
+		opaqueSecret = "opaque0123456789abcdef0123456789"
+	)
+
+	tests := []struct {
+		name       string
+		typedTrace string
+		callTrace  string
+		requestID  string
+		wantTrace  string
+	}{
+		{name: "typed uid and header jwt", typedTrace: uid, callTrace: jwt, requestID: opaqueSecret},
+		{name: "typed opaque falls back to safe header", typedTrace: opaqueSecret, callTrace: "trace-safe-1", requestID: uid, wantTrace: "trace-safe-1"},
+		{name: "safe typed trace wins", typedTrace: "trace-safe-1", callTrace: jwt, requestID: uid, wantTrace: "trace-safe-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callErr := &transport.CallError{
+				Stage:      transport.CallStageHTTP,
+				HTTPStatus: http.StatusUnauthorized,
+				TraceID:    tt.callTrace,
+				RequestID:  tt.requestID,
+			}
+			source := apperrors.NewAuth(
+				"remote-controlled auth error "+uid,
+				apperrors.WithReason("http_401"),
+				apperrors.WithRPCData([]byte(`{"trace_id":"`+tt.typedTrace+`","token":"`+opaqueSecret+`"}`)),
+				apperrors.WithServerDiag(apperrors.ServerDiagnostics{
+					TraceID:         tt.typedTrace,
+					TechnicalDetail: "token=" + opaqueSecret,
+					ActionURL:       "https://example.invalid/?token=" + opaqueSecret,
+				}),
+				apperrors.WithCause(callErr),
+			)
+			marker, ok := coreAuthRejectionFromError(source)
+			if !ok {
+				t.Fatal("HTTP 401 rejection not recognized")
+			}
+			var typed *apperrors.Error
+			if !errors.As(marker, &typed) || typed.ServerDiag.TraceID != tt.wantTrace {
+				t.Fatalf("safe marker diagnostics = %#v, want trace %q", typed, tt.wantTrace)
+			}
+			var sourceTyped *apperrors.Error
+			if !errors.As(source, &sourceTyped) || sourceTyped.ServerDiag.TraceID != transport.SanitizeTraceID(tt.typedTrace) {
+				t.Fatalf("source trace was not sanitized: %#v", sourceTyped)
+			}
+			if sourceTyped.Message != "access token was rejected by the server" || len(sourceTyped.RPCData) != 0 ||
+				sourceTyped.ServerDiag.TechnicalDetail != "" || sourceTyped.ServerDiag.ActionURL != "" {
+				t.Fatalf("source auth error was not normalized for recovery capture: %#v", sourceTyped)
+			}
+			if callErr.TraceID != transport.SanitizeTraceID(tt.callTrace) || callErr.RequestID != transport.SanitizeTraceID(tt.requestID) {
+				t.Fatalf("CallError correlation metadata was not sanitized: %#v", callErr)
+			}
+			var out bytes.Buffer
+			if err := apperrors.PrintJSON(&out, marker); err != nil {
+				t.Fatal(err)
+			}
+			printed := out.String()
+			for _, forbidden := range []string{uid, jwt, opaqueSecret, "remote-controlled auth error"} {
+				if strings.Contains(printed, forbidden) {
+					t.Fatalf("HTTP auth error output leaked %q: %s", forbidden, printed)
+				}
+			}
+			if tt.wantTrace != "" && !strings.Contains(printed, tt.wantTrace) {
+				t.Fatalf("safe trace %q missing from output: %s", tt.wantTrace, printed)
+			}
+		})
 	}
 }
 

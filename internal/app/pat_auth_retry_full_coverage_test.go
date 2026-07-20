@@ -134,7 +134,7 @@ func TestCrossPlatformCoveragePATRetryRemainingOrchestrationCoverage(t *testing.
 		return authpkg.StatusApproved, "", nil
 	}
 	patSleep = func(time.Duration) {}
-	if err := runDirectPATAuthCheck(context.Background(), nil, &apperrors.PATError{RawJSON: patRaw("f", "", "")}, func(context.Context) error { return badRetry }, io.Discard); !errors.Is(err, badRetry) {
+	if err := runDirectPATAuthCheck(context.Background(), nil, patFlowError("f", "", "", ""), func(context.Context) error { return badRetry }, io.Discard); !errors.Is(err, badRetry) {
 		t.Fatalf("direct retry callback = %v", err)
 	}
 
@@ -144,15 +144,15 @@ func TestCrossPlatformCoveragePATRetryRemainingOrchestrationCoverage(t *testing.
 	}
 
 	openBrowserFunc = func(string) error { return nil }
-	for _, raw := range []string{
-		`{"code":"x","data":{"flowId":"f","authUrl":"https://auth.test","desc":"authorize"}}`,
-		`{"code":"x","data":{"flowId":"f","authorizationUrl":"https://auth2.test"}}`,
+	for _, uri := range []string{
+		"https://open-dev.dingtalk.com/personalAuthorization?flowId=f&userCode=ONE",
+		"https://open-dev.dingtalk.com/personalAuthorization?flowId=f&userCode=TWO",
 	} {
 		patPollDeviceFlowWithInterval = func(context.Context, string, string, io.Writer, time.Duration) (string, string, error) {
 			return "", "", wantErr
 		}
 		ctx := context.WithValue(context.Background(), patSuppressBrowserOpenKey, true)
-		if _, err := handlePatAuthCheck(ctx, &runtimeRunner{}, executor.Invocation{}, &apperrors.PATError{RawJSON: raw}, t.TempDir(), io.Discard); err == nil {
+		if _, err := handlePatAuthCheck(ctx, &runtimeRunner{}, executor.Invocation{}, patFlowError("f", "", "", uri), t.TempDir(), io.Discard); err == nil {
 			t.Fatal("poll failure returned nil")
 		}
 	}
@@ -162,7 +162,7 @@ func TestCrossPlatformCoveragePATRetryRemainingOrchestrationCoverage(t *testing.
 		patPollDeviceFlowWithInterval = func(context.Context, string, string, io.Writer, time.Duration) (string, string, error) {
 			return status, "", nil
 		}
-		if _, err := handlePatAuthCheck(context.WithValue(context.Background(), patSuppressBrowserOpenKey, true), &runtimeRunner{}, executor.Invocation{}, &apperrors.PATError{RawJSON: patRaw("f", "", "")}, t.TempDir(), io.Discard); err == nil {
+		if _, err := handlePatAuthCheck(context.WithValue(context.Background(), patSuppressBrowserOpenKey, true), &runtimeRunner{}, executor.Invocation{}, patFlowError("f", "", "", ""), t.TempDir(), io.Discard); err == nil {
 			t.Fatalf("status %s returned nil", status)
 		}
 	}
@@ -173,12 +173,12 @@ func TestCrossPlatformCoveragePATRetryRemainingOrchestrationCoverage(t *testing.
 	patSaveAppConfig = func(string, *authpkg.AppConfig) error { return wantErr }
 	patExchangeCodeForToken = func(context.Context, string, string) (*authpkg.TokenData, error) { return nil, wantErr }
 	skip := executor.Invocation{Params: map[string]any{"retryAfterApproval": false}}
-	if _, err := handlePatAuthCheck(context.Background(), &runtimeRunner{}, skip, &apperrors.PATError{RawJSON: patRaw("f", "client", "secret")}, t.TempDir(), io.Discard); !errors.Is(err, wantErr) {
+	if _, err := handlePatAuthCheck(context.Background(), &runtimeRunner{}, skip, patFlowError("f", "client", "secret", ""), t.TempDir(), io.Discard); !errors.Is(err, wantErr) {
 		t.Fatalf("approved app-config save failure = %v", err)
 	}
 
 	patSaveAppConfig = func(string, *authpkg.AppConfig) error { return nil }
-	if _, err := handlePatAuthCheck(context.Background(), &runtimeRunner{}, skip, &apperrors.PATError{RawJSON: patRaw("f", "client", "secret")}, t.TempDir(), io.Discard); !errors.Is(err, wantErr) {
+	if _, err := handlePatAuthCheck(context.Background(), &runtimeRunner{}, skip, patFlowError("f", "client", "secret", ""), t.TempDir(), io.Discard); !errors.Is(err, wantErr) {
 		t.Fatalf("approved token exchange failure = %v", err)
 	}
 	patExchangeCodeForToken = func(context.Context, string, string) (*authpkg.TokenData, error) {
@@ -186,11 +186,11 @@ func TestCrossPlatformCoveragePATRetryRemainingOrchestrationCoverage(t *testing.
 	}
 	patSaveTokenData = func(string, *authpkg.TokenData) error { return wantErr }
 	r := &runtimeRunner{fallback: runnerCoverageFallback{result: executor.Result{Response: map[string]any{"ok": true}}}}
-	if _, err := handlePatAuthCheck(context.Background(), r, executor.Invocation{}, &apperrors.PATError{RawJSON: patRaw("f", "client", "")}, t.TempDir(), io.Discard); !errors.Is(err, wantErr) {
+	if _, err := handlePatAuthCheck(context.Background(), r, executor.Invocation{}, patFlowError("f", "client", "", ""), t.TempDir(), io.Discard); !errors.Is(err, wantErr) {
 		t.Fatalf("approved retry with save failure = %v", err)
 	}
 	patSaveTokenData = func(string, *authpkg.TokenData) error { return nil }
-	if _, err := handlePatAuthCheck(context.Background(), r, executor.Invocation{}, &apperrors.PATError{RawJSON: patRaw("f", "", "")}, t.TempDir(), io.Discard); err != nil {
+	if _, err := handlePatAuthCheck(context.Background(), r, executor.Invocation{}, patFlowError("f", "", "", ""), t.TempDir(), io.Discard); err != nil {
 		t.Fatalf("approved retry = %v", err)
 	}
 
@@ -213,8 +213,14 @@ func TestCrossPlatformCoveragePATRetryRemainingOrchestrationCoverage(t *testing.
 	}
 }
 
-func patRaw(flowID, clientID, secret string) string {
-	return `{"code":"x","data":{"desc":"authorize","flowId":"` + flowID + `","uri":"https://auth.test","clientId":"` + clientID + `","clientSecret":"` + secret + `"}}`
+func patFlowError(flowID, clientID, secret, uri string) *apperrors.PATError {
+	return apperrors.NewPATAuthorizationError(apperrors.PATAuthorizationFlow{
+		CanonicalCode:    "AGENT_CODE_NOT_EXISTS",
+		FlowID:           flowID,
+		AuthorizationURI: uri,
+		ClientID:         clientID,
+		ClientSecret:     secret,
+	})
 }
 
 func TestCrossPlatformCoveragePATRetryRemainingPollAndBrowserCoverage(t *testing.T) {

@@ -14,9 +14,11 @@ import (
 	"testing"
 
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
+	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/plugin"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/transport"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/authretry"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 	"github.com/spf13/cobra"
 )
@@ -114,7 +116,7 @@ func TestCrossPlatformCoverageDocDownloadPreflightCoverage(t *testing.T) {
 		want   string
 	}{
 		{name: "ok", result: map[string]any{"content": map[string]any{"result": map[string]any{"extension": "docx"}}}, hooks: &edition.Hooks{}},
-		{name: "edition classifier", result: map[string]any{"content": map[string]any{}}, hooks: &edition.Hooks{ClassifyToolResult: func(map[string]any) error { return hookErr }}, want: "classified"},
+		{name: "edition classifier", result: map[string]any{"isError": true, "content": map[string]any{}}, hooks: &edition.Hooks{ClassifyToolResult: func(map[string]any) error { return hookErr }}, want: "classified"},
 		{name: "pat", result: map[string]any{"content": map[string]any{"errorCode": "PAT_NO_PERMISSION"}}, hooks: &edition.Hooks{}, want: "PAT_NO_PERMISSION"},
 		{name: "mcp error", result: map[string]any{"isError": true, "content": []map[string]any{{"type": "text", "text": "mcp failed"}}}, hooks: &edition.Hooks{}, want: "mcp failed"},
 		{name: "business error", result: map[string]any{"content": map[string]any{"success": false, "errorMsg": "business failed"}}, hooks: &edition.Hooks{}, want: "business failed"},
@@ -134,6 +136,27 @@ func TestCrossPlatformCoverageDocDownloadPreflightCoverage(t *testing.T) {
 				t.Fatalf("preflight error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+	coreServer := docPreflightServer(t, map[string]any{"content": map[string]any{"code": 40014}})
+	coreClient := transport.NewClient(nil)
+	coreClient.TrustedDomains = []string{"127.0.0.1"}
+	coreErr := runner.preflightDocDownload(context.Background(), coreClient, coreServer.URL, base)
+	coreServer.Close()
+	if _, ok := authretry.As(coreErr); !ok {
+		t.Fatalf("logical token rejection did not return refresh marker: %T %v", coreErr, coreErr)
+	}
+
+	permissionServer := docPreflightServer(t, map[string]any{"content": map[string]any{
+		"code": 40014,
+		"data": map[string]any{"requiredScopes": []any{"drive:read"}},
+	}})
+	permissionClient := transport.NewClient(nil)
+	permissionClient.TrustedDomains = []string{"127.0.0.1"}
+	permissionErr := runner.preflightDocDownload(context.Background(), permissionClient, permissionServer.URL, base)
+	permissionServer.Close()
+	var permissionTyped *apperrors.Error
+	if !errors.As(permissionErr, &permissionTyped) || permissionTyped.Reason != "permission_denied" {
+		t.Fatalf("preflight mixed permission rejection = %T %#v", permissionErr, permissionErr)
 	}
 	server := docPreflightServer(t, map[string]any{})
 	endpoint := server.URL

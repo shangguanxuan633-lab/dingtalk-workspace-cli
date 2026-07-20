@@ -47,13 +47,29 @@ func (r *runtimeRunner) preflightDocDownload(ctx context.Context, tc *transport.
 		return err
 	}
 
-	if classify := edition.Get().ClassifyToolResult; classify != nil {
-		if err := classify(info.Content); err != nil {
+	coreRefresh, coreRejected := coreAuthRejectionFromContent(info.Content)
+	classificationEligible := info.IsError || coreRejected || apperrors.IsExplicitErrorEnvelope(info.Content)
+	editionClassificationEligible := !apperrors.IsExplicitSuccessEnvelope(info.Content)
+	classificationContent := info.Content
+	if info.IsError && !apperrors.IsExplicitErrorEnvelope(info.Content) {
+		classificationContent = make(map[string]any, len(info.Content)+1)
+		for key, value := range info.Content {
+			classificationContent[key] = value
+		}
+		classificationContent["isError"] = true
+	}
+	if classify := edition.Get().ClassifyToolResult; editionClassificationEligible && classify != nil {
+		if err := classify(classificationContent); err != nil {
 			return err
 		}
 	}
-	if patCheck := apperrors.ClassifyPatAuthCheck(info.Content); patCheck != nil {
-		return patCheck
+	if coreRejected {
+		return coreRefresh
+	}
+	if classificationEligible {
+		if classified := apperrors.ClassifyToolResultContent(classificationContent); classified != nil {
+			return classified
+		}
 	}
 	if info.IsError {
 		return apperrors.NewAPI(

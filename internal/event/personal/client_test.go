@@ -315,6 +315,30 @@ func TestClientBusinessErrorRedactsMaliciousCodeMessageAndRequestID(t *testing.T
 	}
 }
 
+func TestSafePersonalRequestIDRejectsIdentityAndCredentialShapes(t *testing.T) {
+	t.Parallel()
+	for _, unsafe := range []string{
+		"4496576595",
+		"uid_4496576595",
+		"access-token-secret",
+		"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0NDk2NTc2NTk1In0.signature1",
+		"opaque0123456789abcdef0123456789",
+	} {
+		if got := safePersonalRequestID(unsafe); got != "" {
+			t.Fatalf("unsafe request ID %q survived as %q", unsafe, got)
+		}
+		err := (&APIError{Code: "UNAUTHORIZED", Details: map[string]any{"request_id": unsafe}}).Error()
+		if strings.Contains(err, unsafe) || strings.Contains(err, "4496576595") {
+			t.Fatalf("APIError leaked request ID %q: %s", unsafe, err)
+		}
+	}
+	for _, safe := range []string{"req-1", "trace-safe-1", "550e8400-e29b-41d4-a716-446655440000"} {
+		if got := safePersonalRequestID(safe); got != safe {
+			t.Fatalf("safe request ID %q became %q", safe, got)
+		}
+	}
+}
+
 func TestClientOmitsCorpHeaderWhenUnknown(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-DWS-Corp-Id"); got != "" {
@@ -475,12 +499,13 @@ func TestClientDebugLogRedactsSensitivePayloadFields(t *testing.T) {
 		"resp-client-secret",
 		"resp-ticket",
 		"Bearer resp-auth",
+		"req-secret",
 	} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("debug log leaked %q: %s", leaked, out)
 		}
 	}
-	for _, want := range []string{"<redacted>", "safe", "ok", "req-secret"} {
+	for _, want := range []string{"<redacted>", "safe", "ok"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("debug log missing %q: %s", want, out)
 		}

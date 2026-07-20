@@ -27,7 +27,13 @@ func TestIsStrictRejectionMatrix(t *testing.T) {
 		{"401 low risk permission", http.StatusUnauthorized, `{"errorCode":"PAT_LOW_RISK_NO_PERMISSION"}`, false},
 		{"401 batch auth", http.StatusUnauthorized, `{"errorCode":"PAT_BATCH_AUTH_PENDING"}`, false},
 		{"401 missing scopes", http.StatusUnauthorized, `{"code":40014,"data":{"missingScopes":["mail:send"]}}`, false},
+		{"401 empty missing scopes", http.StatusUnauthorized, `{"code":40014,"data":{"missingScopes":[]}}`, true},
+		{"401 empty required scopes object", http.StatusUnauthorized, `{"code":40014,"data":{"requiredScopes":{}}}`, true},
+		{"401 nil scope", http.StatusUnauthorized, `{"code":40014,"data":{"missingScope":null}}`, true},
 		{"401 nested 403", http.StatusUnauthorized, `{"code":40014,"details":{"errorCode":403}}`, false},
+		{"200 explicit success code", http.StatusOK, `{"success":true,"code":40014}`, false},
+		{"200 explicit ok token code", http.StatusOK, `{"ok":"true","errorCode":"TOKEN_VERIFIED_FAILED"}`, false},
+		{"200 explicit success permission metadata", http.StatusOK, `{"success":true,"data":{"requiredScopes":["mail:send"],"status":403}}`, false},
 		{"prose", http.StatusBadRequest, `{"message":"please not 40014"}`, false},
 		{"malformed 401", http.StatusUnauthorized, `not-json`, true},
 	}

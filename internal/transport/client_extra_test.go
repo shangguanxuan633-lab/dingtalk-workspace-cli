@@ -3,11 +3,14 @@ package transport
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
+
+	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 )
 
 func TestWithAuth_ClonesCorrectly(t *testing.T) {
@@ -118,6 +121,92 @@ func TestDoWithRetryRedactsGatewayQueryInHeaderDebugLog(t *testing.T) {
 	}
 	if !strings.Contains(out, "key=REDACTED") {
 		t.Fatalf("debug log did not include redacted endpoint, got: %s", out)
+	}
+}
+
+func TestCallJSONRPCSanitizesHeaderTraceBeforeErrorAndLog(t *testing.T) {
+	t.Parallel()
+
+	const unsafeTrace = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0NDk2NTc2NTk1In0.signature1"
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client := NewClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     http.Header{"X-Trace-Id": {unsafeTrace}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":"unauthorized"}`)),
+			Request:    req,
+		}, nil
+	})})
+	client.MaxRetries = 0
+	client.FileLogger = logger
+
+	err := client.callJSONRPC(context.Background(), "https://mcp-gw.dingtalk.com/server/demo", requestEnvelope{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+	}, true, &map[string]any{})
+	if err == nil {
+		t.Fatal("callJSONRPC() error = nil")
+	}
+	var typed *apperrors.Error
+	if !errors.As(err, &typed) || typed.ServerDiag.TraceID != "" {
+		t.Fatalf("typed error diagnostics = %#v", typed)
+	}
+	var callErr *CallError
+	if !errors.As(err, &callErr) || callErr.TraceID != "" {
+		t.Fatalf("call error = %#v", callErr)
+	}
+	if strings.Contains(logBuf.String(), unsafeTrace) || strings.Contains(logBuf.String(), "4496576595") {
+		t.Fatalf("transport log leaked unsafe trace metadata: %s", logBuf.String())
+	}
+}
+
+func TestJSONRPCAuthErrorDropsRawRemoteDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	const (
+		secret = "access-token-secret"
+		uid    = "4496576595"
+	)
+	err := jsonrpcEnvelopeError("tools/call", &RPCError{
+		Code:    http.StatusUnauthorized,
+		Message: "token " + secret + " rejected for uid " + uid,
+		Data: []byte(`{
+			"trace_id":"4496576595",
+			"errorCode":"TOKEN_VERIFIED_FAILED",
+			"technical_detail":"access-token-secret",
+			"friendly_hint":"retry for uid 4496576595",
+			"action_url":"https://example.invalid/?token=access-token-secret"
+		}`),
+	}, "", "trace-safe-1")
+
+	var typed *apperrors.Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("jsonrpcEnvelopeError() = %T", err)
+	}
+	if typed.Category != apperrors.CategoryAuth || len(typed.RPCData) != 0 {
+		t.Fatalf("auth error retained raw RPC data: %#v", typed)
+	}
+	if typed.ServerDiag.TraceID != "trace-safe-1" || typed.ServerDiag.ServerErrorCode != "TOKEN_VERIFIED_FAILED" {
+		t.Fatalf("safe auth diagnostics = %#v", typed.ServerDiag)
+	}
+	if typed.ServerDiag.TechnicalDetail != "" || typed.ServerDiag.FriendlyHint != "" || typed.ServerDiag.ActionURL != "" {
+		t.Fatalf("untrusted auth diagnostics retained: %#v", typed.ServerDiag)
+	}
+
+	var out bytes.Buffer
+	if printErr := apperrors.PrintJSON(&out, err); printErr != nil {
+		t.Fatal(printErr)
+	}
+	printed := out.String()
+	for _, forbidden := range []string{secret, uid, "retry for uid", "example.invalid", "rpc_data"} {
+		if strings.Contains(printed, forbidden) {
+			t.Fatalf("auth error output leaked %q: %s", forbidden, printed)
+		}
+	}
+	if !strings.Contains(printed, "trace-safe-1") || !strings.Contains(printed, "TOKEN_VERIFIED_FAILED") {
+		t.Fatalf("safe correlation metadata missing: %s", printed)
 	}
 }
 

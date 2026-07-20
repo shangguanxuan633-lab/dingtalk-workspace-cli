@@ -85,7 +85,7 @@ type PatScopeError struct {
 }
 
 func (e *PatScopeError) Error() string {
-	return e.OriginalError
+	return "PAT/OAuth scope authorization is required"
 }
 
 // patScopeRegex matches PAT-protocol scope error patterns from the API.
@@ -98,6 +98,8 @@ var patScopeRegex = regexp.MustCompile(`(?i)(missing_scope|insufficient_scope|sc
 // "mail:user_mailbox.message:send") from an error message.
 // Supports multi-segment scopes with multiple colons (resource:sub:action).
 var scopeValueRegex = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9_.]*(?::[a-zA-Z][a-zA-Z0-9_.]*)+)`)
+
+var safePATScopeRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*(?:[.:][a-zA-Z][a-zA-Z0-9_]*)+$`)
 
 // identityValueRegex extracts an identity label from an error message.
 var identityValueRegex = regexp.MustCompile(`(?i)identity["\s:]+([a-zA-Z_]+)`)
@@ -141,6 +143,17 @@ func extractPatScopeError(err error) *PatScopeError {
 	}
 
 	msg := err.Error()
+	existingIdentity := ""
+	existingType := ""
+	if existing, ok := err.(*PatScopeError); ok {
+		if strings.TrimSpace(existing.Message) != "" {
+			msg = existing.Message
+		} else if strings.TrimSpace(existing.OriginalError) != "" {
+			msg = existing.OriginalError
+		}
+		existingIdentity = existing.Identity
+		existingType = existing.ErrorType
+	}
 	scope := ""
 
 	var typed *apperrors.Error
@@ -159,15 +172,22 @@ func extractPatScopeError(err error) *PatScopeError {
 
 	// Try to extract identity from error message.
 	identity := "user"
+	if safe := safePATIdentity(existingIdentity); safe != "" {
+		identity = safe
+	}
 	identityMatch := identityValueRegex.FindStringSubmatch(msg)
 	if len(identityMatch) > 1 {
 		identity = identityMatch[1]
 	}
 
+	errorType := "missing_scope"
+	if safe := safePATErrorType(existingType); safe != "" {
+		errorType = safe
+	}
 	return &PatScopeError{
-		OriginalError: err.Error(),
+		OriginalError: "PAT/OAuth scope authorization is required",
 		Identity:      identity,
-		ErrorType:     "missing_scope",
+		ErrorType:     errorType,
 		Message:       msg,
 		Hint:          fmt.Sprintf("run `dws auth login --scope %q` to authorize the missing scope", scope),
 		MissingScope:  scope,
@@ -179,11 +199,14 @@ func PrintPatAuthError(w io.Writer, scopeErr *PatScopeError) {
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "{\n")
 	fmt.Fprintf(w, "  %s: %s,\n", tui.Bold("\"ok\""), "false")
-	fmt.Fprintf(w, "  %s: %q,\n", tui.Bold("\"identity\""), scopeErr.Identity)
+	identity := safePATIdentity(scopeErr.Identity)
+	errorType := safePATErrorType(scopeErr.ErrorType)
+	missingScope := safePATScope(scopeErr.MissingScope)
+	fmt.Fprintf(w, "  %s: %q,\n", tui.Bold("\"identity\""), identity)
 	fmt.Fprintf(w, "  %s: {\n", tui.Bold("\"error\""))
-	fmt.Fprintf(w, "    %s: %q,\n", tui.Bold("\"type\""), scopeErr.ErrorType)
-	fmt.Fprintf(w, "    %s: %q,\n", tui.Bold("\"message\""), scopeErr.Message)
-	fmt.Fprintf(w, "    %s: %q\n", tui.Bold("\"hint\""), scopeErr.Hint)
+	fmt.Fprintf(w, "    %s: %q,\n", tui.Bold("\"type\""), errorType)
+	fmt.Fprintf(w, "    %s: %q,\n", tui.Bold("\"message\""), "当前操作缺少必要的 PAT/OAuth scope")
+	fmt.Fprintf(w, "    %s: %q\n", tui.Bold("\"hint\""), "完成对应 scope 授权后重试")
 	fmt.Fprintf(w, "  }\n")
 	fmt.Fprintf(w, "}\n")
 	fmt.Fprintln(w)
@@ -193,8 +216,8 @@ func PrintPatAuthError(w io.Writer, scopeErr *PatScopeError) {
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "  %s %s\n", tui.Dim("#"), tui.Dim("运行以下命令完成授权"))
 
-	if scopeErr.MissingScope != "" {
-		fmt.Fprintf(w, "  %s %s\n", tui.Cyan("$"), tui.Cyan(fmt.Sprintf("dws auth login --scope %q", scopeErr.MissingScope)))
+	if missingScope != "" {
+		fmt.Fprintf(w, "  %s %s\n", tui.Cyan("$"), tui.Cyan(fmt.Sprintf("dws auth login --scope %q", missingScope)))
 	} else {
 		fmt.Fprintf(w, "  %s %s\n", tui.Cyan("$"), tui.Cyan("dws auth login"))
 	}
@@ -240,6 +263,11 @@ func enrichPATErrorWithOpenBrowser(raw string, openBrowser bool) string {
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		return raw
 	}
+	if classified := apperrors.ClassifyPatAuthCheck(payload); classified != nil {
+		if err := json.Unmarshal([]byte(classified.RawJSON), &payload); err != nil {
+			return classified.RawJSON
+		}
+	}
 
 	data, ok := payload["data"].(map[string]any)
 	if !ok || data == nil {
@@ -247,8 +275,11 @@ func enrichPATErrorWithOpenBrowser(raw string, openBrowser bool) string {
 		payload["data"] = data
 	}
 	if rawURI := patAuthorizationURIFromData(data); rawURI != "" {
-		authURL := apperrors.PATAuthorizationURL(rawURI)
-		data["uri"] = authURL
+		if authURL := apperrors.TrustedPATAuthorizationURL(rawURI); authURL != "" {
+			data["uri"] = authURL
+		} else {
+			delete(data, "uri")
+		}
 		delete(data, "authUrl")
 		delete(data, "authorizationUrl")
 	}
@@ -331,6 +362,9 @@ func WaitForPatAuthorization(ctx context.Context, configDir string, output io.Wr
 // retryWithPatAuthRetry wraps an invocation that failed with a PAT scope error.
 // It waits for the user to complete authorization and then retries the invocation.
 func retryWithPatAuthRetry(ctx context.Context, runner executor.Runner, invocation executor.Invocation, scopeErr *PatScopeError, configDir string, output io.Writer) (executor.Result, error) {
+	if IsPatRetrying(ctx) {
+		return executor.Result{}, scopeErr
+	}
 	hostOwnedPAT := authpkg.HostOwnsPATFlow()
 	slog.Debug("pat.host_owned_decision",
 		"site", "retryWithPatAuthRetry",
@@ -369,7 +403,7 @@ func retryWithPatAuthRetry(ctx context.Context, runner executor.Runner, invocati
 	fmt.Fprintf(output, "%s %s\n", tui.StateMark("ok"), tui.Bold("授权完成，正在重试..."))
 	fmt.Fprintln(output)
 
-	return runner.Run(ctx, invocation)
+	return runner.Run(context.WithValue(ctx, patRetryingKey, true), invocation)
 }
 
 // ---- handlePatAuthCheck (runner.go entry point) -----------------------------
@@ -408,11 +442,11 @@ func openPATAuthorizationURI(rawURI string) error {
 		// checks for a non-empty PAT URI before invoking this helper.
 		return nil
 	}
-	// The PAT service returns the complete authorization URL. Treat it as an
-	// opaque string unless it is the known legacy DingTalk hash-route variant.
-	// That variant is normalized by the PAT error contract helper before being
-	// printed, opened, or returned in structured output.
-	return openBrowserFunc(apperrors.PATAuthorizationURL(rawURI))
+	trustedURI := apperrors.TrustedPATAuthorizationURL(rawURI)
+	if trustedURI == "" {
+		return stderrors.New("PAT authorization URI rejected by security policy")
+	}
+	return openBrowserFunc(trustedURI)
 }
 
 func printPATPollDebugResponse(output io.Writer, statusCode int, body []byte) {
@@ -504,39 +538,34 @@ func handlePatAuthCheck(
 	configDir string,
 	output io.Writer,
 ) (executor.Result, error) {
-	// Parse authorization details from PATError.RawJSON.
+	// Organization-policy denial is terminal until an administrator changes
+	// the policy. The canonical selector is independent of upstream aliases and
+	// is checked before any private flow state is consumed.
+	if patErr.CanonicalCode() == patOrgPolicyDeniedCode {
+		return executor.Result{}, &apperrors.PATError{
+			RawJSON: enrichPATErrorWithOpenBrowser(patErr.RawJSON, false),
+		}
+	}
+	// Consume the classifier's narrow private flow capability. RawJSON is only
+	// the public, allowlisted stderr contract and is never reparsed for secrets.
+	flow, ok := patErr.AuthorizationFlow()
+	if !ok {
+		return executor.Result{}, patErr
+	}
 	var patData struct {
-		Code string `json:"code"`
 		Data struct {
-			Desc             string `json:"desc"`
 			FlowID           string `json:"flowId"`
 			URI              string `json:"uri"`
-			AuthURL          string `json:"authUrl"`
-			AuthorizationURL string `json:"authorizationUrl"`
 			ClientID         string `json:"clientId"`
 			ClientSecret     string `json:"clientSecret"`
 			PollIntervalSecs int    `json:"pollIntervalSeconds"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal([]byte(patErr.RawJSON), &patData); err != nil {
-		return executor.Result{}, patErr
-	}
-	if patData.Data.URI == "" {
-		patData.Data.URI = patData.Data.AuthURL
-	}
-	if patData.Data.URI == "" {
-		patData.Data.URI = patData.Data.AuthorizationURL
-	}
-	// Organization-policy denial is terminal until an administrator changes
-	// the policy. Return it before reading browser policy, mutating process-wide
-	// credentials, opening a browser, polling, or retrying the invocation even
-	// when a lenient backend also supplies active-flow fields.
-	if patData.Code == patOrgPolicyDeniedCode {
-		return executor.Result{}, &apperrors.PATError{
-			RawJSON: enrichPATErrorWithOpenBrowser(patErr.RawJSON, false),
-		}
-	}
-
+	patData.Data.FlowID = flow.FlowID
+	patData.Data.URI = flow.AuthorizationURI
+	patData.Data.ClientID = flow.ClientID
+	patData.Data.ClientSecret = flow.ClientSecret
+	patData.Data.PollIntervalSecs = flow.PollIntervalSeconds
 	slog.Debug("PAT auth check",
 		"stage", "pat_auth_check",
 		"client_id_present", strings.TrimSpace(patData.Data.ClientID) != "",
@@ -550,30 +579,6 @@ func handlePatAuthCheck(
 		"hostOwned", hostOwnedPAT,
 		"agentCodeEnvSet", os.Getenv(authpkg.AgentCodeEnv) != "",
 	)
-
-	// Inject clientId/clientSecret from PAT response as runtime credentials
-	// so that subsequent device flow auth uses the server-assigned app identity.
-	var appCfg *authpkg.AppConfig
-	if patData.Data.ClientID != "" {
-		if patData.Data.ClientSecret != "" {
-			// When both clientId and clientSecret are provided, use direct mode
-			// (DingTalk API) rather than MCP proxy — the MCP proxy does not hold
-			// the secret for this particular app.
-			authpkg.SetClientID(patData.Data.ClientID)
-			authpkg.SetClientSecret(patData.Data.ClientSecret)
-		} else {
-			// No clientSecret — rely on MCP proxy to manage the secret server-side.
-			authpkg.SetClientIDFromMCP(patData.Data.ClientID)
-		}
-
-		// Persist only after an explicit APPROVED result below. Raw PAT
-		// interceptions (host-owned / json / empty-flow pass-through) must not
-		// rewrite the shared ~/.dws/app.json state for unrelated shells or agents.
-		appCfg = &authpkg.AppConfig{ClientID: patData.Data.ClientID}
-		if patData.Data.ClientSecret != "" {
-			appCfg.ClientSecret = authpkg.PlainSecret(patData.Data.ClientSecret)
-		}
-	}
 
 	// In host-controlled PAT mode (driven solely by DINGTALK_DWS_AGENTCODE),
 	// or when flowId is absent, the CLI returns machine-readable JSON to
@@ -596,17 +601,24 @@ func handlePatAuthCheck(
 		return executor.Result{}, &apperrors.PATError{RawJSON: enrichPATErrorWithOpenBrowser(patErr.RawJSON, openBrowser)}
 	}
 
+	// Hold server-assigned app credentials in request-local memory until the
+	// user explicitly approves this CLI-owned flow. Passive/structured/host
+	// intercepts must never mutate process-wide authentication state.
+	var appCfg *authpkg.AppConfig
+	if patData.Data.ClientID != "" {
+		appCfg = &authpkg.AppConfig{ClientID: patData.Data.ClientID}
+		if patData.Data.ClientSecret != "" {
+			appCfg.ClientSecret = authpkg.PlainSecret(patData.Data.ClientSecret)
+		}
+	}
+
 	fmt.Fprintln(output)
 	fmt.Fprintf(output, "%s %s\n", tui.StateMark("warning"), tui.Bold("需要 PAT 授权"))
-	if patData.Data.Desc != "" {
-		fmt.Fprintf(output, "  %s %s\n", tui.Dim("ℹ"), patData.Data.Desc)
-	}
 	if patData.Data.URI != "" {
-		authURL := apperrors.PATAuthorizationURL(patData.Data.URI)
-		fmt.Fprintf(output, "  %s 授权链接: %s\n", tui.Dim("🔗"), authURL)
+		fmt.Fprintf(output, "  %s 授权链接: %s\n", tui.Dim("🔗"), patData.Data.URI)
 		fmt.Fprintln(output)
 		if openBrowser {
-			if err := openPATAuthorizationURI(authURL); err != nil {
+			if err := openPATAuthorizationURI(patData.Data.URI); err != nil {
 				logPATAuthFailure(slog.LevelWarn, "PAT authorization browser open failed", "pat_browser_open", err)
 			}
 		}
@@ -645,6 +657,12 @@ func handlePatAuthCheck(
 					apperrors.WithHint("检查 DWS_CONFIG_DIR 与凭证存储权限后重试"),
 					apperrors.WithCause(authpkg.NewDiagnosticStageError("pat_app_config_store", err)),
 				)
+			}
+			if patData.Data.ClientSecret != "" {
+				authpkg.SetClientID(patData.Data.ClientID)
+				authpkg.SetClientSecret(patData.Data.ClientSecret)
+			} else {
+				authpkg.SetClientIDFromMCP(patData.Data.ClientID)
 			}
 		}
 
@@ -721,7 +739,7 @@ func handlePatAuthCheck(
 		)
 
 	default:
-		fmt.Fprintf(output, "%s 未知授权状态: %s\n", tui.StateMark("error"), status)
+		fmt.Fprintf(output, "%s 授权状态无法识别，请查看认证诊断日志\n", tui.StateMark("error"))
 		return executor.Result{}, patErr
 	}
 }
@@ -768,12 +786,15 @@ func enrichPATErrorForHostControl(raw string) string {
 // branch so that any env-mode misconfiguration cannot leak a host-owned
 // contract into stderr.
 func buildPATScopeJSON(scopeErr *PatScopeError, includeHostControl bool) string {
+	identity := safePATIdentity(scopeErr.Identity)
+	errorType := safePATErrorType(scopeErr.ErrorType)
+	missingScope := safePATScope(scopeErr.MissingScope)
 	data := map[string]any{
-		"identity":     scopeErr.Identity,
-		"errorType":    scopeErr.ErrorType,
-		"message":      scopeErr.Message,
-		"hint":         scopeErr.Hint,
-		"missingScope": scopeErr.MissingScope,
+		"identity":     identity,
+		"errorType":    errorType,
+		"message":      "当前操作缺少必要的 PAT/OAuth scope",
+		"hint":         "完成对应 scope 授权后重试",
+		"missingScope": missingScope,
 		"openBrowser":  apperrors.PATOpenBrowserValue(),
 	}
 	if includeHostControl {
@@ -790,6 +811,38 @@ func buildPATScopeJSON(scopeErr *PatScopeError, includeHostControl bool) string 
 	// stderr JSON MUST be single-line.
 	b, _ := jsonutil.Marshal(payload)
 	return string(b)
+}
+
+func safePATIdentity(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "user", "app_user", "app", "organization", "org", "robot", "bot":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
+func safePATErrorType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "missing_scope", "insufficient_scope", "scope_required":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
+func safePATScope(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 160 || !safePATScopeRegex.MatchString(value) {
+		return ""
+	}
+	lower := strings.ToLower(value)
+	for _, marker := range []string{"accesstoken", "access_token", "refreshtoken", "refresh_token", "clientsecret", "client_secret", "authorization", "bearer", "idtoken", "id_token"} {
+		if strings.Contains(lower, marker) {
+			return ""
+		}
+	}
+	return value
 }
 
 func marshalSingleLineJSONNoHTMLEscape(v any) ([]byte, error) {

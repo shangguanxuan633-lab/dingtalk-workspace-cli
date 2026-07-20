@@ -101,6 +101,9 @@ func IsStrictRejection(status int, body []byte) bool {
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	decoder.UseNumber()
 	decodeErr := decoder.Decode(&value)
+	if decodeErr == nil && status >= http.StatusOK && status < http.StatusMultipleChoices && explicitSuccess(value) {
+		return false
+	}
 	if decodeErr == nil && permissionVeto(value) {
 		return false
 	}
@@ -111,6 +114,26 @@ func IsStrictRejection(status int, body []byte) bool {
 		return false
 	}
 	return containsExactAuthRejection(value, 0)
+}
+
+func explicitSuccess(value any) bool {
+	body, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, key := range []string{"success", "ok"} {
+		switch current := body[key].(type) {
+		case bool:
+			if current {
+				return true
+			}
+		case string:
+			if strings.EqualFold(strings.TrimSpace(current), "true") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func containsExactAuthRejection(value any, depth int) bool {
@@ -190,7 +213,7 @@ func permissionVetoDepth(value any, depth int) bool {
 			if normalizedKey == "missingscope" || normalizedKey == "missingscopes" ||
 				normalizedKey == "requiredscope" || normalizedKey == "requiredscopes" ||
 				normalizedKey == "permission" || normalizedKey == "permissions" {
-				if strings.TrimSpace(fmt.Sprint(child)) != "" {
+				if hasPermissionEvidence(child) {
 					return true
 				}
 			}
@@ -223,4 +246,21 @@ func permissionVetoDepth(value any, depth int) bool {
 		return string(typed) == "403"
 	}
 	return false
+}
+
+func hasPermissionEvidence(value any) bool {
+	switch current := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(current) != ""
+	case []any:
+		return len(current) > 0
+	case map[string]any:
+		return len(current) > 0
+	case bool:
+		return current
+	default:
+		return strings.TrimSpace(fmt.Sprint(current)) != ""
+	}
 }

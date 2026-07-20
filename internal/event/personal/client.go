@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/authlease"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/transport"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/config"
 )
 
@@ -192,17 +193,7 @@ func safePersonalAPIErrorCode(code string) string {
 }
 
 func safePersonalRequestID(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" || len(value) > 128 {
-		return ""
-	}
-	for _, r := range value {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == ':' || r == '.' {
-			continue
-		}
-		return ""
-	}
-	return value
+	return transport.SanitizeTraceID(value)
 }
 
 func NewClient(baseURL string, identity Identity) *Client {

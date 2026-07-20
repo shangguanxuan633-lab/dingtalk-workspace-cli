@@ -118,6 +118,37 @@ func TestExtractServerDiagnosticsFromMap_Empty(t *testing.T) {
 	}
 }
 
+func TestExtractServerDiagnosticsRejectsCredentialLookingTraceIDs(t *testing.T) {
+	t.Parallel()
+	for _, traceID := range []string{
+		"4496576595",
+		"449-657-6595",
+		"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0NDk2NTc2NTk1In0.signature1",
+		"access-token-secret",
+		"opaque0123456789abcdef0123456789",
+		"trace-4496576595",
+	} {
+		diag := ExtractServerDiagnosticsFromMap(map[string]any{
+			"trace_id": traceID,
+			"code":     "TOKEN_VERIFIED_FAILED",
+		})
+		if diag.TraceID != "" {
+			t.Fatalf("trace %q survived as %q", traceID, diag.TraceID)
+		}
+	}
+
+	for _, traceID := range []string{
+		"trace-safe-1",
+		"abc123",
+		"550e8400-e29b-41d4-a716-446655440000",
+	} {
+		diag := ExtractServerDiagnosticsFromMap(map[string]any{"trace_id": traceID})
+		if diag.TraceID != traceID {
+			t.Fatalf("safe trace %q sanitized to %q", traceID, diag.TraceID)
+		}
+	}
+}
+
 func TestExtractTraceIDFromHeaders(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -132,6 +163,12 @@ func TestExtractTraceIDFromHeaders(t *testing.T) {
 			"X-Trace-Id":          {"first"},
 			"X-Dingtalk-Trace-Id": {"second"},
 		}, "first"},
+		{"numeric uid rejected", http.Header{"X-Trace-Id": {"4496576595"}}, ""},
+		{"jwt rejected", http.Header{"X-Trace-Id": {"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature1"}}, ""},
+		{"unsafe first falls back", http.Header{
+			"X-Trace-Id":   {"access-token-secret"},
+			"X-Request-Id": {"trace-safe-1"},
+		}, "trace-safe-1"},
 		{"empty", http.Header{}, ""},
 	}
 	for _, tt := range tests {

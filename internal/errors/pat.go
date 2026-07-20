@@ -19,10 +19,9 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
-
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/jsonutil"
 )
 
 // hostControlProvider returns the host-owned clawType for the current
@@ -113,6 +112,24 @@ const ExitCodePermission = 4
 // single data.uri field so terminals and hosts do not need to deduplicate links.
 type PATError struct {
 	RawJSON string
+
+	// authorizationFlow is a narrow, typed in-process capability. Keeping only
+	// the fields required by the device flow prevents arbitrary server JSON from
+	// crossing the public/private boundary by convention alone.
+	authorizationFlow    PATAuthorizationFlow
+	authorizationFlowSet bool
+	canonicalCode        string
+}
+
+// PATAuthorizationFlow is the minimal private state required to complete an
+// interactive PAT flow. Callers must never log ClientSecret.
+type PATAuthorizationFlow struct {
+	CanonicalCode       string
+	FlowID              string
+	AuthorizationURI    string
+	ClientID            string
+	ClientSecret        string
+	PollIntervalSeconds int
 }
 
 func (e *PATError) Error() string { return e.RawJSON }
@@ -122,6 +139,109 @@ func (e *PATError) ExitCode() int { return ExitCodePermission }
 
 // RawStderr returns the raw JSON to be written directly to stderr.
 func (e *PATError) RawStderr() string { return e.RawJSON }
+
+// AuthorizationFlow returns the narrow private capability captured by the
+// classifier. It deliberately never reconstructs state from RawJSON.
+func (e *PATError) AuthorizationFlow() (PATAuthorizationFlow, bool) {
+	if e == nil || !e.authorizationFlowSet {
+		return PATAuthorizationFlow{}, false
+	}
+	return e.authorizationFlow, true
+}
+
+// CanonicalCode returns the PAT selector chosen by the classifier. It is
+// intentionally independent of the upstream field alias (code, errorCode, or
+// error_code), so policy denials cannot accidentally enter an active flow.
+func (e *PATError) CanonicalCode() string {
+	if e == nil {
+		return ""
+	}
+	if e.canonicalCode != "" {
+		return e.canonicalCode
+	}
+	var envelope struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(e.RawJSON), &envelope) != nil {
+		return ""
+	}
+	return strings.TrimSpace(envelope.Code)
+}
+
+func newPATError(body map[string]any, code string) *PATError {
+	return &PATError{
+		RawJSON:              cleanPATJSON(body, code),
+		authorizationFlow:    extractPATAuthorizationFlow(body, code),
+		authorizationFlowSet: true,
+		canonicalCode:        code,
+	}
+}
+
+// NewPATAuthorizationError constructs a PAT error without accepting arbitrary
+// raw server JSON. It is primarily useful to internal adapters and tests.
+func NewPATAuthorizationError(flow PATAuthorizationFlow) *PATError {
+	data := map[string]any{}
+	if flow.FlowID != "" {
+		data["flowId"] = flow.FlowID
+	}
+	if flow.AuthorizationURI != "" {
+		data["uri"] = flow.AuthorizationURI
+	}
+	if flow.ClientID != "" {
+		data["clientId"] = flow.ClientID
+	}
+	if flow.ClientSecret != "" {
+		data["clientSecret"] = flow.ClientSecret
+	}
+	if flow.PollIntervalSeconds != 0 {
+		data["pollIntervalSeconds"] = flow.PollIntervalSeconds
+	}
+	body := map[string]any{"code": flow.CanonicalCode, "data": data}
+	return newPATError(body, flow.CanonicalCode)
+}
+
+func extractPATAuthorizationFlow(body map[string]any, code string) PATAuthorizationFlow {
+	data := body
+	if nested, ok := body["data"].(map[string]any); ok {
+		data = nested
+	}
+	uri := ""
+	for _, key := range []string{"uri", "authUrl", "authorizationUrl"} {
+		if value, ok := data[key].(string); ok && strings.TrimSpace(value) != "" {
+			uri = TrustedPATAuthorizationURL(value)
+			break
+		}
+	}
+	interval := 0
+	if sanitized := sanitizePATPollInterval(data["pollIntervalSeconds"]); sanitized != nil {
+		interval, _ = sanitized.(int)
+	}
+	return PATAuthorizationFlow{
+		CanonicalCode:       strings.TrimSpace(code),
+		FlowID:              boundedPrivatePATString(data["flowId"], 512),
+		AuthorizationURI:    uri,
+		ClientID:            boundedPrivatePATString(data["clientId"], 512),
+		ClientSecret:        boundedPrivatePATString(data["clientSecret"], 4096),
+		PollIntervalSeconds: interval,
+	}
+}
+
+func boundedPrivatePATString(value any, maxLength int) string {
+	raw, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > maxLength {
+		return ""
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+	return raw
+}
 
 // patNoPermissionCodes are PAT error codes that should be passed through
 // as transparent PATError without CLI-level wrapping. Some of these are
@@ -195,6 +315,47 @@ func getPATErrorCode(body map[string]any) (string, bool) {
 	return lookupCodeIn(body, patAuthRequiredCodes)
 }
 
+func findPATErrorBody(value any, depth int) (string, map[string]any, bool) {
+	// A terminal policy/permission denial must always win over a grantable
+	// authorization flow, even when the two signals live in different nested
+	// branches. A single recursive map walk is not sufficient because Go map
+	// iteration order is intentionally random and could otherwise make the
+	// selected PAT action nondeterministic.
+	if code, source, ok := findPATErrorBodyIn(value, depth, patNoPermissionCodes); ok {
+		return code, source, true
+	}
+	return findPATErrorBodyIn(value, depth, patAuthRequiredCodes)
+}
+
+func findPATErrorBodyIn(value any, depth int, accept map[string]bool) (string, map[string]any, bool) {
+	if depth > 8 {
+		return "", nil, false
+	}
+	switch current := value.(type) {
+	case map[string]any:
+		if code, ok := lookupCodeIn(current, accept); ok {
+			return code, current, true
+		}
+		keys := make([]string, 0, len(current))
+		for key := range current {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if code, source, ok := findPATErrorBodyIn(current[key], depth+1, accept); ok {
+				return code, source, true
+			}
+		}
+	case []any:
+		for _, child := range current {
+			if code, source, ok := findPATErrorBodyIn(child, depth+1, accept); ok {
+				return code, source, true
+			}
+		}
+	}
+	return "", nil, false
+}
+
 // ---- DWS gateway auth errors (shared between PAT & general auth) ----------
 
 // dwsGatewayErrors is the set of DWS gateway-level auth error codes.
@@ -236,6 +397,119 @@ func isBusinessError(body map[string]any) bool {
 	return false
 }
 
+// IsExplicitSuccessEnvelope reports whether the upstream explicitly marked a
+// payload successful. Success wins over nested permission-looking metadata:
+// business responses may legitimately contain status enums or required-scope
+// descriptions that are not authentication failures.
+func IsExplicitSuccessEnvelope(body map[string]any) bool {
+	for _, key := range []string{"success", "ok"} {
+		switch value := body[key].(type) {
+		case bool:
+			if value {
+				return true
+			}
+		case string:
+			if strings.EqualFold(strings.TrimSpace(value), "true") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// IsExplicitErrorEnvelope requires positive evidence that a payload represents
+// an error before recursively interpreting generic permission fields.
+func IsExplicitErrorEnvelope(body map[string]any) bool {
+	if len(body) == 0 || IsExplicitSuccessEnvelope(body) {
+		return false
+	}
+	for _, key := range []string{"success", "ok"} {
+		switch value := body[key].(type) {
+		case bool:
+			if !value {
+				return true
+			}
+		case string:
+			if strings.EqualFold(strings.TrimSpace(value), "false") {
+				return true
+			}
+		}
+	}
+	if value, ok := body["isError"].(bool); ok && value {
+		return true
+	}
+	if errorValue, ok := body["error"]; ok && hasPATData(errorValue) {
+		return true
+	}
+	if _, _, ok := findPATErrorBody(body, 0); ok {
+		return true
+	}
+	if _, ok := getDWSGatewayErrorCode(body); ok {
+		return true
+	}
+	if containsExactTokenErrorEvidence(body, 0) {
+		return true
+	}
+	for _, key := range errCodeKeys {
+		value, exists := body[key]
+		if !exists {
+			continue
+		}
+		if permissionStatusForbidden(value) {
+			return true
+		}
+		if code, ok := value.(string); ok && isPermissionVetoCode(code) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsExactTokenErrorEvidence(value any, depth int) bool {
+	if depth > 8 {
+		return false
+	}
+	switch current := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"code", "errorCode", "error_code", "errCode", "errcode", "serverErrorCode", "server_error_code"} {
+			if exactTokenErrorValue(current[key]) {
+				return true
+			}
+		}
+		for _, key := range []string{"error", "data", "result", "details", "content"} {
+			if child, ok := current[key]; ok && containsExactTokenErrorEvidence(child, depth+1) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range current {
+			if containsExactTokenErrorEvidence(child, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func exactTokenErrorValue(value any) bool {
+	switch current := value.(type) {
+	case string:
+		switch strings.ToUpper(strings.TrimSpace(current)) {
+		case "40014", "TOKEN_VERIFIED_FAILED", "USER_TOKEN_ILLEGAL", "ACCESS_TOKEN_EXPIRED", "DWS_SERVICE_UNAUTHORIZED":
+			return true
+		}
+	case int:
+		return current == 40014
+	case int64:
+		return current == 40014
+	case float64:
+		return current == 40014
+	case json.Number:
+		return string(current) == "40014"
+	}
+	return false
+}
+
 // ---- Classification functions -----------------------------------------------
 
 // ClassifyToolResultContent checks a raw MCP tool result content map for
@@ -243,17 +517,24 @@ func isBusinessError(body map[string]any) bool {
 // for use as the edition.Hooks.ClassifyToolResult callback so the framework's
 // runner returns a typed error before its generic business-error classification.
 //
-// Check order: DWS gateway auth > PAT permission.
+// Check order: PAT/permission veto > DWS gateway auth. Permission evidence
+// must win when a mixed response also carries a token-rejection code.
 func ClassifyToolResultContent(content map[string]any) error {
-	if _, ok := getDWSGatewayErrorCode(content); ok {
-		raw, _ := jsonutil.Marshal(content)
-		return NewAuth(string(raw),
+	if IsExplicitSuccessEnvelope(content) {
+		return nil
+	}
+	if code, source, ok := findPATErrorBody(content, 0); ok {
+		return newPATError(source, code)
+	}
+	if IsExplicitErrorEnvelope(content) && hasAuthPermissionVeto(content, 0) {
+		return permissionVetoError(content)
+	}
+	if code, ok := getDWSGatewayErrorCode(content); ok {
+		return NewAuth("DWS gateway rejected the current login state",
 			WithReason("gateway_auth_expired"),
 			WithHint(authExpiredHint()),
+			WithServerDiag(ServerDiagnostics{ServerErrorCode: code}),
 		)
-	}
-	if code, ok := getPATErrorCode(content); ok {
-		return &PATError{RawJSON: cleanPATJSON(content, code)}
 	}
 	return nil
 }
@@ -262,17 +543,27 @@ func ClassifyToolResultContent(content map[string]any) error {
 // Returns a typed error for known gateway auth failures, PAT interceptions,
 // and business-level errors embedded in HTTP-200 JSON bodies.
 //
-// Check order: DWS gateway > PAT permission > generic business error.
+// Check order: PAT/permission veto > DWS gateway > generic business error.
 func ClassifyMCPResponseText(text string) error {
 	var body map[string]any
 	if json.Unmarshal([]byte(text), &body) != nil {
 		return nil
 	}
+	if IsExplicitSuccessEnvelope(body) {
+		return nil
+	}
 
-	if _, ok := getDWSGatewayErrorCode(body); ok {
-		return NewAuth(text,
+	if code, source, ok := findPATErrorBody(body, 0); ok {
+		return newPATError(source, code)
+	}
+	if IsExplicitErrorEnvelope(body) && hasAuthPermissionVeto(body, 0) {
+		return permissionVetoError(body)
+	}
+	if code, ok := getDWSGatewayErrorCode(body); ok {
+		return NewAuth("DWS gateway rejected the current login state",
 			WithReason("gateway_auth_expired"),
 			WithHint(authExpiredHint()),
+			WithServerDiag(ServerDiagnostics{ServerErrorCode: code}),
 		)
 	}
 
@@ -282,10 +573,6 @@ func ClassifyMCPResponseText(text string) error {
 			WithHint(notLoggedInHint()),
 			WithActions("dws auth login"),
 		)
-	}
-
-	if code, ok := getPATErrorCode(body); ok {
-		return &PATError{RawJSON: cleanPATJSON(body, code)}
 	}
 
 	if isBusinessError(body) {
@@ -306,6 +593,120 @@ func authExpiredHint() string {
 
 func notLoggedInHint() string {
 	return "请先登录：dws auth login"
+}
+
+func permissionVetoError(payload any) error {
+	code := permissionDiagnosticCode(payload, 0)
+	opts := []Option{
+		WithReason("permission_denied"),
+		WithHint("确认当前组织，并授予操作所需的权限或 scope 后重试"),
+	}
+	if code != "" {
+		opts = append(opts, WithServerDiag(ServerDiagnostics{ServerErrorCode: code}))
+	}
+	return NewAuth("Permission or scope authorization is required", opts...)
+}
+
+func hasAuthPermissionVeto(value any, depth int) bool {
+	return permissionDiagnosticCode(value, depth) != ""
+}
+
+func permissionDiagnosticCode(value any, depth int) string {
+	if depth > 8 {
+		return ""
+	}
+	switch current := value.(type) {
+	case map[string]any:
+		for key, child := range current {
+			compactKey := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
+			switch compactKey {
+			case "httpstatus", "status", "statuscode", "rpcstatus":
+				if permissionStatusForbidden(child) {
+					return "http_403"
+				}
+			case "code", "errorcode", "errcode", "servererrorcode":
+				if permissionStatusForbidden(child) {
+					return "http_403"
+				}
+				if code, ok := child.(string); ok && isPermissionVetoCode(code) {
+					return strings.ToUpper(strings.TrimSpace(code))
+				}
+			case "missingscope", "missingscopes", "requiredscope", "requiredscopes":
+				if hasPermissionScopeEvidence(child) {
+					return "scope_required"
+				}
+			}
+			if code := permissionDiagnosticCode(child, depth+1); code != "" {
+				return code
+			}
+		}
+	case []any:
+		for _, child := range current {
+			if code := permissionDiagnosticCode(child, depth+1); code != "" {
+				return code
+			}
+		}
+	case string:
+		if isPermissionVetoCode(current) {
+			return strings.ToUpper(strings.TrimSpace(current))
+		}
+	}
+	return ""
+}
+
+func hasPermissionScopeEvidence(value any) bool {
+	switch current := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(current) != ""
+	case []any:
+		return len(current) > 0
+	case []string:
+		return len(current) > 0
+	case map[string]any:
+		return len(current) > 0
+	case bool:
+		return current
+	default:
+		return strings.TrimSpace(fmt.Sprint(current)) != ""
+	}
+}
+
+func permissionStatusForbidden(value any) bool {
+	switch current := value.(type) {
+	case int:
+		return current == 403
+	case int32:
+		return current == 403
+	case int64:
+		return current == 403
+	case uint:
+		return current == 403
+	case uint32:
+		return current == 403
+	case uint64:
+		return current == 403
+	case float64:
+		return current == 403
+	case string:
+		return strings.TrimSpace(current) == "403"
+	default:
+		return false
+	}
+}
+
+func isPermissionVetoCode(code string) bool {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if patNoPermissionCodes[code] || patAuthRequiredCodes[code] {
+		return true
+	}
+	switch code {
+	case "CLI_ORG_NOT_AUTHORIZED", "AUTH_PERMISSION_DENIED", "PERMISSION_DENIED", "FORBIDDEN", "ORG_DOC_TOKEN_MISMATCH":
+		return true
+	default:
+		return false
+	}
 }
 
 func suggestForBusinessErrorText(body map[string]any) string {
@@ -333,9 +734,29 @@ func suggestForBusinessErrorText(body map[string]any) string {
 
 // ---- PAT JSON helpers ------------------------------------------------------
 
-var patTopLevelStrip = map[string]bool{
-	"success": true, "code": true, "errorCode": true, "error_code": true,
-	"message": true, "error": true, "trace_id": true, "class": true,
+var patAllowedDataKeys = map[string]bool{
+	"agentCode":           true,
+	"authRequestId":       true,
+	"authUrl":             true,
+	"authorizationUrl":    true,
+	"clientId":            true,
+	"errorType":           true,
+	"flowId":              true,
+	"grantOptions":        true,
+	"grantType":           true,
+	"grantTypes":          true,
+	"missingScope":        true,
+	"missingScopes":       true,
+	"policy":              true,
+	"pollIntervalSeconds": true,
+	"productCode":         true,
+	"requestId":           true,
+	"requiredScope":       true,
+	"requiredScopes":      true,
+	"riskLevel":           true,
+	"scope":               true,
+	"scopes":              true,
+	"uri":                 true,
 }
 
 // ApplyHostMutations writes the two stderr-JSON fields the host integration
@@ -355,8 +776,11 @@ var patTopLevelStrip = map[string]bool{
 func ApplyHostMutations(out map[string]any) {
 	data := ensurePATData(out)
 	if rawURI := patAuthorizationURIFromData(data); rawURI != "" {
-		authURL := PATAuthorizationURL(rawURI)
-		data["uri"] = authURL
+		if authURL := TrustedPATAuthorizationURL(rawURI); authURL != "" {
+			data["uri"] = authURL
+		} else {
+			delete(data, "uri")
+		}
 		delete(data, "authUrl")
 		delete(data, "authorizationUrl")
 	}
@@ -423,6 +847,14 @@ func PATAuthorizationURL(rawURI string) string {
 	return next.String()
 }
 
+// TrustedPATAuthorizationURL validates a PAT authorization URL for display or
+// browser opening. Only credential-free HTTPS DingTalk URLs are accepted.
+func TrustedPATAuthorizationURL(rawURI string) string {
+	value := sanitizePATAuthorizationURI(rawURI)
+	trusted, _ := value.(string)
+	return trusted
+}
+
 func patAuthorizationRouteQuery(parsed *url.URL) url.Values {
 	candidates := []string{
 		parsed.Fragment,
@@ -465,25 +897,16 @@ func cleanPATJSON(body map[string]any, code string) string {
 		"success": false,
 		"code":    code,
 	}
+	source := any(body)
 	if data, ok := body["data"]; ok {
-		// ApplyHostMutations canonicalizes PAT URL aliases into one data.uri
-		// before JSON encoding, while stripClassFields keeps the rest of the
-		// service payload intact.
-		out["data"] = stripClassFields(data)
-	} else {
-		fallback := map[string]any{}
-		for k, v := range body {
-			if !patTopLevelStrip[k] {
-				fallback[k] = v
-			}
-		}
-		if len(fallback) > 0 {
-			out["data"] = stripClassFields(fallback)
-		}
+		source = data
+	}
+	if data := sanitizePATRoot(source); len(data) > 0 {
+		out["data"] = data
 	}
 	ApplyHostMutations(out)
 	if code == "PAT_ORG_POLICY_DENIED" {
-		applyOrgPolicyDeniedHint(out, body)
+		applyOrgPolicyDeniedHint(out)
 	}
 
 	// stderr JSON MUST be a single-line, directly json.Unmarshal-able
@@ -496,40 +919,194 @@ func cleanPATJSON(body map[string]any, code string) string {
 	return string(b)
 }
 
-func applyOrgPolicyDeniedHint(out map[string]any, body map[string]any) {
+func applyOrgPolicyDeniedHint(out map[string]any) {
 	data := ensurePATData(out)
-	if stringValue(data, "policy") == "" {
+	if _, ok := data["policy"]; !ok {
 		data["policy"] = "OPEN_SOURCE_ORG_SCOPE_FORBIDDEN"
 	}
-	if stringValue(data, "message") == "" {
-		if msg := stringValue(body, "message", "errorMsg", "error"); msg != "" {
-			data["message"] = msg
-		}
-	}
-	if stringValue(data, "hint") == "" {
-		if desc := stringValue(data, "policyDesc", "message"); desc != "" {
-			data["hint"] = "组织策略已禁止当前工具所需的开源数据权限：" + desc +
-				"。请联系组织管理员在 DWS/PAT 权限管控中放开对应 scope 后重试。"
-		} else {
-			data["hint"] = "组织策略已禁止当前工具所需的开源数据权限，请联系组织管理员在 DWS/PAT 权限管控中放开对应 scope 后重试。"
-		}
-	}
+	data["hint"] = "组织策略已禁止当前工具所需的开源数据权限，请联系组织管理员在 DWS/PAT 权限管控中放开对应 scope 后重试。"
 	data["action"] = "contact_org_admin"
 	data["openBrowser"] = false
 	data["retryable"] = false
 }
 
-func stringValue(body map[string]any, keys ...string) string {
-	for _, key := range keys {
-		value, ok := body[key].(string)
-		if !ok {
+func sanitizePATRoot(value any) map[string]any {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return sanitizePATObject(object)
+}
+
+// sanitizePATObject is allowlist-only. The PAT payload is written directly to
+// stderr and parsed by host applications, so unknown fields must never become
+// an implicit credential, identity, free-text, or signed-URL channel.
+func sanitizePATObject(object map[string]any) map[string]any {
+	clean := make(map[string]any)
+	for key, raw := range object {
+		if !patAllowedDataKeys[key] {
 			continue
 		}
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
+		var value any
+		switch key {
+		case "uri", "authUrl", "authorizationUrl":
+			value = sanitizePATAuthorizationURI(raw)
+		case "pollIntervalSeconds":
+			value = sanitizePATPollInterval(raw)
+		default:
+			value = sanitizePATValue(raw)
+		}
+		if hasPATData(value) {
+			clean[key] = value
 		}
 	}
-	return ""
+	return clean
+}
+
+func sanitizePATValue(value any) any {
+	switch current := value.(type) {
+	case map[string]any:
+		return sanitizePATObject(current)
+	case []any:
+		clean := make([]any, 0, len(current))
+		for _, item := range current {
+			if sanitized := sanitizePATValue(item); hasPATData(sanitized) {
+				clean = append(clean, sanitized)
+			}
+		}
+		return clean
+	case string:
+		return sanitizePATIdentifier(current)
+	case bool:
+		return current
+	default:
+		return nil
+	}
+}
+
+func sanitizePATIdentifier(value string) any {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 256 {
+		return nil
+	}
+	hasNonDigit := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' || r == ':' {
+			if r < '0' || r > '9' {
+				hasNonDigit = true
+			}
+			continue
+		}
+		return nil
+	}
+	if !hasNonDigit {
+		return nil
+	}
+	lower := strings.ToLower(value)
+	for _, sensitive := range []string{
+		"access_token", "refreshtoken", "refresh_token", "authorization",
+		"clientsecret", "client_secret", "userid", "user_id", "uid:",
+		"corpid", "corp_id", "bearer:",
+	} {
+		if strings.Contains(lower, sensitive) {
+			return nil
+		}
+	}
+	compact := strings.NewReplacer("_", "", "-", "", ".", "", ":", "").Replace(lower)
+	for _, sensitive := range []string{
+		"accesstoken", "refreshtoken", "clientsecret", "authorization",
+		"idtoken", "bearer", "userid", "corpid",
+	} {
+		if strings.Contains(compact, sensitive) {
+			return nil
+		}
+	}
+	if strings.HasPrefix(compact, "uid") && len(compact) > len("uid") {
+		return nil
+	}
+	if len(value) > 40 && strings.Count(value, ".") == 2 {
+		return nil
+	}
+	return value
+}
+
+func sanitizePATPollInterval(value any) any {
+	var interval int
+	switch current := value.(type) {
+	case int:
+		interval = current
+	case int64:
+		interval = int(current)
+	case float64:
+		if current != float64(int(current)) {
+			return nil
+		}
+		interval = int(current)
+	default:
+		return nil
+	}
+	if interval < 1 || interval > 60 {
+		return nil
+	}
+	return interval
+}
+
+func sanitizePATAuthorizationURI(value any) any {
+	raw, ok := value.(string)
+	if !ok {
+		return nil
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 4096 || containsSensitivePATURLMaterial(raw) {
+		return nil
+	}
+	normalized := PATAuthorizationURL(raw)
+	parsed, err := url.Parse(normalized)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.User != nil {
+		return nil
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	trusted := host == "dingtalk.com" || strings.HasSuffix(host, ".dingtalk.com") ||
+		host == "dingtalkapps.com" || strings.HasSuffix(host, ".dingtalkapps.com")
+	if !trusted || (parsed.Port() != "" && parsed.Port() != "443") {
+		return nil
+	}
+	if containsSensitivePATURLMaterial(normalized) {
+		return nil
+	}
+	return normalized
+}
+
+func containsSensitivePATURLMaterial(raw string) bool {
+	decoded := strings.ToLower(raw)
+	for range 3 {
+		for _, marker := range []string{
+			"access_token=", "refresh_token=", "client_secret=", "clientsecret=",
+			"id_token=", "authorization=", "bearer%20", "token=",
+		} {
+			if strings.Contains(decoded, marker) {
+				return true
+			}
+		}
+		next, err := url.QueryUnescape(decoded)
+		if err != nil || next == decoded {
+			break
+		}
+		decoded = next
+	}
+	return false
+}
+
+func hasPATData(value any) bool {
+	switch current := value.(type) {
+	case map[string]any:
+		return len(current) > 0
+	case []any:
+		return len(current) > 0
+	default:
+		return current != nil
+	}
 }
 
 func marshalSingleLineJSONNoHTMLEscape(v any) ([]byte, error) {
@@ -554,8 +1131,11 @@ func marshalSingleLineJSONNoHTMLEscape(v any) ([]byte, error) {
 // Content map for PAT permission codes and auth-required codes. Returns a
 // non-nil *PATError when the content carries a recognised PAT/auth error.
 func ClassifyPatAuthCheck(content map[string]any) *PATError {
-	if code, ok := getPATErrorCode(content); ok {
-		return &PATError{RawJSON: cleanPATJSON(content, code)}
+	if IsExplicitSuccessEnvelope(content) {
+		return nil
+	}
+	if code, source, ok := findPATErrorBody(content, 0); ok {
+		return newPATError(source, code)
 	}
 	return nil
 }

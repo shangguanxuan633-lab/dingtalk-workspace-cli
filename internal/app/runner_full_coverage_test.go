@@ -280,6 +280,40 @@ func TestCrossPlatformCoverageRunnerRemainingExecutionCoverage(t *testing.T) {
 	}
 }
 
+func TestRunnerSkipsAuthClassifiersForExplicitSuccessfulMetadata(t *testing.T) {
+	oldEdition := edition.Get()
+	oldCall := runnerCallTool
+	t.Cleanup(func() {
+		edition.Override(oldEdition)
+		runnerCallTool = oldCall
+	})
+
+	classifierCalls := 0
+	edition.Override(&edition.Hooks{ClassifyToolResult: func(map[string]any) error {
+		classifierCalls++
+		return errors.New("successful payload must not be classified")
+	}})
+	runner := &runtimeRunner{
+		transport:   transport.NewClient(nil),
+		globalFlags: &GlobalFlags{Token: "explicit-test-token"},
+	}
+	invocation := executor.Invocation{CanonicalProduct: "test", Tool: "metadata"}
+	for _, content := range []map[string]any{
+		{"success": true, "data": map[string]any{"requiredScopes": []any{"mail:send"}, "status": 403}},
+		{"ok": true, "data": map[string]any{"state": "FORBIDDEN", "errorCode": "PAT_SCOPE_AUTH_REQUIRED"}},
+	} {
+		runnerCallTool = func(*transport.Client, context.Context, string, string, map[string]any) (transport.ToolCallResult, error) {
+			return transport.ToolCallResult{Content: content}, nil
+		}
+		if _, err := runner.executeInvocation(context.Background(), "https://example.test", invocation); err != nil {
+			t.Fatalf("successful metadata payload failed: %#v -> %v", content, err)
+		}
+	}
+	if classifierCalls != 0 {
+		t.Fatalf("edition classifier ran %d time(s) for explicit success", classifierCalls)
+	}
+}
+
 func TestCrossPlatformCoverageRunnerRemainingStdioAuthAndHeadersCoverage(t *testing.T) {
 	oldStdioInit := runnerStdioEnsureInitialized
 	oldStdioCall := runnerStdioCallTool

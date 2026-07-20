@@ -444,7 +444,7 @@ func (c *Client) callJSONRPC(ctx context.Context, endpoint string, request reque
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		logging.LogResponseBody(c.FileLogger, request.Method, c.ExecutionId, resp.StatusCode, data, headerTraceID)
-		return httpStatusError(request.Method, endpoint, resp.StatusCode, snapshotPath, headerTraceID)
+		return httpStatusError(request.Method, endpoint, resp.StatusCode, snapshotPath, headerTraceID, extractAuthPolicyEvidence(data))
 	}
 
 	if !expectResponse {
@@ -881,14 +881,29 @@ func sanitizeBearerToken(raw string) string {
 	return token
 }
 
-func httpStatusError(method, endpoint string, statusCode int, snapshotPath, headerTraceID string) error {
+func httpStatusError(method, endpoint string, statusCode int, snapshotPath, headerTraceID string, evidence ...authPolicyEvidence) error {
+	headerTraceID = SanitizeTraceID(headerTraceID)
+	policy := authPolicyEvidence{}
+	if len(evidence) > 0 {
+		policy = evidence[0]
+		policy.code = sanitizeAuthServerErrorCode(policy.code)
+	}
 	message := fmt.Sprintf("request to %s returned HTTP %d", RedactURL(endpoint), statusCode)
+	reason := fmt.Sprintf("http_%d", statusCode)
+	diag := apperrors.ServerDiagnostics{TraceID: headerTraceID}
+	if policy.code != "" {
+		diag.ServerErrorCode = policy.code
+	}
+	if statusCode == http.StatusUnauthorized && policy.veto {
+		message = "request was denied by upstream authorization policy"
+		reason = "permission_denied"
+	}
 	opts := []apperrors.Option{
 		apperrors.WithOperation(method),
-		apperrors.WithReason(fmt.Sprintf("http_%d", statusCode)),
+		apperrors.WithReason(reason),
 		apperrors.WithRetryable(retryable(statusCode)),
 		apperrors.WithSnapshot(snapshotPath),
-		apperrors.WithTraceID(headerTraceID),
+		apperrors.WithServerDiag(diag),
 		apperrors.WithCause(&CallError{
 			Stage:      CallStageHTTP,
 			HTTPStatus: statusCode,
@@ -899,6 +914,13 @@ func httpStatusError(method, endpoint string, statusCode int, snapshotPath, head
 
 	switch {
 	case statusCode == http.StatusUnauthorized:
+		if policy.veto {
+			opts = append(opts,
+				apperrors.WithHint(i18n.T("权限或 scope 授权不足；确认当前组织并完成所需授权后重试。")),
+				apperrors.WithActions(authActions(snapshotPath)...),
+			)
+			return apperrors.NewAuth(message, opts...)
+		}
 		opts = append(opts,
 			apperrors.WithHint(i18n.T("认证失败；请检查登录状态或产品 URL 覆盖。")),
 			apperrors.WithActions(authActions(snapshotPath)...),
@@ -933,8 +955,21 @@ func httpStatusError(method, endpoint string, statusCode int, snapshotPath, head
 }
 
 func jsonrpcEnvelopeError(method string, rpcErr *RPCError, snapshotPath, headerTraceID string) error {
+	headerTraceID = SanitizeTraceID(headerTraceID)
+	policy := extractAuthPolicyEvidence(rpcErr.Data)
+	permissionError := rpcErr.Code == http.StatusForbidden || policy.veto
+	authError := permissionError || policy.auth || looksAuthRPCError(rpcErr)
 	message := fmt.Sprintf("JSON-RPC %s failed with code %d: %s", method, rpcErr.Code, rpcErr.Message)
+	if authError {
+		// Authentication error text and data are remote-controlled and commonly
+		// echo identities or credentials. Keep the typed protocol code plus
+		// bounded correlation metadata, but never render raw auth payloads.
+		message = fmt.Sprintf("JSON-RPC %s authentication failed with code %d", method, rpcErr.Code)
+	}
 	reason := reasonForMethod(method, "jsonrpc_"+jsonrpcCodeLabel(rpcErr.Code))
+	if permissionError {
+		reason = "permission_denied"
+	}
 
 	// Extract structured diagnostics from rpc error data.
 	diag := ExtractServerDiagnostics(rpcErr.Data)
@@ -942,12 +977,17 @@ func jsonrpcEnvelopeError(method string, rpcErr *RPCError, snapshotPath, headerT
 	if diag.TraceID == "" && headerTraceID != "" {
 		diag.TraceID = headerTraceID
 	}
+	if authError {
+		diag = sanitizeAuthServerDiagnostics(diag)
+		if code := sanitizeAuthServerErrorCode(policy.code); code != "" {
+			diag.ServerErrorCode = code
+		}
+	}
 
 	opts := []apperrors.Option{
 		apperrors.WithOperation(method),
 		apperrors.WithReason(reason),
 		apperrors.WithRPCCode(rpcErr.Code),
-		apperrors.WithRPCData(rpcErr.Data),
 		apperrors.WithSnapshot(snapshotPath),
 		apperrors.WithServerDiag(diag),
 		apperrors.WithCause(&CallError{
@@ -956,6 +996,9 @@ func jsonrpcEnvelopeError(method string, rpcErr *RPCError, snapshotPath, headerT
 			TraceID: diag.TraceID,
 			Cause:   errors.New(message),
 		}),
+	}
+	if !authError {
+		opts = append(opts, apperrors.WithRPCData(rpcErr.Data))
 	}
 
 	if rpcErr.Code == -32602 {
@@ -966,11 +1009,12 @@ func jsonrpcEnvelopeError(method string, rpcErr *RPCError, snapshotPath, headerT
 		return apperrors.NewValidation(message, opts...)
 	}
 
-	if looksAuthRPCError(rpcErr) {
-		opts = append(opts,
-			apperrors.WithHint(i18n.T("调用被拒绝；请检查认证状态、租户身份或访问权限。")),
-			apperrors.WithActions(authActions(snapshotPath)...),
-		)
+	if authError {
+		hint := i18n.T("认证失败；请检查登录状态后重试。")
+		if permissionError {
+			hint = i18n.T("权限或 scope 授权不足；确认当前组织并完成所需授权后重试。")
+		}
+		opts = append(opts, apperrors.WithHint(hint), apperrors.WithActions(authActions(snapshotPath)...))
 		return apperrors.NewAuth(message, opts...)
 	}
 

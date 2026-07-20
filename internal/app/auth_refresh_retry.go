@@ -115,21 +115,26 @@ func deleteRejectedTokenForSnapshot(ctx context.Context, configDir string, rejec
 }
 
 func coreAuthRejectionFromError(err error) (*authretry.AuthRefreshRequired, bool) {
-	if err == nil {
+	if err == nil || !authRefreshErrorAllowed(err) {
 		return nil, false
 	}
 	var callErr *transport.CallError
-	if errors.As(err, &callErr) && callErr.HTTPStatus == http.StatusUnauthorized {
-		return &authretry.AuthRefreshRequired{Cause: err}, true
+	if errors.As(err, &callErr) && (callErr.HTTPStatus == http.StatusUnauthorized ||
+		callErr.RPCCode == http.StatusUnauthorized || callErr.RPCCode == 40014) {
+		return sanitizedTransportAuthRejection(err, callErr), true
 	}
 	var typed *apperrors.Error
-	if errors.As(err, &typed) && typed.Reason == "http_401" {
-		return &authretry.AuthRefreshRequired{Cause: err}, true
+	if errors.As(err, &typed) && (typed.Reason == "http_401" || typed.RPCCode == http.StatusUnauthorized ||
+		typed.RPCCode == 40014 || exactTokenRejectionCode(typed.ServerDiag.ServerErrorCode)) {
+		return sanitizedTransportAuthRejection(err, callErr), true
 	}
 	return nil, false
 }
 
 func coreAuthRejectionFromContent(content map[string]any) (*authretry.AuthRefreshRequired, bool) {
+	if apperrors.IsExplicitSuccessEnvelope(content) {
+		return nil, false
+	}
 	if hasAuthRefreshVeto(content, 0) {
 		return nil, false
 	}
@@ -142,7 +147,7 @@ func coreAuthRejectionFromContent(content map[string]any) (*authretry.AuthRefres
 	// metadata and the exact allowlisted code that triggered this branch; free
 	// text and URLs may contain bearer tokens, user IDs, or signed credentials.
 	diag := apperrors.ServerDiagnostics{
-		TraceID:         safeAuthTraceID(rawDiag.TraceID),
+		TraceID:         transport.SanitizeTraceID(rawDiag.TraceID),
 		ServerErrorCode: code,
 	}
 	return &authretry.AuthRefreshRequired{Cause: apperrors.NewAuth(
@@ -153,18 +158,53 @@ func coreAuthRejectionFromContent(content map[string]any) (*authretry.AuthRefres
 	)}, true
 }
 
-func safeAuthTraceID(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" || len(value) > 128 {
-		return ""
-	}
-	for _, r := range value {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == ':' || r == '.' {
-			continue
+func sanitizedTransportAuthRejection(err error, callErr *transport.CallError) *authretry.AuthRefreshRequired {
+	traceID := ""
+	serverCode := ""
+	var typed *apperrors.Error
+	if errors.As(err, &typed) && typed != nil {
+		traceID = transport.SanitizeTraceID(typed.ServerDiag.TraceID)
+		if exactTokenRejectionCode(typed.ServerDiag.ServerErrorCode) {
+			serverCode = strings.ToUpper(strings.TrimSpace(typed.ServerDiag.ServerErrorCode))
 		}
-		return ""
+		if serverCode == "" && typed.RPCCode == 40014 {
+			serverCode = "40014"
+		}
+		if serverCode == "" && typed.RPCCode == http.StatusUnauthorized {
+			serverCode = "HTTP_401"
+		}
+		// The original typed error is also passed to recovery capture by the
+		// runner. Normalize its remotely controlled surface in place so that a
+		// rejected-token retry cannot persist a UID/token through Message,
+		// RPCData, or extended server diagnostics before the safe marker is
+		// rendered.
+		typed.Message = "access token was rejected by the server"
+		typed.Reason = "access_token_rejected"
+		typed.RPCData = nil
+		typed.ServerDiag = apperrors.ServerDiagnostics{TraceID: traceID, ServerErrorCode: serverCode}
 	}
-	return value
+	if callErr != nil {
+		callErr.TraceID = transport.SanitizeTraceID(callErr.TraceID)
+		callErr.RequestID = transport.SanitizeTraceID(callErr.RequestID)
+		if traceID == "" {
+			traceID = callErr.TraceID
+		}
+		if serverCode == "" && callErr.RPCCode == 40014 {
+			serverCode = "40014"
+		}
+		if serverCode == "" && (callErr.HTTPStatus == http.StatusUnauthorized || callErr.RPCCode == http.StatusUnauthorized) {
+			serverCode = "HTTP_401"
+		}
+		callErr.Cause = errors.New("access token was rejected by the server")
+	}
+	diag := apperrors.ServerDiagnostics{TraceID: traceID, ServerErrorCode: serverCode}
+	return &authretry.AuthRefreshRequired{Cause: apperrors.NewAuth(
+		"access token was rejected by the server",
+		apperrors.WithOperation("tools/call"),
+		apperrors.WithReason("access_token_rejected"),
+		apperrors.WithServerDiag(diag),
+		apperrors.WithCause(authpkg.NewDiagnosticStageError("runtime_auth_rejection", err)),
+	)}
 }
 
 func hasAuthRefreshVeto(value any, depth int) bool {
@@ -181,11 +221,14 @@ func hasAuthRefreshVeto(value any, depth int) bool {
 					return true
 				}
 			case "code", "errorcode", "errcode", "servererrorcode":
+				if isForbiddenCode(child) {
+					return true
+				}
 				if code, ok := child.(string); ok && isAuthRefreshVetoCode(code) {
 					return true
 				}
-			case "missingscope", "missingscopes":
-				if child != nil && strings.TrimSpace(fmt.Sprint(child)) != "" {
+			case "missingscope", "missingscopes", "requiredscope", "requiredscopes":
+				if hasAuthScopeEvidence(child) {
 					return true
 				}
 			}
@@ -201,6 +244,25 @@ func hasAuthRefreshVeto(value any, depth int) bool {
 		}
 	}
 	return false
+}
+
+func hasAuthScopeEvidence(value any) bool {
+	switch current := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(current) != ""
+	case []any:
+		return len(current) > 0
+	case []string:
+		return len(current) > 0
+	case map[string]any:
+		return len(current) > 0
+	case bool:
+		return current
+	default:
+		return strings.TrimSpace(fmt.Sprint(current)) != ""
+	}
 }
 
 func isForbiddenCode(value any) bool {
@@ -220,7 +282,8 @@ func isForbiddenCode(value any) bool {
 
 func isAuthRefreshVetoCode(code string) bool {
 	switch strings.ToUpper(strings.TrimSpace(code)) {
-	case "CLI_ORG_NOT_AUTHORIZED", "AUTH_PERMISSION_DENIED", "PERMISSION_DENIED",
+	case "CLI_ORG_NOT_AUTHORIZED", "AUTH_PERMISSION_DENIED", "PERMISSION_DENIED", "FORBIDDEN", "ORG_DOC_TOKEN_MISMATCH",
+		"SCOPE_REQUIRED", "HTTP_403",
 		"PAT_NO_PERMISSION", "PAT_LOW_RISK_NO_PERMISSION", "PAT_MEDIUM_RISK_NO_PERMISSION",
 		"PAT_HIGH_RISK_NO_PERMISSION", "PAT_ORG_POLICY_DENIED", "AGENT_CODE_NOT_EXISTS",
 		"PAT_BATCH_AUTH_PENDING", "PAT_SCOPE_AUTH_REQUIRED":
@@ -285,7 +348,7 @@ func exactTokenRejectionValue(value any) (string, bool) {
 
 func exactTokenRejectionCode(code string) bool {
 	switch strings.ToUpper(strings.TrimSpace(code)) {
-	case "TOKEN_VERIFIED_FAILED", "USER_TOKEN_ILLEGAL", "ACCESS_TOKEN_EXPIRED", "DWS_SERVICE_UNAUTHORIZED":
+	case "40014", "TOKEN_VERIFIED_FAILED", "USER_TOKEN_ILLEGAL", "ACCESS_TOKEN_EXPIRED", "DWS_SERVICE_UNAUTHORIZED":
 		return true
 	default:
 		return false
@@ -306,11 +369,10 @@ func authRefreshAllowed(sourceErr, originalErr error) bool {
 func authRefreshErrorAllowed(err error) bool {
 	var typed *apperrors.Error
 	if errors.As(err, &typed) {
-		if typed.Reason == "http_403" || typed.RPCCode == http.StatusForbidden {
+		if typed.Reason == "http_403" || typed.Reason == "permission_denied" || typed.RPCCode == http.StatusForbidden {
 			return false
 		}
-		switch strings.ToUpper(strings.TrimSpace(typed.ServerDiag.ServerErrorCode)) {
-		case "CLI_ORG_NOT_AUTHORIZED", "AUTH_PERMISSION_DENIED", "PERMISSION_DENIED":
+		if isAuthRefreshVetoCode(typed.ServerDiag.ServerErrorCode) {
 			return false
 		}
 	}

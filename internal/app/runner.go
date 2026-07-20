@@ -693,6 +693,9 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 		}
 		// PAT scope error: offer human-readable output and retry after authorization
 		if isPatScopeError(err) {
+			if IsPatRetrying(ctx) {
+				return executor.Result{}, err
+			}
 			scopeErr := extractPatScopeError(err)
 			runnerCaptureRuntimeFailure(invocation, err, err)
 			return runnerRetryWithPatAuthRetry(ctx, r, invocation, scopeErr, defaultConfigDir(), os.Stderr)
@@ -702,10 +705,20 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 	}
 
 	coreRefresh, coreRejected := coreAuthRejectionFromContent(callResult.Content)
+	classificationEligible := callResult.IsError || coreRejected || apperrors.IsExplicitErrorEnvelope(callResult.Content)
+	editionClassificationEligible := !apperrors.IsExplicitSuccessEnvelope(callResult.Content)
+	classificationContent := callResult.Content
+	if callResult.IsError && !apperrors.IsExplicitErrorEnvelope(classificationContent) {
+		classificationContent = make(map[string]any, len(callResult.Content)+1)
+		for key, value := range callResult.Content {
+			classificationContent[key] = value
+		}
+		classificationContent["isError"] = true
+	}
 
 	// ---- Edition hook gets first dibs (preserves overlay PATError passthrough) ----
-	if fn := edition.Get().ClassifyToolResult; fn != nil {
-		if editionErr := fn(callResult.Content); editionErr != nil {
+	if fn := edition.Get().ClassifyToolResult; editionClassificationEligible && fn != nil {
+		if editionErr := fn(classificationContent); editionErr != nil {
 			if patCheck := apperrors.AsPatAuthCheckError(editionErr); patCheck != nil {
 				if IsPatRetrying(ctx) {
 					return executor.Result{}, patCheck // already retried once, don't loop
@@ -737,12 +750,17 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 		return result, retryErr
 	}
 
-	// ---- Structured PAT auth check (open-source fallback) ----
-	if patCheck := apperrors.ClassifyPatAuthCheck(callResult.Content); patCheck != nil {
-		if IsPatRetrying(ctx) {
-			return executor.Result{}, patCheck // already retried once, don't loop
+	// ---- Open-source auth/PAT/permission fallback ----
+	if classificationEligible {
+		if classified := apperrors.ClassifyToolResultContent(classificationContent); classified != nil {
+			if patCheck := apperrors.AsPatAuthCheckError(classified); patCheck != nil {
+				if IsPatRetrying(ctx) {
+					return executor.Result{}, patCheck // already retried once, don't loop
+				}
+				return runnerHandlePatAuthCheck(ctx, r, invocation, patCheck, defaultConfigDir(), os.Stderr)
+			}
+			return executor.Result{}, classified
 		}
-		return runnerHandlePatAuthCheck(ctx, r, invocation, patCheck, defaultConfigDir(), os.Stderr)
 	}
 
 	if callResult.IsError {
@@ -759,6 +777,9 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 		)
 		// PAT scope error in business response: offer human-readable output and retry
 		if isPatScopeError(mcpErr) {
+			if IsPatRetrying(ctx) {
+				return executor.Result{}, mcpErr
+			}
 			scopeErr := extractPatScopeError(mcpErr)
 			runnerCaptureRuntimeFailure(invocation, mcpErr, mcpErr)
 			return runnerRetryWithPatAuthRetry(ctx, r, invocation, scopeErr, defaultConfigDir(), os.Stderr)

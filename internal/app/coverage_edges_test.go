@@ -946,7 +946,7 @@ func TestCrossPlatformCoverageExecuteInvocationCoverage(t *testing.T) {
 
 	hookErr := errors.New("edition classification")
 	edition.Override(&edition.Hooks{ClassifyToolResult: func(map[string]any) error { return hookErr }})
-	rpcResult = map[string]any{"structuredContent": map[string]any{"value": 1}}
+	rpcResult = map[string]any{"isError": true, "structuredContent": map[string]any{"value": 1}}
 	if _, err := r.executeInvocation(context.Background(), server.URL, inv); !errors.Is(err, hookErr) {
 		t.Fatalf("edition classification = %v", err)
 	}
@@ -2004,8 +2004,13 @@ func TestCrossPlatformCoverageSkillHelpersAndErrorsCoverage(t *testing.T) {
 }
 
 func TestCrossPlatformCoverageProfileCommandAndModelCoverage(t *testing.T) {
+	previousRuntimeProfile := authpkg.RuntimeProfile()
+	t.Cleanup(func() { authpkg.SetRuntimeProfile(previousRuntimeProfile) })
+
 	configDir := t.TempDir()
 	t.Setenv("DWS_CONFIG_DIR", configDir)
+	t.Setenv(keychain.StorageDirEnv, filepath.Join(configDir, "keychain"))
+	t.Setenv(keychain.DisableKeychainEnv, "1")
 	now := time.Now().UTC()
 	cfg := &authpkg.ProfilesConfig{
 		Version: 1, PrimaryProfile: "corp-a", CurrentProfile: "corp-a", PreviousProfile: "corp-b",
@@ -2170,6 +2175,9 @@ func TestCrossPlatformCoverageProfileCommandAndModelCoverage(t *testing.T) {
 	for _, limit := range []int{0, 2, 5, 40} {
 		_ = clipProfileCell("abcdefgh", limit)
 		_ = clipProfileDisplayCell("中文abcdefgh", limit)
+	}
+	if got := authpkg.RuntimeProfile(); got != previousRuntimeProfile {
+		t.Fatalf("runtime profile leaked from profile coverage: got %q, want %q", got, previousRuntimeProfile)
 	}
 }
 
