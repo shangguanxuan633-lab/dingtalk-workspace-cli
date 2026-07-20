@@ -27,7 +27,10 @@ func TestDeviceAndAppEndpointErrorsExcludeServerFreeText(t *testing.T) {
 	provider := NewDeviceFlowProvider(t.TempDir(), nil)
 	provider.httpClient = client
 	for _, invoke := range []func() error{
-		func() error { _, err := provider.postForm(context.Background(), "https://example.invalid", url.Values{}); return err },
+		func() error {
+			_, err := provider.postForm(context.Background(), "https://example.invalid", url.Values{})
+			return err
+		},
 		func() error { _, err := provider.doGet(context.Background(), "https://example.invalid"); return err },
 	} {
 		err := invoke()
