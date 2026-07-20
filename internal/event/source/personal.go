@@ -389,8 +389,16 @@ func retryPersonal(err error) error {
 }
 
 func isRetryablePersonalError(err error) bool {
+	if isTransientAuthFailure(err) {
+		return true
+	}
 	var retryable *retryablePersonalError
 	return errors.As(err, &retryable)
+}
+
+func isTransientAuthFailure(err error) bool {
+	var diagnostic *authpkg.DiagnosticStageError
+	return errors.As(err, &diagnostic) && authpkg.ClassifyRefreshFailure(err) == authpkg.RefreshFailureTransient
 }
 
 func personalRetryLogError(err error) string {

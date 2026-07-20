@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	dwsevent "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/event/authlease"
 	"github.com/gorilla/websocket"
@@ -158,6 +159,15 @@ func (s *DingtalkSource) startPortalTicket(ctx context.Context, emit dwsevent.Em
 		}
 		var stageErr *portalStageError
 		isStageError := errors.As(err, &stageErr)
+		if !isStageError && isTransientAuthFailure(err) {
+			stageErr = &portalStageError{
+				stage:     "ticket_auth",
+				status:    authpkg.DiagnosticStatus(err),
+				retryable: true,
+				cause:     err,
+			}
+			isStageError = true
+		}
 		if !isStageError || !stageErr.retryable || s.cfg.PortalTicket.DisableReconnect {
 			return err
 		}
