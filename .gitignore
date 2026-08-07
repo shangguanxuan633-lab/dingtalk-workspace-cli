@@ -47,3 +47,10 @@ test/dev_functional/results.jsonl
 /.qoder/
 .vercel
 .env*
+
+# local agent artifacts
+.codex-receipts/
+.codex-worktrees/
+dist-online/
+output/
+recovery-worktrees/
